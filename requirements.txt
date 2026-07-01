@@ -1,0 +1,6 @@
+ijson>=3.2.0
+jieba>=0.42.1
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+FlagEmbedding>=1.2.0
+numpy>=1.26.0

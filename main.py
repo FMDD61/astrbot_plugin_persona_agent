@@ -1,0 +1,381 @@
+"""astrbot_plugin_persona_agent — main entry.
+
+v0.1 skeleton: registers commands and event handlers, wires the three
+sub-agent C services (StyleProfile / RagService / InterjectionManager),
+and implements the @ reply path. Active interjection, poke, dream, and
+topic_bank are gated by their `*.enabled` (int 0/1) config and stay
+silent at default.
+
+See IMPLEMENTATION_PLAN.md (sections 1, 2, 8, 9) and DEPLOYMENT_GUIDE.md.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+import time
+from pathlib import Path
+from typing import Optional
+
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.star import Context, Star, StarTools
+import astrbot.api.message_components as Comp
+
+from .services.style_profile import StyleProfile
+from .services.rag_service import RagService
+from .services.interjection import (
+    InterjectionManager,
+    TRIGGER_AT,
+    TRIGGER_RAG,
+    ACTION_REPLY,
+    ACTION_TOPIC,
+    ACTION_SILENT,
+)
+from .services.json_store import JsonStore
+from .services.context_buffer import ContextBuffer
+
+
+class PersonaAgent(Star):
+    def __init__(self, context: Context, config: AstrBotConfig) -> None:
+        super().__init__(context)
+        self.config = config
+        self.data_dir: Path = StarTools.get_data_dir()
+        self.store = JsonStore(self.data_dir)
+
+        # IDs (string, OneBot uses string-typed user_id in raw events)
+        self.target_group_id: str = str(config.get("target_group_id", ""))
+        self.bot_qq: str = str(config.get("bot_qq", ""))
+        self.style_source_qq: str = str(config.get("style_source_qq", ""))
+
+        # Services (lazy heavy deps; created in initialize())
+        self.style: Optional[StyleProfile] = None
+        self.rag: Optional[RagService] = None
+        self.interjection: Optional[InterjectionManager] = None
+        self.buffer: Optional[ContextBuffer] = None
+
+        self._decision_log_path = self.data_dir / "decision_log.jsonl"
+
+    # ----------------------------------------------------------------- lifecycle
+
+    async def initialize(self) -> None:
+        logger.info(f"[persona_agent] initializing, data_dir={self.data_dir}")
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+
+        self.style = StyleProfile(self.data_dir)
+
+        rag_cfg = self.config.get("rag", {}) or {}
+        self.rag = RagService(self.data_dir)
+
+        ij_cfg = self.config.get("interjection", {}) or {}
+        topic_cfg = self.config.get("topic_bank", {}) or {}
+        self.interjection = InterjectionManager(
+            self.style,
+            active_interjection=int(self.config.get("active_interjection", 0)),
+            reply_on_at=int(self.config.get("reply_on_at", 1)),
+            topic_bank_enabled=int(topic_cfg.get("enabled", 0)),
+            rag_score_threshold=float(rag_cfg.get("score_threshold", 0.55)),
+            cold_start_threshold_sec=float(ij_cfg.get("cold_start_threshold_sec", 600)),
+            min_gap_sec=float(ij_cfg.get("min_gap_sec", 25)),
+            at_cooldown_sec=float(ij_cfg.get("at_cooldown_sec", 8)),
+            silence_cap_sec=float(ij_cfg.get("silence_cap_sec", 120)),
+            local_tz_offset_hours=int(ij_cfg.get("local_tz_offset_hours", 8)),
+        )
+
+        cb_cfg = self.config.get("context_buffer", {}) or {}
+        self.buffer = ContextBuffer(
+            self.data_dir,
+            max_messages=int(cb_cfg.get("max_messages", 200)),
+            max_age_sec=int(cb_cfg.get("max_age_sec", 3600)),
+            persist_jsonl=int(cb_cfg.get("persist_jsonl", 1)) == 1,
+        )
+
+        logger.info(
+            f"[persona_agent] ready: target_group={self.target_group_id} "
+            f"bot={self.bot_qq} style_src={self.style_source_qq} "
+            f"reply_on_at={self.config.get('reply_on_at')} "
+            f"active_interjection={self.config.get('active_interjection')}"
+        )
+
+    async def terminate(self) -> None:
+        logger.info("[persona_agent] terminating")
+
+    # ----------------------------------------------------------------- helpers
+
+    def _is_target_group(self, event: AstrMessageEvent) -> bool:
+        gid = event.get_group_id()
+        return gid is not None and str(gid) == self.target_group_id
+
+    def _is_at_bot(self, event: AstrMessageEvent) -> bool:
+        self_id = str(event.get_self_id() or self.bot_qq)
+        for seg in event.get_messages():
+            if isinstance(seg, Comp.At) and str(getattr(seg, "qq", "")) == self_id:
+                return True
+        return False
+
+    def _log_decision(self, payload: dict) -> None:
+        try:
+            self.store.append_jsonl("decision_log.jsonl", payload)
+        except Exception as e:  # never let logging crash the handler
+            logger.warning(f"[persona_agent] decision log write failed: {e}")
+
+    def _record_inbound(self, event: AstrMessageEvent) -> None:
+        if self.buffer is None:
+            return
+        try:
+            self.buffer.add(
+                ts=time.time(),
+                group_id=str(event.get_group_id() or ""),
+                sender_id=str(event.get_sender_id() or ""),
+                sender_name=event.get_sender_name() or "",
+                text=event.message_str or "",
+                message_id=str(getattr(event.message_obj, "message_id", "")),
+                message_type="group",
+            )
+        except Exception as e:
+            logger.warning(f"[persona_agent] buffer add failed: {e}")
+
+    # ----------------------------------------------------------------- commands
+
+    @filter.command("persona_status")
+    async def cmd_status(self, event: AstrMessageEvent):
+        cfg = self.config
+        lines = [
+            "=== persona_agent status ===",
+            f"target_group     : {self.target_group_id}",
+            f"bot_qq           : {self.bot_qq}",
+            f"style_source_qq  : {self.style_source_qq}",
+            f"reply_on_at      : {cfg.get('reply_on_at')}",
+            f"active_interjection : {cfg.get('active_interjection')}",
+            f"topic_bank.enabled  : {(cfg.get('topic_bank') or {}).get('enabled', 0)}",
+            f"poke.enabled        : {(cfg.get('poke') or {}).get('enabled', 0)}",
+            f"dream.enabled       : {(cfg.get('dream') or {}).get('enabled', 0)}",
+            f"data_dir         : {self.data_dir}",
+        ]
+        if self.interjection is not None:
+            snap = self.interjection.snapshot()
+            lines.append(f"hourly_used      : {snap['hourly_used']:.2f}  hour={snap['current_hour']}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("reload_persona_config")
+    async def cmd_reload(self, event: AstrMessageEvent):
+        """Apply config toggles to the live InterjectionManager.
+
+        The 7 editable JSON files (style profile etc.) auto-hot-reload via
+        mtime; this command only rebinds the interjection toggles.
+        """
+        if self.interjection is None:
+            yield event.plain_result("插件尚未完成初始化。")
+            return
+        topic_cfg = self.config.get("topic_bank", {}) or {}
+        self.interjection.update_toggles(
+            active_interjection=int(self.config.get("active_interjection", 0)),
+            reply_on_at=int(self.config.get("reply_on_at", 1)),
+            topic_bank_enabled=int(topic_cfg.get("enabled", 0)),
+        )
+        yield event.plain_result(
+            f"已重载: reply_on_at={self.config.get('reply_on_at')} "
+            f"active_interjection={self.config.get('active_interjection')} "
+            f"topic_bank.enabled={topic_cfg.get('enabled', 0)}"
+        )
+
+    @filter.command("bind_dream")
+    async def cmd_bind_dream(self, event: AstrMessageEvent):
+        """Bind the current private-chat UMO for weekly dream delivery."""
+        gid = event.get_group_id()
+        if gid:
+            yield event.plain_result("请在私聊中执行 /bind_dream。")
+            return
+        umo = event.unified_msg_origin
+        self.store.save_json("dream_binding.json", {
+            "unified_msg_origin": umo,
+            "bound_at": int(time.time()),
+            "sender_id": str(event.get_sender_id() or ""),
+        })
+        yield event.plain_result(f"已绑定私聊会话: {umo}")
+
+    @filter.command("dream_now")
+    async def cmd_dream_now(self, event: AstrMessageEvent):
+        if int((self.config.get("dream") or {}).get("enabled", 0)) != 1:
+            yield event.plain_result("dream.enabled=0，已禁用做梦。")
+            return
+        # Actual dream generation is sub-agent D's job (not in v0.1).
+        yield event.plain_result("dream_now: 子代理 D 尚未实装。")
+
+    # ----------------------------------------------------------------- events
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def on_group_message(self, event: AstrMessageEvent):
+        if not self._is_target_group(event):
+            return  # non-target group: completely silent
+
+        self._record_inbound(event)
+
+        if self.style is None or self.rag is None or self.interjection is None:
+            return  # not initialized yet
+
+        is_at = self._is_at_bot(event)
+        sender_uin = str(event.get_sender_id() or "")
+        text = (event.message_str or "").strip()
+
+        # Build live context from buffer (last N lines, formatted).
+        live_ctx = self.buffer.format_recent(max_lines=20) if self.buffer else ""
+
+        # Quick RAG probe — needed both for ranking and for interjection
+        # decisions. Skip if the trigger is obviously AT (still want hits
+        # for prompt augmentation though).
+        top_score = 0.0
+        hits: list[dict] = []
+        rag_cfg = self.config.get("rag", {}) or {}
+        try:
+            hits = self.rag.query(
+                live_ctx + ("\n" + text if text else ""),
+                k=int(rag_cfg.get("k_retrieve", 8)),
+                top_n_final=int(rag_cfg.get("top_n_final", 3)),
+            )
+            if hits:
+                top_score = float(hits[0].get("score", 0.0))
+        except Exception as e:
+            logger.warning(f"[persona_agent] RAG query failed: {e}")
+
+        last_msg_ts = self.buffer.last_ts() if self.buffer else time.time()
+        decision = self.interjection.decide(
+            now_utc=time.time(),
+            is_at_me=is_at,
+            sender_uin=sender_uin,
+            last_group_msg_ts=last_msg_ts,
+            top_rag_score=top_score,
+        )
+        self._log_decision(decision.to_log(time.time(), sender_uin))
+
+        if decision.action == ACTION_SILENT:
+            return
+
+        if decision.action == ACTION_TOPIC:
+            # Sub-agent D will own this branch; v0.1 stays silent.
+            logger.info("[persona_agent] topic action requested, but topic_bank not implemented yet")
+            return
+
+        # ACTION_REPLY ----------------------------------------------------
+        try:
+            reply_text = await self._generate_reply(event, text, live_ctx, hits)
+        except Exception as e:
+            logger.exception(f"[persona_agent] LLM generation failed: {e}")
+            return
+
+        reply_text = self._postprocess(reply_text)
+        if not reply_text:
+            logger.info("[persona_agent] empty reply after postprocess; skipping send")
+            return
+
+        segments = [s.strip() for s in reply_text.split("\n") if s.strip()]
+        if not segments:
+            return
+
+        for i, seg in enumerate(segments):
+            if i > 0:
+                delay = min(0.3 + 0.06 * len(seg) + random.uniform(0, 0.4), 2.0)
+                await asyncio.sleep(delay)
+            yield event.plain_result(seg)
+        self.interjection.register_reply(
+            now_utc=time.time(),
+            trigger=decision.trigger,
+            sender_uin=sender_uin,
+        )
+        # Record bot's own message back into the buffer.
+        if self.buffer is not None:
+            self.buffer.add(
+                ts=time.time(),
+                group_id=str(event.get_group_id() or ""),
+                sender_id=self.bot_qq,
+                sender_name="<bot>",
+                text=reply_text,
+                message_id="",
+                message_type="bot",
+            )
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.OTHER_MESSAGE)
+    async def on_other(self, event: AstrMessageEvent):
+        """Poke notice handler (skeleton — sub-agent D will fill)."""
+        if int((self.config.get("poke") or {}).get("enabled", 0)) != 1:
+            return
+        raw = getattr(event.message_obj, "raw_message", None)
+        if not raw:
+            return
+        try:
+            if (raw.get("notice_type") == "notify"
+                    and raw.get("sub_type") == "poke"
+                    and str(raw.get("target_id")) == self.bot_qq):
+                poker = str(raw.get("user_id"))
+                logger.info(f"[persona_agent] poked by {poker} (handler not implemented)")
+        except AttributeError:
+            return
+
+    # ----------------------------------------------------------------- LLM
+
+    async def _generate_reply(
+        self,
+        event: AstrMessageEvent,
+        user_text: str,
+        live_ctx: str,
+        hits: list[dict],
+    ) -> str:
+        local_hour = self._local_hour()
+        sys_prompt = self.style.system_prompt(local_hour=local_hour) if self.style else ""
+        examples = ""
+        if self.rag and hits:
+            examples = self.rag.format_examples(
+                hits,
+                max_chars=int((self.config.get("rag") or {}).get("max_example_chars", 800)),
+            )
+        if examples:
+            sys_prompt = f"{sys_prompt}\n\n{examples}"
+
+        contexts: list[dict] = []
+        if live_ctx:
+            contexts.append({"role": "user", "content": f"[群聊最近上下文]\n{live_ctx}"})
+
+        provider_id = (self.config.get("llm") or {}).get("provider_id", "") or None
+        if not provider_id:
+            try:
+                provider_id = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+            except Exception:
+                provider_id = None
+
+        if not provider_id:
+            logger.warning("[persona_agent] no LLM provider available")
+            return ""
+
+        resp = await self.context.llm_generate(
+            chat_provider_id=provider_id,
+            prompt=user_text or "(no text)",
+            system_prompt=sys_prompt,
+            contexts=contexts,
+        )
+        return (getattr(resp, "completion_text", "") or "").strip()
+
+    # ----------------------------------------------------------------- misc
+
+    def _local_hour(self) -> int:
+        offset = int((self.config.get("interjection") or {}).get("local_tz_offset_hours", 8))
+        return int(((time.time() / 3600.0) + offset) % 24)
+
+    @staticmethod
+    def _postprocess(text: str) -> str:
+        if not text:
+            return ""
+        bad = ["作为一个AI", "作为AI", "作为一名AI", "作为人工智能", "我是AI", "我是一个AI"]
+        out = text.strip()
+        for b in bad:
+            out = out.replace(b, "")
+        import re
+        out = re.sub(r"(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]) +(?=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])", "\n", out)
+        lines = out.splitlines()
+        if len(lines) > 8:
+            lines = lines[:8]
+        out = "\n".join(lines).strip()
+        if len(out) > 400:
+            out = out[:400].rstrip()
+        return out

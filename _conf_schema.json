@@ -1,0 +1,211 @@
+{
+  "data_dir": {
+    "type": "string",
+    "description": "运行时数据目录",
+    "hint": "存放风格文件、chromadb、决策日志等。git pull 不会覆盖此目录。",
+    "default": "/opt/AstrBot/data/plugin_data/astrbot_plugin_persona_agent"
+  },
+  "target_group_id": {
+    "type": "string",
+    "description": "目标 QQ 群号",
+    "hint": "机器人只在此群内工作。其他群一律沉默。",
+    "default": "881438753"
+  },
+  "test_mode": {
+    "type": "int",
+    "description": "测试模式（0 生产 / 1 测试）",
+    "hint": "1 时机器人只在 test_group_id 内工作，忽略 target_group_id。",
+    "default": 0
+  },
+  "test_group_id": {
+    "type": "string",
+    "description": "测试群号",
+    "hint": "仅在 test_mode=1 时生效。测试群 1047699954，测试员 337934842 + 3490909149。",
+    "default": "1047699954"
+  },
+  "bot_qq": {
+    "type": "string",
+    "description": "机器人 QQ 号",
+    "hint": "用于判断是否被 @、是否被戳。",
+    "default": "3589783410"
+  },
+  "style_source_qq": {
+    "type": "string",
+    "description": "风格源 QQ 号",
+    "hint": "机器人模仿这个 QQ 的发言风格。离线数据已按此号生成。",
+    "default": "337934842"
+  },
+
+  "reply_on_at": {
+    "type": "int",
+    "description": "被 @ 时是否回复（0 关闭 / 1 开启）",
+    "hint": "整数 0/1，不是 bool。0 时即使被 @ 也不调用 LLM。",
+    "default": 1
+  },
+  "active_interjection": {
+    "type": "int",
+    "description": "主动插话总开关（0 关闭 / 1 开启）",
+    "hint": "整数 0/1。0 时机器人除被 @ 外完全沉默。建议验证期保持 0。",
+    "default": 0
+  },
+
+  "rag": {
+    "type": "object",
+    "description": "RAG 检索参数",
+    "items": {
+      "k_retrieve": {
+        "type": "int",
+        "description": "向量库召回 top-k",
+        "default": 8
+      },
+      "top_n_final": {
+        "type": "int",
+        "description": "重排后保留前 N 条注入 prompt",
+        "default": 3
+      },
+      "score_threshold": {
+        "type": "float",
+        "description": "主动插话的 RAG 分数门槛",
+        "hint": "分数低于此值不主动插话。0.40 较吵，0.65 较安静。",
+        "default": 0.55
+      },
+      "max_example_chars": {
+        "type": "int",
+        "description": "RAG 示例块最大字符数",
+        "default": 800
+      }
+    }
+  },
+
+  "interjection": {
+    "type": "object",
+    "description": "插话节奏控制",
+    "items": {
+      "min_gap_sec": {
+        "type": "int",
+        "description": "任意两次发言最小间隔（秒）",
+        "default": 25
+      },
+      "at_cooldown_sec": {
+        "type": "int",
+        "description": "同一人连续 @ 的冷却（秒）",
+        "default": 8
+      },
+      "cold_start_threshold_sec": {
+        "type": "int",
+        "description": "冷场判定阈值（秒）",
+        "hint": "群里多久没人说话算冷场。超过则可由 topic_bank 接管。",
+        "default": 600
+      },
+      "silence_cap_sec": {
+        "type": "int",
+        "description": "RAG 触发要求群仍活跃的上限（秒）",
+        "hint": "群已沉默超过此值，不再用 RAG 主动接话。",
+        "default": 120
+      },
+      "local_tz_offset_hours": {
+        "type": "int",
+        "description": "本地时区偏移（小时）",
+        "hint": "用于查 my_hourly_distribution.json 的小时预算。",
+        "default": 8
+      }
+    }
+  },
+
+  "topic_bank": {
+    "type": "object",
+    "description": "主动话题（冷场救场）",
+    "items": {
+      "enabled": {
+        "type": "int",
+        "description": "0 关闭 / 1 开启",
+        "default": 0
+      }
+    }
+  },
+
+  "poke": {
+    "type": "object",
+    "description": "戳一戳响应",
+    "items": {
+      "enabled": {
+        "type": "int",
+        "description": "0 关闭 / 1 开启",
+        "default": 0
+      },
+      "cooldown_sec": {
+        "type": "int",
+        "description": "同一人回戳冷却（秒）",
+        "default": 300
+      }
+    }
+  },
+
+  "dream": {
+    "type": "object",
+    "description": "做梦（每周私聊推送）",
+    "items": {
+      "enabled": {
+        "type": "int",
+        "description": "0 关闭 / 1 开启",
+        "default": 0
+      },
+      "interval_days": {
+        "type": "int",
+        "description": "做梦间隔（天）",
+        "default": 7
+      },
+      "lookback_hours": {
+        "type": "int",
+        "description": "梦境素材回顾窗口（小时）",
+        "default": 168
+      },
+      "target_qq": {
+        "type": "string",
+        "description": "梦境推送的目标 QQ（需先在私聊执行 /bind_dream）",
+        "default": "337934842"
+      }
+    }
+  },
+
+  "context_buffer": {
+    "type": "object",
+    "description": "运行时上下文缓冲",
+    "items": {
+      "max_messages": {
+        "type": "int",
+        "description": "内存中保留的最近消息数",
+        "default": 200
+      },
+      "max_age_sec": {
+        "type": "int",
+        "description": "最大保留时长（秒），超过则淘汰",
+        "default": 3600
+      },
+      "persist_jsonl": {
+        "type": "int",
+        "description": "是否落盘到 recent_messages.jsonl（0/1）",
+        "default": 1
+      }
+    }
+  },
+
+  "llm": {
+    "type": "object",
+    "description": "LLM provider 选择",
+    "items": {
+      "provider_id": {
+        "type": "string",
+        "description": "LLM provider ID",
+        "hint": "留空使用 AstrBot 当前会话默认 provider。建议在 AstrBot WebUI 配置火山引擎 provider。",
+        "default": "",
+        "_special": "select_provider"
+      },
+      "max_tokens": {
+        "type": "int",
+        "description": "回复最大 token 数",
+        "default": 256
+      }
+    }
+  }
+}
