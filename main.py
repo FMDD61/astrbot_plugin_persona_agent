@@ -47,6 +47,8 @@ class PersonaAgent(Star):
 
         # IDs (string, OneBot uses string-typed user_id in raw events)
         self.target_group_id: str = str(config.get("target_group_id", ""))
+        self.test_mode: int = int(config.get("test_mode", 0))
+        self.test_group_id: str = str(config.get("test_group_id", ""))
         self.bot_qq: str = str(config.get("bot_qq", ""))
         self.style_source_qq: str = str(config.get("style_source_qq", ""))
 
@@ -107,6 +109,7 @@ class PersonaAgent(Star):
 
         logger.info(
             f"[persona_agent] ready: target_group={self.target_group_id} "
+            f"test_mode={self.test_mode} test_group={self.test_group_id} "
             f"bot={self.bot_qq} style_src={self.style_source_qq} "
             f"reply_on_at={self.config.get('reply_on_at')} "
             f"active_interjection={self.config.get('active_interjection')}"
@@ -119,7 +122,11 @@ class PersonaAgent(Star):
 
     def _is_target_group(self, event: AstrMessageEvent) -> bool:
         gid = event.get_group_id()
-        return gid is not None and str(gid) == self.target_group_id
+        if gid is None:
+            return False
+        if self.test_mode == 1:
+            return str(gid) == self.test_group_id
+        return str(gid) == self.target_group_id
 
     def _is_at_bot(self, event: AstrMessageEvent) -> bool:
         self_id = str(event.get_self_id() or self.bot_qq)
