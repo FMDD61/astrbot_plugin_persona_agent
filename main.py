@@ -34,6 +34,8 @@ from .services.interjection import (
 )
 from .services.json_store import JsonStore
 from .services.context_buffer import ContextBuffer
+from .services.session_manager import SessionManager
+from .services.kg_provider import KGProvider, RagKGProvider, KGContext
 
 
 class PersonaAgent(Star):
@@ -53,6 +55,8 @@ class PersonaAgent(Star):
         self.rag: Optional[RagService] = None
         self.interjection: Optional[InterjectionManager] = None
         self.buffer: Optional[ContextBuffer] = None
+        self.session_mgr: Optional[SessionManager] = None
+        self.kg_provider: Optional[KGProvider] = None
 
         self._decision_log_path = self.data_dir / "decision_log.jsonl"
 
@@ -88,6 +92,17 @@ class PersonaAgent(Star):
             max_messages=int(cb_cfg.get("max_messages", 200)),
             max_age_sec=int(cb_cfg.get("max_age_sec", 3600)),
             persist_jsonl=int(cb_cfg.get("persist_jsonl", 1)) == 1,
+        )
+
+        self.session_mgr = SessionManager(
+            data_dir=str(self.data_dir),
+            max_messages=int(cb_cfg.get("session_max_messages", 300)),
+        )
+        self.kg_provider = RagKGProvider(
+            self.rag,
+            k_retrieve=int(rag_cfg.get("k_retrieve", 8)),
+            top_n_final=int(rag_cfg.get("top_n_final", 3)),
+            max_chars=int(rag_cfg.get("max_example_chars", 400)),
         )
 
         logger.info(
@@ -155,6 +170,10 @@ class PersonaAgent(Star):
         if self.interjection is not None:
             snap = self.interjection.snapshot()
             lines.append(f"hourly_used      : {snap['hourly_used']:.2f}  hour={snap['current_hour']}")
+        if self.session_mgr is not None:
+            snap = self.session_mgr.snapshot()
+            for gid, sz in snap.items():
+                lines.append(f"session[{gid}]  : {sz} msgs")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("reload_persona_config")
@@ -208,23 +227,25 @@ class PersonaAgent(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
         if not self._is_target_group(event):
-            return  # non-target group: completely silent
+            return
 
         self._record_inbound(event)
 
         if self.style is None or self.rag is None or self.interjection is None:
-            return  # not initialized yet
+            return
+        if self.session_mgr is None or self.kg_provider is None:
+            return
 
         is_at = self._is_at_bot(event)
         sender_uin = str(event.get_sender_id() or "")
         text = (event.message_str or "").strip()
+        group_id = str(event.get_group_id() or "")
 
-        # Build live context from buffer (last N lines, formatted).
+        alias = self.style.preferred_alias(sender_uin) or f"群友{sender_uin}"
+        self.session_mgr.append(group_id, "user", text, name=alias)
+
         live_ctx = self.buffer.format_recent(max_lines=20) if self.buffer else ""
 
-        # Quick RAG probe — needed both for ranking and for interjection
-        # decisions. Skip if the trigger is obviously AT (still want hits
-        # for prompt augmentation though).
         top_score = 0.0
         hits: list[dict] = []
         rag_cfg = self.config.get("rag", {}) or {}
@@ -253,13 +274,27 @@ class PersonaAgent(Star):
             return
 
         if decision.action == ACTION_TOPIC:
-            # Sub-agent D will own this branch; v0.1 stays silent.
             logger.info("[persona_agent] topic action requested, but topic_bank not implemented yet")
             return
 
-        # ACTION_REPLY ----------------------------------------------------
         try:
-            reply_text = await self._generate_reply(event, text, live_ctx, hits)
+            recent = self.session_mgr.recent(group_id, n=20)
+            kg_result = await self.kg_provider.query(KGContext(
+                recent_messages=recent,
+                current_speaker=alias,
+                current_text=text,
+                group_id=group_id,
+            ))
+        except Exception as e:
+            logger.warning(f"[persona_agent] KG query failed: {e}")
+            kg_result = None
+
+        contexts = self.session_mgr.get_contexts(group_id)
+        if kg_result and kg_result.content:
+            contexts.append({"role": "system", "content": kg_result.content})
+
+        try:
+            reply_text = await self._generate_reply(event, text, contexts)
         except Exception as e:
             logger.exception(f"[persona_agent] LLM generation failed: {e}")
             return
@@ -278,12 +313,15 @@ class PersonaAgent(Star):
                 delay = min(0.3 + 0.06 * len(seg) + random.uniform(0, 0.4), 2.0)
                 await asyncio.sleep(delay)
             yield event.plain_result(seg)
+
         self.interjection.register_reply(
             now_utc=time.time(),
             trigger=decision.trigger,
             sender_uin=sender_uin,
         )
-        # Record bot's own message back into the buffer.
+
+        self.session_mgr.append(group_id, "assistant", reply_text)
+
         if self.buffer is not None:
             self.buffer.add(
                 ts=time.time(),
@@ -319,23 +357,10 @@ class PersonaAgent(Star):
         self,
         event: AstrMessageEvent,
         user_text: str,
-        live_ctx: str,
-        hits: list[dict],
+        contexts: list[dict],
     ) -> str:
         local_hour = self._local_hour()
         sys_prompt = self.style.system_prompt(local_hour=local_hour) if self.style else ""
-        examples = ""
-        if self.rag and hits:
-            examples = self.rag.format_examples(
-                hits,
-                max_chars=int((self.config.get("rag") or {}).get("max_example_chars", 800)),
-            )
-        if examples:
-            sys_prompt = f"{sys_prompt}\n\n{examples}"
-
-        contexts: list[dict] = []
-        if live_ctx:
-            contexts.append({"role": "user", "content": f"[群聊最近上下文]\n{live_ctx}"})
 
         provider_id = (self.config.get("llm") or {}).get("provider_id", "") or None
         if not provider_id:
@@ -350,7 +375,7 @@ class PersonaAgent(Star):
 
         resp = await self.context.llm_generate(
             chat_provider_id=provider_id,
-            prompt=user_text or "(no text)",
+            prompt=None,
             system_prompt=sys_prompt,
             contexts=contexts,
         )
