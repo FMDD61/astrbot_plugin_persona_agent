@@ -152,6 +152,7 @@ class InterjectionManager:
         sender_uin: str = "",
         last_group_msg_ts: Optional[float] = None,
         top_rag_score: float = 0.0,
+        emotion_multiplier: float = 1.0,
     ) -> Decision:
         """Make a single decision. Pure function over current state + inputs."""
         now_utc = now_utc if now_utc is not None else time.time()
@@ -215,11 +216,12 @@ class InterjectionManager:
                 )
 
             # ---- 2. RAG ----
-            if top_rag_score >= self.rag_score_threshold and silence <= self.silence_cap_sec:
+            effective_score = top_rag_score * emotion_multiplier
+            if effective_score >= self.rag_score_threshold and silence <= self.silence_cap_sec:
                 return Decision(
                     action=ACTION_REPLY, trigger=TRIGGER_RAG,
-                    reason=f"top RAG score {top_rag_score:.2f} >= {self.rag_score_threshold:.2f}",
-                    score=round(top_rag_score, 4),
+                    reason=f"top RAG score {top_rag_score:.2f}*{emotion_multiplier:.2f}={effective_score:.2f} >= {self.rag_score_threshold:.2f}",
+                    score=round(effective_score, 4),
                     hour=hour, hourly_budget=budget, hourly_used=self._hourly_used,
                     silence_sec=silence,
                 )

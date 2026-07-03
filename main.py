@@ -36,6 +36,7 @@ from .services.json_store import JsonStore
 from .services.context_buffer import ContextBuffer
 from .services.session_manager import SessionManager
 from .services.kg_provider import KGProvider, RagKGProvider, KGContext
+from .services.emotion import EmotionProvider, DefaultEmotionProvider, EmotionState
 
 
 class PersonaAgent(Star):
@@ -59,6 +60,8 @@ class PersonaAgent(Star):
         self.buffer: Optional[ContextBuffer] = None
         self.session_mgr: Optional[SessionManager] = None
         self.kg_provider: Optional[KGProvider] = None
+        self._emotion: Optional[EmotionProvider] = None
+        self._generating: dict[str, bool] = {}
 
         self._decision_log_path = self.data_dir / "decision_log.jsonl"
 
@@ -106,6 +109,7 @@ class PersonaAgent(Star):
             top_n_final=int(rag_cfg.get("top_n_final", 3)),
             max_chars=int(rag_cfg.get("max_example_chars", 400)),
         )
+        self._emotion = DefaultEmotionProvider()
 
         logger.info(
             f"[persona_agent] ready: target_group={self.target_group_id} "
@@ -251,6 +255,9 @@ class PersonaAgent(Star):
         alias = self.style.preferred_alias(sender_uin) or f"群友{sender_uin}"
         self.session_mgr.append(group_id, "user", text, name=alias)
 
+        if self._generating.get(group_id):
+            return
+
         live_ctx = self.buffer.format_recent(max_lines=20) if self.buffer else ""
 
         top_score = 0.0
@@ -268,12 +275,14 @@ class PersonaAgent(Star):
             logger.warning(f"[persona_agent] RAG query failed: {e}")
 
         last_msg_ts = self.buffer.last_ts() if self.buffer else time.time()
+        emotion_state = await self._emotion.query(group_id, self.session_mgr.recent(group_id, n=20)) if self._emotion else EmotionState.neutral()
         decision = self.interjection.decide(
             now_utc=time.time(),
             is_at_me=is_at,
             sender_uin=sender_uin,
             last_group_msg_ts=last_msg_ts,
             top_rag_score=top_score,
+            emotion_multiplier=emotion_state.global_willingness,
         )
         self._log_decision(decision.to_log(time.time(), sender_uin))
 
@@ -284,61 +293,65 @@ class PersonaAgent(Star):
             logger.info("[persona_agent] topic action requested, but topic_bank not implemented yet")
             return
 
+        self._generating[group_id] = True
         try:
-            recent = self.session_mgr.recent(group_id, n=20)
-            kg_result = await self.kg_provider.query(KGContext(
-                recent_messages=recent,
-                current_speaker=alias,
-                current_text=text,
-                group_id=group_id,
-            ))
-        except Exception as e:
-            logger.warning(f"[persona_agent] KG query failed: {e}")
+            await asyncio.sleep(0.5)
+
             kg_result = None
+            try:
+                recent = self.session_mgr.recent(group_id, n=20)
+                kg_result = await self.kg_provider.query(KGContext(
+                    recent_messages=recent,
+                    current_speaker=alias,
+                    current_text=text,
+                    group_id=group_id,
+                ))
+            except Exception as e:
+                logger.warning(f"[persona_agent] KG query failed: {e}")
 
-        contexts = self.session_mgr.get_contexts(group_id)
-        if kg_result and kg_result.content:
-            contexts.append({"role": "system", "content": kg_result.content})
+            contexts = self.session_mgr.get_contexts(group_id)
+            if kg_result and kg_result.content:
+                contexts.append({"role": "system", "content": kg_result.content})
 
-        try:
-            reply_text = await self._generate_reply(event, text, contexts)
-        except Exception as e:
-            logger.exception(f"[persona_agent] LLM generation failed: {e}")
-            return
+            try:
+                reply_text = await self._generate_reply(event, text, contexts, emotion_state)
+            except Exception as e:
+                logger.exception(f"[persona_agent] LLM generation failed: {e}")
+                return
 
-        reply_text = self._postprocess(reply_text)
-        if not reply_text:
-            logger.info("[persona_agent] empty reply after postprocess; skipping send")
-            return
+            reply_text = self._postprocess(reply_text)
+            if not reply_text:
+                logger.info("[persona_agent] empty reply after postprocess; skipping send")
+                return
 
-        segments = [s.strip() for s in reply_text.split("\n") if s.strip()]
-        if not segments:
-            return
+            yield event.plain_result(reply_text)
 
-        for i, seg in enumerate(segments):
-            if i > 0:
-                delay = min(0.3 + 0.06 * len(seg) + random.uniform(0, 0.4), 2.0)
-                await asyncio.sleep(delay)
-            yield event.plain_result(seg)
+            if emotion_state.sticker_prompt:
+                try:
+                    yield event.chain_result([Comp.Image.fromText(emotion_state.sticker_prompt)])
+                except Exception:
+                    pass
 
-        self.interjection.register_reply(
-            now_utc=time.time(),
-            trigger=decision.trigger,
-            sender_uin=sender_uin,
-        )
-
-        self.session_mgr.append(group_id, "assistant", reply_text)
-
-        if self.buffer is not None:
-            self.buffer.add(
-                ts=time.time(),
-                group_id=str(event.get_group_id() or ""),
-                sender_id=self.bot_qq,
-                sender_name="<bot>",
-                text=reply_text,
-                message_id="",
-                message_type="bot",
+            self.interjection.register_reply(
+                now_utc=time.time(),
+                trigger=decision.trigger,
+                sender_uin=sender_uin,
             )
+
+            self.session_mgr.append(group_id, "assistant", reply_text)
+
+            if self.buffer is not None:
+                self.buffer.add(
+                    ts=time.time(),
+                    group_id=str(event.get_group_id() or ""),
+                    sender_id=self.bot_qq,
+                    sender_name="<bot>",
+                    text=reply_text,
+                    message_id="",
+                    message_type="bot",
+                )
+        finally:
+            self._generating[group_id] = False
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.OTHER_MESSAGE)
@@ -365,9 +378,12 @@ class PersonaAgent(Star):
         event: AstrMessageEvent,
         user_text: str,
         contexts: list[dict],
+        emotion: Optional[EmotionState] = None,
     ) -> str:
         local_hour = self._local_hour()
         sys_prompt = self.style.system_prompt(local_hour=local_hour) if self.style else ""
+        if emotion and emotion.current_mood:
+            sys_prompt = f"{sys_prompt}\n\n{emotion.current_mood}"
 
         provider_id = (self.config.get("llm") or {}).get("provider_id", "") or None
         if not provider_id:
