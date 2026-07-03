@@ -42,6 +42,32 @@ from .services.memory_store import MemoryStore, MemoryEvent
 _RE_QUOTE_BLOCK = re.compile(r'\[引用消息\(.+?\)\]', re.DOTALL)
 _RE_AT_MARKER = re.compile(r'\[At:\d+\]')
 
+_RE_EMOJI = re.compile(
+    "["
+    "\U0001F300-\U0001F9FF"   # Misc Symbols, Pictographs, Emoticons, Supplemental
+    "\U0001FA00-\U0001FAFF"   # Symbols and Pictographs Extended-A
+    "\U00002600-\U000027BF"   # Misc Symbols + Dingbats
+    "\U0000FE0F\U0000200D"    # Variation Selector + ZWJ
+    "\U0001F1E0-\U0001F1FF"   # Regional Indicator Symbols
+    "\U00002B50\U00002764"    # ⭐ ❤
+    "]"
+)
+_RE_AT_USER = re.compile(r'(?<!\w)@\S+')
+_RE_PAREN_META = re.compile(
+    r'[（(]\s*'
+    r'(?:\d{5,}'                   # QQ number (5+ digits)
+    r'|day\s*\d+'                 # day counter
+    r'|第?\d+\s*天'              # 第N天 / N天
+    r'|群地位[↑↓]+'              # status tracker
+    r'|\d+/\d+'                   # fraction
+    r'|\b\d{2,4}\b'              # standalone number 2-4 digits
+    r')'
+    r'\s*[）)]'
+)
+
+_KOUPI_LIST = ("汪汪", "啃啃", "搓搓", "呜嘿", "bakabaka", "钨钼钨钼", "嗷呜")
+_KOUPI_MAX_TOTAL = 2
+
 
 class PersonaAgent(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -470,14 +496,57 @@ class PersonaAgent(Star):
         return False
 
     @staticmethod
+    def _strip_at_mentions(text: str) -> str:
+        return _RE_AT_USER.sub("", text)
+
+    @staticmethod
+    def _strip_meta_parens(text: str) -> str:
+        return _RE_PAREN_META.sub("", text)
+
+    @staticmethod
+    def _strip_emoji(text: str) -> str:
+        return _RE_EMOJI.sub("", text)
+
+    @staticmethod
+    def _cap_koupi(text: str) -> str:
+        occurrences: list[tuple[int, int]] = []
+        for phrase in _KOUPI_LIST:
+            idx = 0
+            while True:
+                pos = text.find(phrase, idx)
+                if pos == -1:
+                    break
+                occurrences.append((pos, len(phrase)))
+                idx = pos + len(phrase)
+        if len(occurrences) <= _KOUPI_MAX_TOTAL:
+            return text
+        occurrences.sort(key=lambda x: x[0])
+        parts: list[str] = []
+        prev_end = 0
+        for i, (pos, length) in enumerate(occurrences):
+            parts.append(text[prev_end:pos])
+            if i < _KOUPI_MAX_TOTAL:
+                parts.append(text[pos:pos + length])
+            prev_end = pos + length
+        parts.append(text[prev_end:])
+        return "".join(parts)
+
+    @staticmethod
     def _postprocess(text: str) -> str:
         if not text:
             return ""
-        bad = ["作为一个AI", "作为AI", "作为一名AI", "作为人工智能", "我是AI", "我是一个AI"]
+        bad = [
+            "作为一个AI", "作为AI", "作为一名AI", "作为人工智能", "我是AI", "我是一个AI",
+            "作为助手", "作为大模型", "作为语言模型", "我是一个大模型", "我是语言模型",
+        ]
         out = text.strip()
         for b in bad:
             out = out.replace(b, "")
-        out = re.sub(r"(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]) +(?=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])", "\n", out)
+        out = PersonaAgent._strip_at_mentions(out)
+        out = PersonaAgent._strip_meta_parens(out)
+        out = re.sub(r"(?<=[\u4e00-\u9fff]) +(?=[\u4e00-\u9fff])", "", out)
+        out = PersonaAgent._cap_koupi(out)
+        out = PersonaAgent._strip_emoji(out)
         lines = out.splitlines()
         if len(lines) > 8:
             lines = lines[:8]
