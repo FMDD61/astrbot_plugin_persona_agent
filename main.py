@@ -38,6 +38,7 @@ from .services.session_manager import SessionManager
 from .services.kg_provider import KGProvider, MultiSignalKGProvider, KGContext
 from .services.emotion import EmotionProvider, DefaultEmotionProvider, EmotionState
 from .services.memory_store import MemoryStore, MemoryEvent
+from .services.dream_job import DreamJob
 
 _RE_QUOTE_BLOCK = re.compile(r'\[引用消息\(.+?\)\]', re.DOTALL)
 _RE_AT_MARKER = re.compile(r'\[At:\d+\]')
@@ -92,6 +93,7 @@ class PersonaAgent(Star):
         self.kg_provider: Optional[KGProvider] = None
         self._emotion: Optional[EmotionProvider] = None
         self._memory_store: Optional[MemoryStore] = None
+        self._dream_job: Optional[DreamJob] = None
         self._generating: dict[str, bool] = {}
 
         self._decision_log_path = self.data_dir / "decision_log.jsonl"
@@ -143,6 +145,25 @@ class PersonaAgent(Star):
             max_chars=int(rag_cfg.get("max_example_chars", 400)),
         )
         self._emotion = DefaultEmotionProvider()
+        self._dream_job = DreamJob(self._memory_store, str(self.data_dir))
+
+        dream_cfg = self.config.get("dream", {}) or {}
+        if int(dream_cfg.get("enabled", 0)) == 1:
+            if self.context.cron_manager is not None:
+                await self.context.cron_manager.add_basic_job(
+                    name="persona_dream_job",
+                    cron_expression="0 3 * * 1",
+                    handler=self._dream_job.run,
+                    description="Weekly persona style drift report via MemoryStore analysis",
+                    timezone="Asia/Shanghai",
+                    enabled=True,
+                    persistent=False,
+                )
+                logger.info("[persona_agent] dream cron registered (weekly Mon 03:00 CST)")
+            else:
+                logger.warning("[persona_agent] cron_manager not available, dream cron NOT registered")
+        else:
+            logger.info("[persona_agent] dream.enabled=0, cron NOT registered")
 
         logger.info(
             f"[persona_agent] ready: target_group={self.target_group_id} "
@@ -269,8 +290,20 @@ class PersonaAgent(Star):
         if int((self.config.get("dream") or {}).get("enabled", 0)) != 1:
             yield event.plain_result("dream.enabled=0，已禁用做梦。")
             return
-        # Actual dream generation is sub-agent D's job (not in v0.1).
-        yield event.plain_result("dream_now: 子代理 D 尚未实装。")
+        if self._dream_job is None:
+            yield event.plain_result("DreamJob 尚未初始化。")
+            return
+        try:
+            report = await asyncio.to_thread(self._dream_job.run)
+            yield event.plain_result(
+                f"DreamJob 完成: 升级建议 {len(report.suggested_upgrades)} 人, "
+                f"降级建议 {len(report.suggested_downgrades)} 人, "
+                f"话题趋势 {len(report.topic_trends)} 个, "
+                f"分析 {report.stats.get('members_analyzed', 0)} 人."
+            )
+        except Exception as e:
+            logger.exception(f"[persona_agent] DreamJob.run() failed: {e}")
+            yield event.plain_result(f"DreamJob 失败: {e}")
 
     # ----------------------------------------------------------------- events
 
