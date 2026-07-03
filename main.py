@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -37,6 +38,9 @@ from .services.session_manager import SessionManager
 from .services.kg_provider import KGProvider, MultiSignalKGProvider, KGContext
 from .services.emotion import EmotionProvider, DefaultEmotionProvider, EmotionState
 from .services.memory_store import MemoryStore, MemoryEvent
+
+_RE_QUOTE_BLOCK = re.compile(r'\[引用消息\(.+?\)\]', re.DOTALL)
+_RE_AT_MARKER = re.compile(r'\[At:\d+\]')
 
 
 class PersonaAgent(Star):
@@ -104,6 +108,7 @@ class PersonaAgent(Star):
             data_dir=str(self.data_dir),
             max_messages=int(cb_cfg.get("session_max_messages", 300)),
         )
+        self._memory_store = MemoryStore(str(self.data_dir))
         self.kg_provider = MultiSignalKGProvider(
             rag=self.rag,
             store=self._memory_store,
@@ -112,7 +117,6 @@ class PersonaAgent(Star):
             max_chars=int(rag_cfg.get("max_example_chars", 400)),
         )
         self._emotion = DefaultEmotionProvider()
-        self._memory_store = MemoryStore(str(self.data_dir))
 
         logger.info(
             f"[persona_agent] ready: target_group={self.target_group_id} "
@@ -141,6 +145,13 @@ class PersonaAgent(Star):
             if isinstance(seg, Comp.At) and str(getattr(seg, "qq", "")) == self_id:
                 return True
         return False
+
+    @staticmethod
+    def _clean_message_text(text: str) -> str:
+        """Strip [引用消息(...)] and [At:QQ] blocks from raw message text."""
+        t = _RE_QUOTE_BLOCK.sub("", text)
+        t = _RE_AT_MARKER.sub("", t)
+        return t.strip()
 
     def _log_decision(self, payload: dict) -> None:
         try:
@@ -252,7 +263,7 @@ class PersonaAgent(Star):
 
         is_at = self._is_at_bot(event)
         sender_uin = str(event.get_sender_id() or "")
-        text = (event.message_str or "").strip()
+        text = self._clean_message_text(event.message_str or "")
         group_id = str(event.get_group_id() or "")
 
         alias = self.style.preferred_alias(sender_uin) or f"群友{sender_uin}"
@@ -305,10 +316,12 @@ class PersonaAgent(Star):
         self._log_decision(decision.to_log(time.time(), sender_uin))
 
         if decision.action == ACTION_SILENT:
+            event.stop_event()
             return
 
         if decision.action == ACTION_TOPIC:
             logger.info("[persona_agent] topic action requested, but topic_bank not implemented yet")
+            event.stop_event()
             return
 
         self._generating[group_id] = True
@@ -414,19 +427,47 @@ class PersonaAgent(Star):
             logger.warning("[persona_agent] no LLM provider available")
             return ""
 
-        resp = await self.context.llm_generate(
-            chat_provider_id=provider_id,
-            prompt=None,
-            system_prompt=sys_prompt,
-            contexts=contexts,
-        )
-        return (getattr(resp, "completion_text", "") or "").strip()
+        try:
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=None,
+                system_prompt=sys_prompt,
+                contexts=contexts,
+            )
+        except Exception as e:
+            logger.exception(f"[persona_agent] llm_generate raised: {e}")
+            return ""
+
+        text = (getattr(resp, "completion_text", "") or "").strip()
+        if self._is_error_response(text):
+            logger.warning(f"[persona_agent] llm returned error response, suppressed ({len(text)} chars)")
+            return ""
+        return text
 
     # ----------------------------------------------------------------- misc
 
     def _local_hour(self) -> int:
         offset = int((self.config.get("interjection") or {}).get("local_tz_offset_hours", 8))
         return int(((time.time() / 3600.0) + offset) % 24)
+
+    @staticmethod
+    def _is_error_response(text: str) -> bool:
+        t = text.strip()
+        if not t:
+            return True
+        if t.startswith("{"):
+            try:
+                obj = json.loads(t)
+                if isinstance(obj, dict):
+                    if {"error_code", "error_name", "cloudflare_error", "error_category"} & set(obj.keys()):
+                        return True
+                    if "type" in obj and "error" in str(obj["type"]).lower():
+                        return True
+                    if isinstance(obj.get("status"), int) and obj["status"] >= 400:
+                        return True
+            except json.JSONDecodeError:
+                pass
+        return False
 
     @staticmethod
     def _postprocess(text: str) -> str:
@@ -436,7 +477,6 @@ class PersonaAgent(Star):
         out = text.strip()
         for b in bad:
             out = out.replace(b, "")
-        import re
         out = re.sub(r"(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]) +(?=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])", "\n", out)
         lines = out.splitlines()
         if len(lines) > 8:
