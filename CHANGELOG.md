@@ -9,8 +9,14 @@
 ## [Unreleased]
 
 ### Added
+- **MemoryStore (Phase 1)**: SQLite-backed ADD-only entity + relation graph with FTS5 BM25 search
+  - Entity extraction: jieba keywords + @mention detection + alias matching
+  - ADD-only edges: never overwrite, append with timestamp for temporal decay
+  - `get_relation(from, to)` → interaction count, closeness tier, common topics
+  - `get_hot_topics(group)` → trending topics in last 7 days
+  - `search_bm25(text)` → FTS5 full-text keyword search
+  - fire-and-forget `ingest()` in main.py via `asyncio.to_thread()`
 - 三层 AI 记忆架构设计 (检索层 + 存储层 + 进化层)
-- MemoryStore 抽象接口 (设计阶段)
 - DreamJob 周 cron 关系漂移检测 (设计阶段)
 
 ### Changed
