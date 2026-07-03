@@ -39,6 +39,7 @@ from .services.kg_provider import KGProvider, MultiSignalKGProvider, KGContext
 from .services.emotion import EmotionProvider, DefaultEmotionProvider, EmotionState
 from .services.memory_store import MemoryStore, MemoryEvent
 from .services.dream_job import DreamJob
+from .services.conflict_detector import ConflictDetector
 
 _RE_QUOTE_BLOCK = re.compile(r'\[引用消息\(.+?\)\]', re.DOTALL)
 _RE_AT_MARKER = re.compile(r'\[At:\d+\]')
@@ -66,7 +67,7 @@ _RE_PAREN_META = re.compile(
     r'\s*[）)]'
 )
 
-_KOUPI_LIST = ("汪汪", "啃啃", "搓搓", "呜嘿", "bakabaka", "钨钼钨钼", "嗷呜")
+_KOUPI_LIST = ("啃啃", "搓搓", "呜嘿", "bakabaka", "钨钼钨钼", "嗷呜", "捏猫猫的")
 _KOUPI_MAX_TOTAL = 2
 
 
@@ -94,6 +95,7 @@ class PersonaAgent(Star):
         self._emotion: Optional[EmotionProvider] = None
         self._memory_store: Optional[MemoryStore] = None
         self._dream_job: Optional[DreamJob] = None
+        self._conflict_detector: Optional[ConflictDetector] = None
         self._generating: dict[str, bool] = {}
 
         self._decision_log_path = self.data_dir / "decision_log.jsonl"
@@ -165,6 +167,10 @@ class PersonaAgent(Star):
         else:
             logger.info("[persona_agent] dream.enabled=0, cron NOT registered")
 
+        self._conflict_detector = ConflictDetector(
+            keywords_dir=str(self.data_dir),
+        )
+
         logger.info(
             f"[persona_agent] ready: target_group={self.target_group_id} "
             f"test_mode={self.test_mode} test_group={self.test_group_id} "
@@ -205,6 +211,25 @@ class PersonaAgent(Star):
             self.store.append_jsonl("decision_log.jsonl", payload)
         except Exception as e:  # never let logging crash the handler
             logger.warning(f"[persona_agent] decision log write failed: {e}")
+
+    async def _notify_admin(self, context_summary: str, group_id: str, speaker: str) -> None:
+        binding = self.store.load_json("admin_binding.json", {})
+        umo = binding.get("unified_msg_origin")
+        if not umo:
+            logger.warning("[persona_agent] conflict detected but no admin binding; notification skipped")
+            return
+        msg = (
+            f"[冲突警告] 群 {group_id}\n"
+            f"触发者: {speaker}\n"
+            f"上下文: {context_summary[:200]}"
+        )
+        try:
+            from astrbot.api.event import MessageChain
+            chain = MessageChain().message(msg)
+            await self.context.send_message(umo, chain)
+            logger.info(f"[persona_agent] conflict notification sent to admin")
+        except Exception as e:
+            logger.warning(f"[persona_agent] failed to send admin notification: {e}")
 
     def _record_inbound(self, event: AstrMessageEvent) -> None:
         if self.buffer is None:
@@ -285,6 +310,21 @@ class PersonaAgent(Star):
         })
         yield event.plain_result(f"已绑定私聊会话: {umo}")
 
+    @filter.command("bind_admin")
+    async def cmd_bind_admin(self, event: AstrMessageEvent):
+        """Bind the current private-chat UMO for admin conflict notifications."""
+        gid = event.get_group_id()
+        if gid:
+            yield event.plain_result("请在私聊中执行 /bind_admin。")
+            return
+        umo = event.unified_msg_origin
+        self.store.save_json("admin_binding.json", {
+            "unified_msg_origin": umo,
+            "bound_at": int(time.time()),
+            "sender_id": str(event.get_sender_id() or ""),
+        })
+        yield event.plain_result(f"已绑定管理员通知会话: {umo}")
+
     @filter.command("dream_now")
     async def cmd_dream_now(self, event: AstrMessageEvent):
         if int((self.config.get("dream") or {}).get("enabled", 0)) != 1:
@@ -333,6 +373,17 @@ class PersonaAgent(Star):
                 self._memory_store.ingest,
                 MemoryEvent(speaker_alias=alias, text=text, group_id=group_id),
             ))
+
+        if self._conflict_detector is not None:
+            conflict_ctx = self._conflict_detector.feed(time.time(), alias, text)
+            if conflict_ctx:
+                is_conflict = await self._conflict_detector.verify_with_llm(
+                    self.context, conflict_ctx
+                )
+                if is_conflict:
+                    event.stop_event()
+                    await self._notify_admin(conflict_ctx, group_id, alias)
+                    return
 
         if self._generating.get(group_id):
             return

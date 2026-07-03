@@ -94,7 +94,7 @@ class StyleProfile:
     def system_prompt(self, local_hour: Optional[int] = None) -> str:
         f = self._get("system_prompt_fragments.json")
         parts: list[str] = []
-        for key in ("identity", "tone", "vocabulary", "schedule", "relations"):
+        for key in ("identity", "tone", "vocabulary", "schedule", "relations", "group_context", "personality"):
             v = f.get(key)
             if isinstance(v, str) and v.strip():
                 parts.append(v.strip())
@@ -125,6 +125,8 @@ class StyleProfile:
             uin = str(m.get("uin", ""))
             alias = (m.get("alias") or "").strip()
             if not uin or not alias:
+                continue
+            if m.get("notes") == "bot":
                 continue
             if alias in seen_aliases:
                 continue
