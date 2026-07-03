@@ -9,6 +9,13 @@
 ## [Unreleased]
 
 ### Added
+- **DreamJob (Phase 3)**: 周 cron 记忆巩固与风格漂移报告
+  - `_build_member_stats`: 从 MemoryStore 边计算活跃天数/日均互动/连续天数
+  - `_data_closeness`: 纯数据驱动亲密度分级 (new/known/close)
+  - `_suggest_upgrades`: 自动建议升级 (>=60天→known, >=90天→close)
+  - `_suggest_downgrades`: >=90天无互动 → 建议降级(需人工确认)
+  - `_detect_topic_trends`: 话题趋势周环比
+  - 输出 `style_drift_report.json` (原子写, 不覆盖人工文件)
 - **MultiSignalKGProvider (Phase 2)**: 多信号融合检索替代 RagKGProvider
   - dense(BGE向量) + BM25(FTS5关键词) + entity(alias实体匹配) 三路加权融合
   - graph augmentation: 注入说话人与 bot 的互动模式 (closeness tier, 共同话题)

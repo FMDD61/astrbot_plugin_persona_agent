@@ -240,20 +240,20 @@ class MemoryStore:
     ) -> list[RelationEdge]:
         cutoff = time.time() - since_days * 86400
         with self._lock, self._get_conn() as conn:
+            where = ["ts >= ?"]
+            params = [cutoff]
+            if entity:
+                where.append("(from_alias=? OR to_alias=?)")
+                params.extend([entity, entity])
             if edge_type:
-                rows = conn.execute(
-                    "SELECT from_alias, to_alias, type, ts, properties_json FROM edges "
-                    "WHERE (from_alias=? OR to_alias=?) AND type=? AND ts >= ? "
-                    "ORDER BY ts DESC LIMIT ?",
-                    (entity, entity, edge_type, cutoff, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT from_alias, to_alias, type, ts, properties_json FROM edges "
-                    "WHERE (from_alias=? OR to_alias=?) AND ts >= ? "
-                    "ORDER BY ts DESC LIMIT ?",
-                    (entity, entity, cutoff, limit),
-                ).fetchall()
+                where.append("type=?")
+                params.append(edge_type)
+            clause = " AND ".join(where)
+            rows = conn.execute(
+                f"SELECT from_alias, to_alias, type, ts, properties_json FROM edges "
+                f"WHERE {clause} ORDER BY ts DESC LIMIT ?",
+                params + [limit],
+            ).fetchall()
         return [
             RelationEdge(
                 from_alias=r[0], to_alias=r[1], type=r[2], ts=r[3],
