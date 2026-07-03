@@ -36,6 +36,7 @@ from .services.context_buffer import ContextBuffer
 from .services.session_manager import SessionManager
 from .services.kg_provider import KGProvider, RagKGProvider, KGContext
 from .services.emotion import EmotionProvider, DefaultEmotionProvider, EmotionState
+from .services.memory_store import MemoryStore, MemoryEvent
 
 
 class PersonaAgent(Star):
@@ -60,6 +61,7 @@ class PersonaAgent(Star):
         self.session_mgr: Optional[SessionManager] = None
         self.kg_provider: Optional[KGProvider] = None
         self._emotion: Optional[EmotionProvider] = None
+        self._memory_store: Optional[MemoryStore] = None
         self._generating: dict[str, bool] = {}
 
         self._decision_log_path = self.data_dir / "decision_log.jsonl"
@@ -109,6 +111,7 @@ class PersonaAgent(Star):
             max_chars=int(rag_cfg.get("max_example_chars", 400)),
         )
         self._emotion = DefaultEmotionProvider()
+        self._memory_store = MemoryStore(str(self.data_dir))
 
         logger.info(
             f"[persona_agent] ready: target_group={self.target_group_id} "
@@ -253,6 +256,12 @@ class PersonaAgent(Star):
 
         alias = self.style.preferred_alias(sender_uin) or f"群友{sender_uin}"
         self.session_mgr.append(group_id, "user", text, name=alias)
+
+        if self._memory_store is not None:
+            asyncio.create_task(asyncio.to_thread(
+                self._memory_store.ingest,
+                MemoryEvent(speaker_alias=alias, text=text, group_id=group_id),
+            ))
 
         if self._generating.get(group_id):
             return
