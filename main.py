@@ -34,7 +34,7 @@ from .services.interjection import (
 from .services.json_store import JsonStore
 from .services.context_buffer import ContextBuffer
 from .services.session_manager import SessionManager
-from .services.kg_provider import KGProvider, RagKGProvider, KGContext
+from .services.kg_provider import KGProvider, MultiSignalKGProvider, KGContext
 from .services.emotion import EmotionProvider, DefaultEmotionProvider, EmotionState
 from .services.memory_store import MemoryStore, MemoryEvent
 
@@ -104,8 +104,9 @@ class PersonaAgent(Star):
             data_dir=str(self.data_dir),
             max_messages=int(cb_cfg.get("session_max_messages", 300)),
         )
-        self.kg_provider = RagKGProvider(
-            self.rag,
+        self.kg_provider = MultiSignalKGProvider(
+            rag=self.rag,
+            store=self._memory_store,
             k_retrieve=int(rag_cfg.get("k_retrieve", 8)),
             top_n_final=int(rag_cfg.get("top_n_final", 3)),
             max_chars=int(rag_cfg.get("max_example_chars", 400)),
@@ -283,7 +284,16 @@ class PersonaAgent(Star):
             logger.warning(f"[persona_agent] RAG query failed: {e}")
 
         last_msg_ts = self.buffer.last_ts() if self.buffer else time.time()
-        emotion_state = await self._emotion.query(group_id, self.session_mgr.recent(group_id, n=20)) if self._emotion else EmotionState.neutral()
+        emotion_state = await self._emotion.query(
+            group_id,
+            self.session_mgr.recent(group_id, n=20),
+            kg_ctx=KGContext(
+                recent_messages=self.session_mgr.recent(group_id, n=20),
+                current_speaker=alias,
+                current_text=text,
+                group_id=group_id,
+            ),
+        ) if self._emotion else EmotionState.neutral()
         decision = self.interjection.decide(
             now_utc=time.time(),
             is_at_me=is_at,

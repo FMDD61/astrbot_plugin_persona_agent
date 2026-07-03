@@ -6,12 +6,16 @@ Hooks into two points in the reply pipeline:
                             sticker_prompt triggers an image send via Comp.Image.
 
 v1: DefaultEmotionProvider returns neutral (no emotional influence).
-Future: issue #2 knowledge-graph provider feeds real emotion state.
+v2: KGContext accepted for structured context (forward-compat with Phase 3 DreamJob).
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .kg_provider import KGContext
 
 
 @dataclass
@@ -27,10 +31,20 @@ class EmotionState:
 
 class EmotionProvider(ABC):
     @abstractmethod
-    async def query(self, group_id: str, recent_msgs: list[dict]) -> EmotionState:
+    async def query(
+        self,
+        group_id: str,
+        recent_msgs: list[dict],
+        kg_ctx: Optional["KGContext"] = None,
+    ) -> EmotionState:
         ...
 
 
 class DefaultEmotionProvider(EmotionProvider):
-    async def query(self, group_id: str, recent_msgs: list[dict]) -> EmotionState:
+    async def query(
+        self,
+        group_id: str,
+        recent_msgs: list[dict],
+        kg_ctx: Optional["KGContext"] = None,
+    ) -> EmotionState:
         return EmotionState.neutral()

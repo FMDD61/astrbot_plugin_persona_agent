@@ -9,6 +9,11 @@
 ## [Unreleased]
 
 ### Added
+- **MultiSignalKGProvider (Phase 2)**: 多信号融合检索替代 RagKGProvider
+  - dense(BGE向量) + BM25(FTS5关键词) + entity(alias实体匹配) 三路加权融合
+  - graph augmentation: 注入说话人与 bot 的互动模式 (closeness tier, 共同话题)
+  - 保留 _format 接口: 结构化风格指引注入 contexts 末尾
+- **EmotionProvider.query()** 新增 `kg_ctx: Optional[KGContext]` 参数 (Phase 3 兼容)
 - **MemoryStore (Phase 1)**: SQLite-backed ADD-only entity + relation graph with FTS5 BM25 search
   - Entity extraction: jieba keywords + @mention detection + alias matching
   - ADD-only edges: never overwrite, append with timestamp for temporal decay
