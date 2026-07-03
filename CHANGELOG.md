@@ -16,6 +16,21 @@
   - `_suggest_downgrades`: >=90天无互动 → 建议降级(需人工确认)
   - `_detect_topic_trends`: 话题趋势周环比
   - 输出 `style_drift_report.json` (原子写, 不覆盖人工文件)
+- **ConflictDetector**: 三阶段冲突检测 (关键词 → burst → LLM 语义确认)
+  - `conflict_keywords.json`: 人工可编辑冲突关键词库 (mtime 热重载)
+  - `/bind_admin`: 绑定管理员私聊会话, 冲突时推送通知
+  - 30min 冷却, 检测到冲突自动 `stop_event`
+- **system_prompt_fragments 增强**:
+  - `vocabulary` 重写: 口癖与表达习惯分离, 新增群内术语解释
+  - 新增 `group_context` 字段: 群介绍 + 群规
+  - 新增 `personality` 字段: 人物性格描述
+- **`/bind_admin`**: 独立的冲突通知绑定, 与 dream_binding 解耦
+  - `_build_member_stats`: 从 MemoryStore 边计算活跃天数/日均互动/连续天数
+  - `_data_closeness`: 纯数据驱动亲密度分级 (new/known/close)
+  - `_suggest_upgrades`: 自动建议升级 (>=60天→known, >=90天→close)
+  - `_suggest_downgrades`: >=90天无互动 → 建议降级(需人工确认)
+  - `_detect_topic_trends`: 话题趋势周环比
+  - 输出 `style_drift_report.json` (原子写, 不覆盖人工文件)
 - **MultiSignalKGProvider (Phase 2)**: 多信号融合检索替代 RagKGProvider
   - dense(BGE向量) + BM25(FTS5关键词) + entity(alias实体匹配) 三路加权融合
   - graph augmentation: 注入说话人与 bot 的互动模式 (closeness tier, 共同话题)
@@ -32,6 +47,11 @@
 - DreamJob 周 cron 关系漂移检测 (设计阶段)
 
 ### Changed
+- `system_prompt_fragments.json`: vocabulary 重写 (口癖与术语分离), 新增 group_context / personality
+- `style_profile.py`: `system_prompt()` 增加 group_context / personality key; `_build_alias_block()` 跳过 bot
+- `member_relations.json`: 星野 / 苗爷 标记为 bot
+- `main.py` `_KOUPI_LIST`: 移除 `汪汪`(人名), 新增 `捏猫猫的`
+- `DEPLOYMENT_GUIDE.md`: §8 重写为 git pull 工作流 + DreamJob cron + style 文件同步
 - PostgreSQL 图表替代 pure ChromaDB 的存储方案规划
 
 ---
