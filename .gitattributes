@@ -1,0 +1,17 @@
+# 行尾规范化策略（wsl-win-bridge 规范，2026-08-16 迁移时锁定）
+* text=auto
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
+# 二进制显式声明，防 text=auto 误判
+*.zip  binary
+*.gz   binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.db   binary
