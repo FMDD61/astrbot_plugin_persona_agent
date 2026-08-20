@@ -54,6 +54,16 @@
 - `DEPLOYMENT_GUIDE.md`: §8 重写为 git pull 工作流 + DreamJob cron + style 文件同步
 - PostgreSQL 图表替代 pure ChromaDB 的存储方案规划
 
+### Fixed
+- **requirements.txt**: `chromadb` / `sentence-transformers` 由 `>=` 钉死为 `==0.5.23` / `==3.3.1`
+  - 与预构建 RAG 产物（0.5.23 构建）及 AGENTS.md 文档对齐，避免 pip 解析到 chromadb 1.x 导致产物不可读
+- **tools/smoke_rag.py**: 修复文档/代码漂移
+  - 新增 `--data-dir` 参数（默认开发工作区 `<插件父目录>/data_out`）
+  - 新增 `--real`：用真实 chromadb+BGE 后端读取预构建产物做 RAG 查询验证（默认仍为 Fake 后端离线跑）
+  - 修复相对导入：支持 `python -m tools.smoke_rag`（repo 根）与 `python -m astrbot_plugin_persona_agent.tools.smoke_rag`（插件父目录）两种运行方式
+  - 更新 docstring 用法说明
+- **DEPLOYMENT_GUIDE.md**: §4.7 / §4B.5 / §12 冒烟命令与实际工具行为对齐（离线默认 + `--real` 真实验证）
+
 ---
 
 ## [0.2.0] — 2026-07-03

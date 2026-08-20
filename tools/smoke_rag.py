@@ -1,4 +1,4 @@
-﻿"""End-to-end smoke test for sub-agent C (style_profile + rag + interjection).
+"""End-to-end smoke test for sub-agent C (style_profile + rag + interjection).
 
 Runs on the Windows workspace without chromadb / sentence-transformers /
 torch installed. We inject:
@@ -14,14 +14,29 @@ then walk a tiny scripted group transcript through the pipeline:
   3. Feed top_rag_score + @-flag + silence into InterjectionManager.
   4. Print a compact decision log.
 
-Run:
-    $env:PYTHONIOENCODING="utf-8"
-    python -m astrbot_plugin_persona_agent.tools.smoke_rag
+默认用 Fake 后端（离线，不需真实依赖），也可用 `--real` 对预构建 chromadb 产物做真实 RAG 查询验证。
+
+运行方式（两种等价）:
+
+    1) 在插件目录（repo 根）内直接以工具包运行:
+        python -m tools.smoke_rag
+        python -m tools.smoke_rag --data-dir /opt/AstrBot/data/plugin_data/astrbot_plugin_persona_agent
+
+    2) 在插件父目录以完整包路径运行:
+        python -m astrbot_plugin_persona_agent.tools.smoke_rag --data-dir <数据目录>
+
+真实 RAG 链路验证（读取预构建 chromadb 产物 + BGE 嵌入）:
+        python -m tools.smoke_rag --real --data-dir <数据目录>
+
+参数:
+    --data-dir  数据目录（含风格 JSON 与 chromadb/ 产物；默认开发工作区 <插件父目录>/data_out）
+    --real      使用真实 chromadb + BGE 后端做 RAG 查询（默认用 Fake 后端离线跑）
 
 Exit code 0 means all assertions passed.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import time
@@ -32,19 +47,34 @@ def _iso_utc(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 from pathlib import Path
 
-from ..services.style_profile import StyleProfile
-from ..services.rag_service import RagService
-from ..services.interjection import (
-    InterjectionManager,
-    TRIGGER_AT,
-    TRIGGER_RAG,
-    TRIGGER_SILENT,
-    ACTION_REPLY,
-    ACTION_SILENT,
-)
+# 同时支持两种运行方式：
+#   - `python -m astrbot_plugin_persona_agent.tools.smoke_rag`（插件父目录，相对导入生效）
+#   - `python -m tools.smoke_rag`（repo 根目录，回退到顶层 services 包）
+try:
+    from ..services.style_profile import StyleProfile
+    from ..services.rag_service import RagService
+    from ..services.interjection import (
+        InterjectionManager,
+        TRIGGER_AT,
+        TRIGGER_RAG,
+        TRIGGER_SILENT,
+        ACTION_REPLY,
+        ACTION_SILENT,
+    )
+except ImportError:
+    from services.style_profile import StyleProfile
+    from services.rag_service import RagService
+    from services.interjection import (
+        InterjectionManager,
+        TRIGGER_AT,
+        TRIGGER_RAG,
+        TRIGGER_SILENT,
+        ACTION_REPLY,
+        ACTION_SILENT,
+    )
 
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "data_out"
+DEFAULT_DATA_DIR = Path(__file__).resolve().parents[2] / "data_out"
 
 
 # ---------------- fakes ----------------
@@ -151,17 +181,71 @@ SCENARIOS = [
 ]
 
 
-def main() -> int:
-    if not DATA_DIR.exists():
-        print(f"[FATAL] data_out missing: {DATA_DIR}", file=sys.stderr)
-        return 2
-
-    sp = StyleProfile(DATA_DIR)
+def _run_fake_rag(data_dir: Path) -> None:
+    """离线冒烟：Fake 嵌入 + Fake 集合，验证 RAG 排序与格式（不需真实依赖）。"""
     rag = RagService(
-        DATA_DIR,
+        data_dir,
         backend=FakeEmbedding(),
         collection=FakeChroma(FIXTURE),
     )
+    hits = rag.query("今天打瓦", k=8, now_utc=NOW, top_n_final=3)
+    assert hits, "RAG returned 0 hits"
+    assert hits[0]["id"] == "pair_0001", f"expected pair_0001 first, got {hits[0]['id']}"
+    assert hits[0]["score"] > hits[-1]["score"], "scores not descending"
+    block = rag.format_examples(hits, max_chars=600)
+    assert "示例1" in block and "来 我开黑" in block, "example block missing content"
+    print(f"[ok] RAG(fake): top_score={hits[0]['score']:.3f} dense={hits[0]['dense']:.2f} "
+          f"recency={hits[0]['recency']:.2f} hour={hits[0]['hour_match']:.2f}")
+    print(f"[ok] format_examples len={len(block)}")
+
+
+def _run_real(data_dir: Path) -> None:
+    """真实冒烟：读取预构建 chromadb 产物 + BGE 嵌入做真实 RAG 查询。"""
+    print("[real] 加载真实 chromadb + BGE 后端（首次会加载模型，较慢）...")
+    rag = RagService(data_dir)  # 未注入 mock → 惰性加载 sentence-transformers + chromadb
+    hits = rag.query("今天来打瓦吗 来一把", k=8, now_utc=None, top_n_final=3)
+    assert hits, "real RAG returned 0 hits"
+    try:
+        import chromadb  # noqa: PLC0415
+        coll = chromadb.PersistentClient(
+            path=str(data_dir / "chromadb")
+        ).get_collection("persona_pairs")
+        count = coll.count()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[real] (collection count skipped: {exc})")
+        count = None
+    block = rag.format_examples(hits, max_chars=600)
+    assert "示例1" in block, "real format_examples missing 示例1"
+    print(f"[ok] real RAG: count={count} hits={len(hits)} top_id={hits[0]['id']} "
+          f"top_score={hits[0]['score']:.3f} block_len={len(block)}")
+    for h in hits[:3]:
+        print(f"      {h['id']:<14} dense={h['dense']:.2f} recency={h['recency']:.2f} "
+              f"score={h['score']:.3f}")
+    print("[ok] real format_examples ok")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="persona_agent 冒烟测试：风格文件加载 + RAG 排序 + 插话决策"
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=str(DEFAULT_DATA_DIR),
+        help="数据目录（含风格 JSON 与 chromadb/ 产物）。默认开发工作区 <插件父目录>/data_out。",
+    )
+    parser.add_argument(
+        "--real",
+        action="store_true",
+        help="用真实 chromadb+BGE 后端跑 RAG 查询验证（默认用 Fake 后端离线跑）。",
+    )
+    args = parser.parse_args()
+    data_dir = Path(args.data_dir)
+
+    if not data_dir.exists():
+        print(f"[FATAL] data dir missing: {data_dir}", file=sys.stderr)
+        return 2
+
+    sp = StyleProfile(data_dir)
 
     # ---- StyleProfile sanity ----
     sys_prompt = sp.system_prompt(local_hour=22)
@@ -170,20 +254,16 @@ def main() -> int:
     peaks = sp.peak_hours()
     print(f"[ok] StyleProfile: prompt_len={len(sys_prompt)} budget(22h)={h22_budget:.2f} peak_count={len(peaks)}")
 
-    # ---- RAG ranking ----
-    hits = rag.query("今天打瓦", k=8, now_utc=NOW, top_n_final=3)
-    assert hits, "RAG returned 0 hits"
-    assert hits[0]["id"] == "pair_0001", f"expected pair_0001 first, got {hits[0]['id']}"
-    assert hits[0]["score"] > hits[-1]["score"], "scores not descending"
-    block = rag.format_examples(hits, max_chars=600)
-    assert "示例1" in block and "来 我开黑" in block, "example block missing content"
-    print(f"[ok] RAG: top_score={hits[0]['score']:.3f} dense={hits[0]['dense']:.2f} "
-          f"recency={hits[0]['recency']:.2f} hour={hits[0]['hour_match']:.2f}")
-    print(f"[ok] format_examples len={len(block)}")
+    # ---- RAG backend（Fake 离线 or 真实）----
+    if args.real:
+        _run_real(data_dir)
+    else:
+        _run_fake_rag(data_dir)
 
     # ---- StyleProfile hot reload ----
-    frag_path = DATA_DIR / "system_prompt_fragments.json"
+    frag_path = data_dir / "system_prompt_fragments.json"
     original = frag_path.read_text("utf-8")
+    print("[note] 热重载测试会临时改写 system_prompt_fragments.json 并自动还原")
     try:
         bumped = json.loads(original)
         marker = bumped.get("identity", "") + "  // smoke"
