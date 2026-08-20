@@ -1,6 +1,7 @@
 ijson>=3.2.0
 jieba>=0.42.1
-chromadb>=0.5.0
-sentence-transformers>=3.0.0
+# 版本与预构建 RAG 产物对齐（上游要求），保证跨机可移植性，勿随意升级
+chromadb==0.5.23
+sentence-transformers==3.3.1
 FlagEmbedding>=1.2.0
 numpy>=1.26.0
