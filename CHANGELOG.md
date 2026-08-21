@@ -68,6 +68,13 @@
   - 修复：只从本地 HF 缓存加载（模型已预置 781M 缓存），离线加载约 4s；不再联网阻塞
   - 注意：新机器须先预下载 BGE 模型，否则启动首次 RAG 会直接报错而非自动下载
 
+### Docs（2026-08-22 本地文档审计，暂未推送）
+- **README.md**: 更新架构/MemoryStore(SQLite)/部署步骤(BGE 离线预下载 + root NapCat)/当前状态到 v0.4
+- **DEPLOYMENT_GUIDE.md / OPERATIONS.md / AGENTS.md（工作区根）**: 同步实测部署状态、
+  BGE 离线修复、root NapCat 风控红线、归档历史文档到 `docs/archive/`
+- **历史文档**: `docs/specs/*`、`GPU_FIX_BACKLOG.md`、`验机装机操作清单.md`、`authorization.md` 移入
+  `docs/archive/`；一次性 `新建 文本文档.txt` 删除
+
 ---
 
 ## [0.2.0] — 2026-07-03
