@@ -11,6 +11,7 @@ See IMPLEMENTATION_PLAN.md (sections 1, 2, 8, 9) and DEPLOYMENT_GUIDE.md.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -548,11 +549,79 @@ class PersonaAgent(Star):
             logger.exception(f"[persona_agent] llm_generate raised: {e}")
             return ""
 
+        self._log_llm_probe(event, contexts, sys_prompt, provider_id, resp, local_hour)
+
         text = (getattr(resp, "completion_text", "") or "").strip()
         if self._is_error_response(text):
             logger.warning(f"[persona_agent] llm returned error response, suppressed ({len(text)} chars)")
             return ""
         return text
+
+    def _log_llm_probe(
+        self,
+        event: AstrMessageEvent,
+        contexts: list[dict],
+        sys_prompt: str,
+        provider_id: str,
+        resp: object,
+        local_hour: int,
+    ) -> None:
+        """Observability probe: session continuity + provider KV/prefix-cache usage.
+
+        Appends one record to llm_cache_probe.jsonl per generation. Never
+        raises; failures only warn. Exists for the 2026-08 evaluation round.
+        """
+        try:
+            gid = str(event.get_group_id() or "")
+            session_size = self.session_mgr.size(gid) if self.session_mgr else -1
+            kg_tail_chars = 0
+            if contexts and isinstance(contexts[-1], dict) and contexts[-1].get("role") == "system":
+                kg_tail_chars = len(str(contexts[-1].get("content", "")))
+            total_chars = sum(
+                len(str(m.get("content", ""))) if isinstance(m, dict) else 0
+                for m in contexts
+            )
+            usage = getattr(resp, "usage", None)
+            usage_d: dict = {}
+            if usage is not None:
+                usage_d = {
+                    "input_other": getattr(usage, "input_other", None),
+                    "input_cached": getattr(usage, "input_cached", None),
+                    "output": getattr(usage, "output", None),
+                }
+            raw_usage = None
+            raw = getattr(resp, "raw_completion", None)
+            if raw is not None:
+                try:
+                    u = getattr(raw, "usage", None)
+                    if u is not None:
+                        raw_usage = u.model_dump() if hasattr(u, "model_dump") else u
+                except Exception:
+                    raw_usage = None
+            record = {
+                "ts": time.time(),
+                "group_id": gid,
+                "session_size_before": session_size,
+                "contexts_len": len(contexts),
+                "contexts_chars": total_chars,
+                "kg_tail_chars": kg_tail_chars,
+                "sys_prompt_len": len(sys_prompt),
+                "sys_prompt_hash16": hashlib.sha256(sys_prompt.encode("utf-8")).hexdigest()[:16],
+                "local_hour": local_hour,
+                "provider_id": provider_id,
+                "usage": usage_d,
+                "raw_usage": raw_usage,
+                "resp_id": getattr(resp, "id", None),
+            }
+            self.store.append_jsonl("llm_cache_probe.jsonl", record)
+            logger.info(
+                f"[persona_agent] cache_probe group={gid} session={session_size} "
+                f"ctx={len(contexts)} kg={kg_tail_chars} "
+                f"syshash={record['sys_prompt_hash16']} "
+                f"input_cached={usage_d.get('input_cached')} raw_usage={'yes' if raw_usage is not None else 'no'}"
+            )
+        except Exception as e:
+            logger.warning(f"[persona_agent] cache probe log failed: {e}")
 
     # ----------------------------------------------------------------- misc
 

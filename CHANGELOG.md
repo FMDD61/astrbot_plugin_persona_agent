@@ -9,6 +9,7 @@
 ## [Unreleased]
 
 ### Added
+- **LLM 缓存观测探针 (2026-08 评测用)**: `_generate_reply` 每次生成追加一行 `llm_cache_probe.jsonl`（session 长度 / sys prompt sha256 前缀 / usage 缓存命中 / raw usage），仅观测用途，失败仅 warning 不影响回复
 - **DreamJob (Phase 3)**: 周 cron 记忆巩固与风格漂移报告
   - `_build_member_stats`: 从 MemoryStore 边计算活跃天数/日均互动/连续天数
   - `_data_closeness`: 纯数据驱动亲密度分级 (new/known/close)
