@@ -83,7 +83,9 @@ class RagService:
             if self._backend is not None:
                 return self._backend
             from sentence_transformers import SentenceTransformer  # type: ignore
-            model = SentenceTransformer(self._model_name)
+            # 只从本地 HF 缓存加载，禁止 SentenceTransformer() 联网校验元数据。
+            # 否则在 huggingface.co 不可达时地址 http_backoff 无限重试，同步阻塞 AstrBot 事件循环（表现为“主动回复卡死”）。
+            model = SentenceTransformer(self._model_name, local_files_only=True)
             dim = int(model.get_sentence_embedding_dimension())
 
             class _STBackend:
