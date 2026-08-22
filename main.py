@@ -136,9 +136,14 @@ class PersonaAgent(Star):
             persist_jsonl=int(cb_cfg.get("persist_jsonl", 1)) == 1,
         )
 
+        # v3: per-day sessions, unlimited message cap (daily rotation bounds it).
+        # max_messages <= 0 means unbounded; config key kept for backward compat.
+        _sess_cap = int(cb_cfg.get("session_max_messages", 0) or 0)
         self.session_mgr = SessionManager(
             data_dir=str(self.data_dir),
-            max_messages=int(cb_cfg.get("session_max_messages", 300)),
+            max_messages=(_sess_cap if _sess_cap > 0 else None),
+            rotation_hour=2,
+            tz_offset_hours=8,
         )
         restored = self.session_mgr.load_all()
         if restored:
@@ -176,6 +181,29 @@ class PersonaAgent(Star):
             keywords_dir=str(self.data_dir),
         )
 
+        # v3: sleep window + diary (rotation at 02:00 inside the sleep window)
+        sleep_cfg = self.config.get("sleep", {}) or {}
+        self._sleep_enabled = int(sleep_cfg.get("enabled", 1)) == 1
+        self._sleep_start = int(sleep_cfg.get("start_hour", 2))
+        self._sleep_end = int(sleep_cfg.get("end_hour", 7))
+        diary_cfg = self.config.get("diary", {}) or {}
+        self._diary_enabled = int(diary_cfg.get("enabled", 1)) == 1
+        self._last_provider_id: Optional[str] = None
+
+        if self._diary_enabled and self.context.cron_manager is not None:
+            await self.context.cron_manager.add_basic_job(
+                name="persona_daily_rotation",
+                cron_expression="5 2 * * *",
+                handler=self._daily_rotation_job,
+                description="Daily session rotation + diary summary (02:05 CST)",
+                timezone="Asia/Shanghai",
+                enabled=True,
+                persistent=False,
+            )
+            logger.info("[persona_agent] daily rotation cron registered (02:05 CST)")
+        else:
+            logger.warning("[persona_agent] diary.disabled or cron_manager missing; rotation cron NOT registered")
+
         # Pre-warm RAG off the event loop so the first group message never
         # stalls on BGE/chroma lazy init (2026-08-22 watchdog incident).
         warmed = await asyncio.to_thread(self.rag.warmup)
@@ -191,6 +219,11 @@ class PersonaAgent(Star):
 
     async def terminate(self) -> None:
         logger.info("[persona_agent] terminating")
+        if self.session_mgr is not None:
+            try:
+                self.session_mgr.save_all()
+            except Exception as e:
+                logger.warning(f"[persona_agent] session save on terminate failed: {e}")
 
     # ----------------------------------------------------------------- helpers
 
@@ -375,8 +408,40 @@ class PersonaAgent(Star):
         text = self._clean_message_text(event.message_str or "")
         group_id = str(event.get_group_id() or "")
 
+        # v3: media-only messages (forward/images/emotes without text) are
+        # recorded by the buffer for stats but excluded from the session;
+        # image understanding is a future design item.
+        if not text.strip():
+            event.stop_event()
+            return
+
+        # v3: daily rotation fallback (primary trigger is the 02:05 cron).
+        old_msgs = self.session_mgr.rotate_if_day_changed(group_id)
+        if old_msgs and self._diary_enabled:
+            asyncio.create_task(self._generate_diary(group_id, old_msgs))
+
         alias = self.style.preferred_alias(sender_uin) or f"群友{sender_uin}"
         self.session_mgr.append(group_id, "user", text, name=alias)
+
+        # v3: sleep window — bot stays silent (mimics human rest) but the
+        # message has already joined the session/memory for the new day.
+        if self._sleep_enabled and self._is_sleeping():
+            self._log_decision({
+                "action": "silent",
+                "trigger": "sleep",
+                "reason": "sleep window (no participation)",
+                "score": 0.0,
+                "hour": self._local_hour(),
+                "hourly_budget": 0.0,
+                "hourly_used": 0.0,
+                "silence_sec": 0.0,
+                "cooldown_left_sec": 0.0,
+                "extra": {},
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "sender_uin": sender_uin,
+            })
+            event.stop_event()
+            return
 
         if self._memory_store is not None:
             asyncio.create_task(asyncio.to_thread(
@@ -569,6 +634,7 @@ class PersonaAgent(Star):
         if not provider_id:
             logger.warning("[persona_agent] no LLM provider available")
             return ""
+        self._last_provider_id = provider_id
 
         try:
             resp = await self.context.llm_generate(
@@ -655,6 +721,70 @@ class PersonaAgent(Star):
             )
         except Exception as e:
             logger.warning(f"[persona_agent] cache probe log failed: {e}")
+
+    # ------------------------------------------------------------ v3 diary/sleep
+
+    def _is_sleeping(self) -> bool:
+        h = self._local_hour()
+        if self._sleep_start <= self._sleep_end:
+            return self._sleep_start <= h < self._sleep_end
+        return h >= self._sleep_start or h < self._sleep_end
+
+    async def _daily_rotation_job(self) -> None:
+        """Cron: rotate every group session that crossed the day boundary and
+        generate the daily diary from the archived day."""
+        if self.session_mgr is None:
+            return
+        for gid in list(self.session_mgr.snapshot().keys()):
+            old_msgs = self.session_mgr.rotate_if_day_changed(gid)
+            if old_msgs:
+                logger.info(f"[persona_agent] daily rotation: group={gid} msgs={len(old_msgs)}")
+                if self._diary_enabled:
+                    asyncio.create_task(self._generate_diary(gid, old_msgs))
+
+    async def _generate_diary(self, group_id: str, msgs: list[dict]) -> None:
+        """Daily diary summary reusing the archived day session as context.
+
+        Cache-friendly by design (v3 decision): the request prefix
+        (fixed persona system prompt + the day's raw messages) is identical to
+        the last chat request, so the gateway prefix cache covers it.
+        """
+        if not msgs:
+            return
+        try:
+            if not self._last_provider_id:
+                logger.info("[persona_agent] diary skipped: no provider id known yet")
+                return
+            sys_prompt = self.style.system_prompt(local_hour=self._local_hour()) if self.style else ""
+            contexts = [dict(m) for m in msgs]
+            contexts.append({
+                "role": "user",
+                "content": (
+                    "请把今天群里发生的事写成一篇简短的日记（100~200字），"
+                    "包含主要话题与群友互动，用你的语气和第一人称，不要列条。"
+                ),
+            })
+            resp = await self.context.llm_generate(
+                chat_provider_id=self._last_provider_id,
+                prompt=None,
+                system_prompt=sys_prompt,
+                contexts=contexts,
+            )
+            summary = (getattr(resp, "completion_text", "") or "").strip()
+            if not summary or self._is_error_response(summary):
+                logger.warning("[persona_agent] diary skipped: empty/error response")
+                return
+            record = {
+                "day": self.session_mgr.day_key(),
+                "group_id": group_id,
+                "summary": summary,
+                "n_messages": len(msgs),
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            self.store.append_jsonl("daily_diary.jsonl", record)
+            logger.info(f"[persona_agent] diary written: day={record['day']} n={len(msgs)}")
+        except Exception as e:
+            logger.warning(f"[persona_agent] diary generation failed: {e}")
 
     # ----------------------------------------------------------------- misc
 
