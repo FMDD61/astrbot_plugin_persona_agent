@@ -536,6 +536,29 @@ class PersonaAgent(Star):
         if emotion and emotion.current_mood:
             sys_prompt = f"{sys_prompt}\n\n{emotion.current_mood}"
 
+        # Dynamic current-speaker hint (2026-08-23 fix): inserted BEFORE the
+        # KG tail (KG stays the last message -> cache prefix untouched; line is
+        # per-speaker constant so it is stable across consecutive messages).
+        speaker_uin = str(event.get_sender_id() or "")
+        alias_txt = ""
+        if self.style is not None:
+            try:
+                alias_txt = self.style.preferred_alias(speaker_uin) or ""
+            except Exception:
+                alias_txt = ""
+        if not alias_txt:
+            alias_txt = f"群友{speaker_uin}"
+        is_src = bool(self.style_source_qq) and speaker_uin == str(self.style_source_qq)
+        speaker_line = (
+            f"【当前说话人】与本消息对应的发话人：QQ {speaker_uin}，群内别名「{alias_txt}」"
+            f"{'（风格源 QQ）' if is_src else ''}。"
+            "请始终用该别名称呼 TA；无法确认时不要臆造其他群友的别名。"
+        )
+        if contexts and isinstance(contexts[-1], dict) and contexts[-1].get("role") == "system":
+            contexts.insert(-1, {"role": "system", "content": speaker_line})
+        else:
+            contexts.append({"role": "system", "content": speaker_line})
+
         provider_id = (self.config.get("llm") or {}).get("provider_id", "") or None
         if not provider_id:
             try:
