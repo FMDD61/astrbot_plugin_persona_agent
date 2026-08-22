@@ -201,6 +201,12 @@
         "default": "",
         "_special": "select_provider"
       },
+      "cache_probe_enabled": {
+        "type": "int",
+        "description": "LLM 调用观测探针（0 关 / 1 开）",
+        "hint": "开启时每次生成追加一行 llm_cache_probe.jsonl（session 长度/系统提示词 hash/usage 缓存命中）。2026-08 评估后转正为常态观测，默认开。",
+        "default": 1
+      },
       "max_tokens": {
         "type": "int",
         "description": "回复最大 token 数",
