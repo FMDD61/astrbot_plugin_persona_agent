@@ -135,6 +135,23 @@ class RagService:
         diff = min(diff, 24 - diff)
         return 1.0 if diff <= 1 else 0.0
 
+    # ---- startup warmup ----
+
+    def warmup(self) -> bool:
+        """Pre-load the embedding backend + chroma collection at startup.
+
+        Prevents the first live query from blocking the event loop for
+        seconds (BGE model load / chroma open, see 2026-08-22 incident:
+        lazy init + missing HF_HUB_OFFLINE hung the loop for minutes).
+        Non-fatal: query() still lazily retries on failure.
+        """
+        try:
+            self._ensure_backend()
+            self._ensure_collection()
+            return True
+        except Exception:
+            return False
+
     # ---- public API ----
     def query(
         self,

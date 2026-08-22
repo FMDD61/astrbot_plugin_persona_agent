@@ -56,6 +56,7 @@ _RE_EMOJI = re.compile(
     "]"
 )
 _RE_AT_USER = re.compile(r'(?<!\w)@\S+')
+_RE_REPLY_MARKER = re.compile(r'\[(?:回复|r:)[^\]]*\]')
 _RE_PAREN_META = re.compile(
     r'[（(]\s*'
     r'(?:\d{5,}'                   # QQ number (5+ digits)
@@ -139,6 +140,9 @@ class PersonaAgent(Star):
             data_dir=str(self.data_dir),
             max_messages=int(cb_cfg.get("session_max_messages", 300)),
         )
+        restored = self.session_mgr.load_all()
+        if restored:
+            logger.info(f"[persona_agent] restored sessions: {restored}")
         self._memory_store = MemoryStore(str(self.data_dir))
         self.kg_provider = MultiSignalKGProvider(
             rag=self.rag,
@@ -171,6 +175,11 @@ class PersonaAgent(Star):
         self._conflict_detector = ConflictDetector(
             keywords_dir=str(self.data_dir),
         )
+
+        # Pre-warm RAG off the event loop so the first group message never
+        # stalls on BGE/chroma lazy init (2026-08-22 watchdog incident).
+        warmed = await asyncio.to_thread(self.rag.warmup)
+        logger.info(f"[persona_agent] RAG warmup {'OK' if warmed else 'FAILED (will retry lazily)'}")
 
         logger.info(
             f"[persona_agent] ready: target_group={self.target_group_id} "
@@ -549,7 +558,8 @@ class PersonaAgent(Star):
             logger.exception(f"[persona_agent] llm_generate raised: {e}")
             return ""
 
-        self._log_llm_probe(event, contexts, sys_prompt, provider_id, resp, local_hour)
+        if int((self.config.get("llm") or {}).get("cache_probe_enabled", 1)) == 1:
+            self._log_llm_probe(event, contexts, sys_prompt, provider_id, resp, local_hour)
 
         text = (getattr(resp, "completion_text", "") or "").strip()
         if self._is_error_response(text):
@@ -697,6 +707,7 @@ class PersonaAgent(Star):
             out = out.replace(b, "")
         out = PersonaAgent._strip_at_mentions(out)
         out = PersonaAgent._strip_meta_parens(out)
+        out = _RE_REPLY_MARKER.sub("", out)
         out = re.sub(r"(?<=[\u4e00-\u9fff]) +(?=[\u4e00-\u9fff])", "", out)
         out = PersonaAgent._cap_koupi(out)
         out = PersonaAgent._strip_emoji(out)
