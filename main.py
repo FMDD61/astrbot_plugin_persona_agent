@@ -711,10 +711,18 @@ class PersonaAgent(Star):
         out = re.sub(r"(?<=[\u4e00-\u9fff]) +(?=[\u4e00-\u9fff])", "", out)
         out = PersonaAgent._cap_koupi(out)
         out = PersonaAgent._strip_emoji(out)
-        lines = out.splitlines()
+        # Prompt forbids newlines (''禁止空格和换行符''); enforce in postprocess:
+        # collapse lines with punctuation-aware joining so "x\ny" -> "x，y".
+        lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
         if len(lines) > 8:
             lines = lines[:8]
-        out = "\n".join(lines).strip()
+        tail_ok = "，。！？～~、…：；,.!?~"
+        joined = ""
+        for ln in lines:
+            if joined and joined[-1] not in tail_ok:
+                joined += "，"
+            joined += ln
+        out = joined.strip()
         if len(out) > 400:
             out = out[:400].rstrip()
         return out
