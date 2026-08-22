@@ -190,6 +190,40 @@
     }
   },
 
+  "sleep": {
+    "type": "object",
+    "description": "睡眠窗（模拟真人作息，02:00–07:00 默认）",
+    "items": {
+      "enabled": {
+        "type": "int",
+        "description": "0 关闭 / 1 开启",
+        "default": 1
+      },
+      "start_hour": {
+        "type": "int",
+        "description": "睡眠开始小时（本地时）",
+        "default": 2
+      },
+      "end_hour": {
+        "type": "int",
+        "description": "睡眠结束小时（本地时）",
+        "default": 7
+      }
+    }
+  },
+
+  "diary": {
+    "type": "object",
+    "description": "每日日记（02:05 轮换 cron 生成，复用当日会话上下文以命中前缀缓存）",
+    "items": {
+      "enabled": {
+        "type": "int",
+        "description": "0 关闭 / 1 开启",
+        "default": 1
+      }
+    }
+  },
+
   "llm": {
     "type": "object",
     "description": "LLM provider 选择",
