@@ -90,16 +90,18 @@ class VisionService:
         self,
         api_base: str,
         api_key: str,
-        model: str = "mimo-v2.5",
+        model: str = "deepseek-v4-flash-vision-exp",
         *,
         timeout: float = 15.0,
         cache_ttl: float = 30.0,
         desc_max_chars: int = 120,
+        reasoning_effort: str = "low",
         http_post: Optional[PostFn] = None,
     ) -> None:
         self._url = api_base.rstrip("/") + "/chat/completions"
         self._key = api_key
         self._model = model
+        self._reasoning_effort = reasoning_effort
         self._timeout = float(timeout)
         self._cache_ttl = float(cache_ttl)
         self._desc_max_chars = int(desc_max_chars)
@@ -141,8 +143,9 @@ class VisionService:
                         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
                     ]},
                 ],
-                "max_tokens": 160,
+                "max_tokens": 512,
                 "temperature": 0.3,
+                "reasoning_effort": self._reasoning_effort,
             }
             out = await asyncio.wait_for(self._post(payload), timeout=self._timeout)
             desc = ((out.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
