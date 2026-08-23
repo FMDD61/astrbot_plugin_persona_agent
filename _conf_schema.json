@@ -280,6 +280,11 @@
         "type": "int",
         "description": "描述文本最大长度",
         "default": 120
+      },
+      "reasoning_effort": {
+        "type": "string",
+        "description": "视觉模型思考强度（low/off/high；实测 low+512 tokens 最稳）",
+        "default": "low"
       }
     }
   },
