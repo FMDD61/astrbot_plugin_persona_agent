@@ -9,6 +9,12 @@
 ## [Unreleased]
 
 ### Added
+- **第一批功能缺口修复（G1-G4, 2026-08-23）**:
+  - G1: RAG 查询移出事件循环 —— 决策阶段 `rag.query` 与 KG dense 检索改 `asyncio.to_thread`（BGE 编码不再冻结所有群）
+  - G2: 引用回复实现 —— `[r:-N]` 标记解析（`services/text_style.py::extract_quote`，`-1`=最新消息）→ `ContextBuffer.quote_target(n)` 查 message_id → `Comp.Reply` 构造 OneBot reply chain；查不到则降级纯文本
+  - G3: 数据保留策略 —— `housekeeping` 配置（session_keep_days=3, jsonl_max_mb=50）：过期按日会话文件清理 + jsonl 轮转（.1/.2），初始化与每日 cron 各跑一次
+  - G4: 单元测试落地 —— `tests/`（unittest 零依赖，23 例）：text_style 全链路（引用标记/换行/口癖/AI 味/emoji/长度）、SessionManager 日界/轮换/按日恢复/旧格式兼容/无上限/clear、ContextBuffer quote_target
+  - 重构：文本处理纯函数抽取到 `services/text_style.py`（无 astrbot 依赖，可离线测试），main.py 薄委托
 - **v3 按日会话 + 02:00 轮换 + 睡眠窗（2026-08-23 设计定稿）**:
   - SessionManager 取消 300 条硬上限（按日轮换天然定界，1M 窗口内自由增长）；`session_<group>_<day>.json` 按日落盘，启动恢复当日窗口
   - 睡眠窗默认 02:00–07:00（可配）：全静默（含 @ 不回复、无插话），消息照常入会话与记忆；轮换时刻 02:00 落在窗内，重建/缓存重构无感
