@@ -751,10 +751,11 @@ class PersonaAgent(Star):
             self._vision = VisionService(
                 api_base=api_base,
                 api_key=str(keys[0]),
-                model=str(vcfg.get("model", "mimo-v2.5")),
+                model=str(vcfg.get("model", "deepseek-v4-flash-vision-exp")),
                 timeout=float(vcfg.get("timeout_sec", 15)),
                 cache_ttl=float(vcfg.get("cache_ttl_sec", 30)),
                 desc_max_chars=int(vcfg.get("desc_max_chars", 120)),
+                reasoning_effort=str(vcfg.get("reasoning_effort", "low")),
             )
             logger.info(f"[persona_agent] vision service ready (model={self._vision._model})")
         except Exception as e:
