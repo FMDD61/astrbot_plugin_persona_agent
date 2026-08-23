@@ -196,6 +196,23 @@
     }
   },
 
+  "examples": {
+    "type": "object",
+    "description": "典型对话静态注入（G14；改文件名即可热切换，A/B 用）",
+    "items": {
+      "enabled": {
+        "type": "int",
+        "description": "0 关闭 / 1 开启",
+        "default": 1
+      },
+      "max_entries": {
+        "type": "int",
+        "description": "最多注入示例条数",
+        "default": 12
+      }
+    }
+  },
+
   "housekeeping": {
     "type": "object",
     "description": "数据保留策略（G3）",
