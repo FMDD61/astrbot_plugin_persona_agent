@@ -181,6 +181,9 @@ class PersonaAgent(Star):
         diary_cfg = self.config.get("diary", {}) or {}
         self._diary_enabled = int(diary_cfg.get("enabled", 1)) == 1
         self._last_provider_id: Optional[str] = None
+        # Test-time sleep override: "awake" / "sleep" / None(window applies);
+        # in-memory only, resets on restart.
+        self._sleep_override: Optional[str] = None
 
         vision_cfg = self.config.get("vision", {}) or {}
         self._vision_enabled = int(vision_cfg.get("enabled", 1)) == 1
@@ -313,6 +316,28 @@ class PersonaAgent(Star):
                 lines.append(f"session[{gid}]  : {sz} msgs")
         yield event.plain_result("\n".join(lines))
 
+    @filter.command("persona_wake")
+    async def cmd_persona_wake(self, event: AstrMessageEvent):
+        """Test-time wake: sleep window disabled until /persona_sleep or restart."""
+        if not self._is_privileged(event):
+            yield event.plain_result("无权限。")
+            return
+        self._sleep_override = "awake"
+        logger.info("[persona_agent] sleep override -> awake (manual test mode)")
+        yield event.plain_result("已唤醒（手动测试模式），睡眠窗暂不生效。退出测试可发 /persona_sleep 或重启。")
+
+    @filter.command("persona_sleep")
+    async def cmd_persona_sleep(self, event: AstrMessageEvent):
+        if not self._is_privileged(event):
+            yield event.plain_result("无权限。")
+            return
+        self._sleep_override = None
+        logger.info("[persona_agent] sleep override cleared")
+        yield event.plain_result("已恢复睡眠窗规则。")
+
+    def _is_privileged(self, event: AstrMessageEvent) -> bool:
+        return bool(self.privileged_qq) and str(event.get_sender_id() or "") == self.privileged_qq
+
     @filter.command("reload_persona_config")
     async def cmd_reload(self, event: AstrMessageEvent):
         """Apply config toggles to the live InterjectionManager.
@@ -435,7 +460,7 @@ class PersonaAgent(Star):
 
         # v3: sleep window — bot stays silent (mimics human rest) but the
         # message has already joined the session/memory for the new day.
-        if self._sleep_enabled and self._is_sleeping():
+        if self._is_sleeping():
             self._log_decision({
                 "action": "silent",
                 "trigger": "sleep",
@@ -888,10 +913,19 @@ class PersonaAgent(Star):
     # ------------------------------------------------------------ v3 diary/sleep
 
     def _is_sleeping(self) -> bool:
+        if self._sleep_override == "awake":
+            return False
+        if self._sleep_override == "sleep":
+            return True
+        cfg = self.config.get("sleep", {}) or {}
+        if int(cfg.get("enabled", 1)) != 1:
+            return False
+        start = int(cfg.get("start_hour", self._sleep_start))
+        end = int(cfg.get("end_hour", self._sleep_end))
         h = self._local_hour()
-        if self._sleep_start <= self._sleep_end:
-            return self._sleep_start <= h < self._sleep_end
-        return h >= self._sleep_start or h < self._sleep_end
+        if start <= end:
+            return start <= h < end
+        return h >= start or h < end
 
     def _housekeeping(self) -> None:
         """Retention: prune old per-day session files and rotate oversized
