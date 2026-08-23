@@ -7,6 +7,7 @@ v2: ``MultiSignalKGProvider`` — dense(BGE) + BM25(FTS5) + entity(alias overlap
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -64,8 +65,9 @@ class MultiSignalKGProvider(KGProvider):
         if not query_text:
             return None
 
-        # 1. dense (BGE vector)
-        dense_hits = self._rag.query(
+        # 1. dense (BGE vector) — CPU-bound, keep off the event loop (G1)
+        dense_hits = await asyncio.to_thread(
+            self._rag.query,
             context_text=query_text,
             k=self._k_retrieve,
             now_utc=time.time(),

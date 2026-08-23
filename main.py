@@ -11,6 +11,7 @@ See IMPLEMENTATION_PLAN.md (sections 1, 2, 8, 9) and DEPLOYMENT_GUIDE.md.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import hashlib
 import json
 import re
@@ -23,6 +24,15 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 import astrbot.api.message_components as Comp
 
+from .services.text_style import (
+    RE_QUOTE_BLOCK,
+    RE_AT_MARKER,
+    RE_EMOJI,
+    RE_AT_USER,
+    RE_PAREN_META,
+    RE_REPLY_MARKER,
+)
+from .services import text_style
 from .services.style_profile import StyleProfile
 from .services.rag_service import RagService
 from .services.interjection import (
@@ -41,37 +51,6 @@ from .services.emotion import EmotionProvider, DefaultEmotionProvider, EmotionSt
 from .services.memory_store import MemoryStore, MemoryEvent
 from .services.dream_job import DreamJob
 from .services.conflict_detector import ConflictDetector
-
-_RE_QUOTE_BLOCK = re.compile(r'\[引用消息\(.+?\)\]', re.DOTALL)
-_RE_AT_MARKER = re.compile(r'\[At:\d+\]')
-
-_RE_EMOJI = re.compile(
-    "["
-    "\U0001F300-\U0001F9FF"   # Misc Symbols, Pictographs, Emoticons, Supplemental
-    "\U0001FA00-\U0001FAFF"   # Symbols and Pictographs Extended-A
-    "\U00002600-\U000027BF"   # Misc Symbols + Dingbats
-    "\U0000FE0F\U0000200D"    # Variation Selector + ZWJ
-    "\U0001F1E0-\U0001F1FF"   # Regional Indicator Symbols
-    "\U00002B50\U00002764"    # ⭐ ❤
-    "]"
-)
-_RE_AT_USER = re.compile(r'(?<!\w)@\S+')
-_RE_REPLY_MARKER = re.compile(r'\[(?:回复|r:)[^\]]*\]')
-_RE_PAREN_META = re.compile(
-    r'[（(]\s*'
-    r'(?:\d{5,}'                   # QQ number (5+ digits)
-    r'|day\s*\d+'                 # day counter
-    r'|第?\d+\s*天'              # 第N天 / N天
-    r'|群地位[↑↓]+'              # status tracker
-    r'|\d+/\d+'                   # fraction
-    r'|\b\d{2,4}\b'              # standalone number 2-4 digits
-    r')'
-    r'\s*[）)]'
-)
-
-_KOUPI_LIST = ("啃啃", "搓搓", "呜嘿", "bakabaka", "钨钼钨钼", "嗷呜", "捏猫猫的")
-_KOUPI_MAX_TOTAL = 2
-
 
 class PersonaAgent(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -107,6 +86,7 @@ class PersonaAgent(Star):
     async def initialize(self) -> None:
         logger.info(f"[persona_agent] initializing, data_dir={self.data_dir}")
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._housekeeping()
 
         self.style = StyleProfile(self.data_dir)
 
@@ -245,9 +225,7 @@ class PersonaAgent(Star):
     @staticmethod
     def _clean_message_text(text: str) -> str:
         """Strip [引用消息(...)] and [At:QQ] blocks from raw message text."""
-        t = _RE_QUOTE_BLOCK.sub("", text)
-        t = _RE_AT_MARKER.sub("", t)
-        return t.strip()
+        return text_style.clean_message_text(text)
 
     def _log_decision(self, payload: dict) -> None:
         try:
@@ -469,7 +447,9 @@ class PersonaAgent(Star):
         hits: list[dict] = []
         rag_cfg = self.config.get("rag", {}) or {}
         try:
-            hits = self.rag.query(
+            # G1: BGE embed + chroma search are CPU-bound; keep them off the loop.
+            hits = await asyncio.to_thread(
+                self.rag.query,
                 live_ctx + ("\n" + text if text else ""),
                 k=int(rag_cfg.get("k_retrieve", 8)),
                 top_n_final=int(rag_cfg.get("top_n_final", 3)),
@@ -535,12 +515,20 @@ class PersonaAgent(Star):
                 logger.exception(f"[persona_agent] LLM generation failed: {e}")
                 return
 
-            reply_text = self._postprocess(reply_text)
+            clean_text, quote_n = text_style.extract_quote(reply_text)
+            reply_text = self._postprocess(clean_text)
             if not reply_text:
                 logger.info("[persona_agent] empty reply after postprocess; skipping send")
                 return
 
-            yield event.plain_result(reply_text)
+            # G2: [r:-N] -> OneBot reply chain (needs a real group message id)
+            qid = None
+            if quote_n is not None and self.buffer is not None:
+                qid = self.buffer.quote_target(quote_n)
+            if qid:
+                yield event.chain_result([Comp.Reply(id=qid), Comp.Plain(reply_text)])
+            else:
+                yield event.plain_result(reply_text)
 
             if emotion_state.sticker_prompt:
                 try:
@@ -730,11 +718,49 @@ class PersonaAgent(Star):
             return self._sleep_start <= h < self._sleep_end
         return h >= self._sleep_start or h < self._sleep_end
 
+    def _housekeeping(self) -> None:
+        """Retention: prune old per-day session files and rotate oversized
+        jsonl logs (G3). Best-effort, never raises."""
+        try:
+            hk = self.config.get("housekeeping", {}) or {}
+            keep_days = int(hk.get("session_keep_days", 3))
+            max_mb = float(hk.get("jsonl_max_mb", 50))
+            today = datetime.datetime.now()  # local wall date for retention
+            cutoff = (today - datetime.timedelta(days=keep_days - 1)).strftime("%Y-%m-%d")
+            removed = 0
+            for f in self.data_dir.glob("session_*_*.json"):
+                m = re.search(r"_(\d{4}-\d{2}-\d{2})\.json$", f.name)
+                if m and m.group(1) < cutoff:
+                    try:
+                        f.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+            if removed:
+                logger.info(f"[persona_agent] housekeeping removed {removed} old session file(s)")
+            for name in ("recent_messages.jsonl", "decision_log.jsonl",
+                         "llm_cache_probe.jsonl", "daily_diary.jsonl"):
+                path = self.data_dir / name
+                try:
+                    if path.exists() and path.stat().st_size > max_mb * 1024 * 1024:
+                        p1 = Path(str(path) + ".1")
+                        p2 = Path(str(path) + ".2")
+                        p2.unlink(missing_ok=True)
+                        if p1.exists():
+                            p1.rename(p2)
+                        path.rename(p1)
+                        logger.info(f"[persona_agent] housekeeping rotated {name} ({max_mb}MB)")
+                except OSError:
+                    pass
+        except Exception as e:
+            logger.warning(f"[persona_agent] housekeeping failed: {e}")
+
     async def _daily_rotation_job(self) -> None:
         """Cron: rotate every group session that crossed the day boundary and
         generate the daily diary from the archived day."""
         if self.session_mgr is None:
             return
+        self._housekeeping()
         for gid in list(self.session_mgr.snapshot().keys()):
             old_msgs = self.session_mgr.rotate_if_day_changed(gid)
             if old_msgs:
@@ -813,69 +839,24 @@ class PersonaAgent(Star):
 
     @staticmethod
     def _strip_at_mentions(text: str) -> str:
-        return _RE_AT_USER.sub("", text)
+        return text_style.strip_at_mentions(text)
 
     @staticmethod
     def _strip_meta_parens(text: str) -> str:
-        return _RE_PAREN_META.sub("", text)
+        return text_style.strip_meta_parens(text)
 
     @staticmethod
     def _strip_emoji(text: str) -> str:
-        return _RE_EMOJI.sub("", text)
+        return text_style.strip_emoji(text)
 
     @staticmethod
     def _cap_koupi(text: str) -> str:
-        occurrences: list[tuple[int, int]] = []
-        for phrase in _KOUPI_LIST:
-            idx = 0
-            while True:
-                pos = text.find(phrase, idx)
-                if pos == -1:
-                    break
-                occurrences.append((pos, len(phrase)))
-                idx = pos + len(phrase)
-        if len(occurrences) <= _KOUPI_MAX_TOTAL:
-            return text
-        occurrences.sort(key=lambda x: x[0])
-        parts: list[str] = []
-        prev_end = 0
-        for i, (pos, length) in enumerate(occurrences):
-            parts.append(text[prev_end:pos])
-            if i < _KOUPI_MAX_TOTAL:
-                parts.append(text[pos:pos + length])
-            prev_end = pos + length
-        parts.append(text[prev_end:])
-        return "".join(parts)
+        return text_style.cap_koupi(text)
+
+    @staticmethod
+    def _extract_quote(text: str) -> tuple[str, Optional[int]]:
+        return text_style.extract_quote(text)
 
     @staticmethod
     def _postprocess(text: str) -> str:
-        if not text:
-            return ""
-        bad = [
-            "作为一个AI", "作为AI", "作为一名AI", "作为人工智能", "我是AI", "我是一个AI",
-            "作为助手", "作为大模型", "作为语言模型", "我是一个大模型", "我是语言模型",
-        ]
-        out = text.strip()
-        for b in bad:
-            out = out.replace(b, "")
-        out = PersonaAgent._strip_at_mentions(out)
-        out = PersonaAgent._strip_meta_parens(out)
-        out = _RE_REPLY_MARKER.sub("", out)
-        out = re.sub(r"(?<=[\u4e00-\u9fff]) +(?=[\u4e00-\u9fff])", "", out)
-        out = PersonaAgent._cap_koupi(out)
-        out = PersonaAgent._strip_emoji(out)
-        # Prompt forbids newlines (''禁止空格和换行符''); enforce in postprocess:
-        # collapse lines with punctuation-aware joining so "x\ny" -> "x，y".
-        lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-        if len(lines) > 8:
-            lines = lines[:8]
-        tail_ok = "，。！？～~、…：；,.!?~"
-        joined = ""
-        for ln in lines:
-            if joined and joined[-1] not in tail_ok:
-                joined += "，"
-            joined += ln
-        out = joined.strip()
-        if len(out) > 400:
-            out = out[:400].rstrip()
-        return out
+        return text_style.postprocess(text)

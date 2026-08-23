@@ -190,6 +190,23 @@
     }
   },
 
+  "housekeeping": {
+    "type": "object",
+    "description": "数据保留策略（G3）",
+    "items": {
+      "session_keep_days": {
+        "type": "int",
+        "description": "保留最近 N 天的按日会话文件",
+        "default": 3
+      },
+      "jsonl_max_mb": {
+        "type": "float",
+        "description": "jsonl 日志超过该大小（MB）自动轮转",
+        "default": 50
+      }
+    }
+  },
+
   "sleep": {
     "type": "object",
     "description": "睡眠窗（模拟真人作息，02:00–07:00 默认）",

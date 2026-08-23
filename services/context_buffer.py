@@ -129,6 +129,21 @@ class ContextBuffer:
             lines.append(line)
         return "\n".join(lines)
 
+    def quote_target(self, n: int) -> Optional[str]:
+        """message_id of the n-th newest buffered group message (n=1 latest).
+
+        Returns None when out of range or the target is not a group message
+        with a real id (e.g. the bot's own reply)."""
+        with self._lock:
+            items = list(self._buf)
+        idx = len(items) - n
+        if not (0 <= idx < len(items)):
+            return None
+        m = items[idx]
+        if m.message_type != "group" or not m.message_id:
+            return None
+        return m.message_id
+
     def find_since(self, since_ts: float) -> list[BufferedMessage]:
         with self._lock:
             return [m for m in self._buf if m.ts >= since_ts]
