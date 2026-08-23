@@ -135,7 +135,7 @@ class VisionService:
                 "model": self._model,
                 "messages": [
                     {"role": "system", "content":
-                        "用中文简要描述图片内容，不超过80字；若是表情包，说明其情绪和梗。"},
+                        "用中文简要描述图片中确定可见的内容，不超过80字；如是表情包说明其情绪和梗。不要猜测人物身份、不要脑补图中没有的内容；看不清就说看不清。"},
                     {"role": "user", "content": [
                         {"type": "text", "text": "描述这张图片。"},
                         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
