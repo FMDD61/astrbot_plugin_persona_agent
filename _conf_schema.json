@@ -247,6 +247,43 @@
     }
   },
 
+  "vision": {
+    "type": "object",
+    "description": "识图（G15：图片/gif 表情 → 视觉模型 → 文本进会话；QQ Face 走本地映射）",
+    "items": {
+      "enabled": {
+        "type": "int",
+        "description": "0 关闭 / 1 开启",
+        "default": 1
+      },
+      "model": {
+        "type": "string",
+        "description": "视觉模型（网关内，默认 mimo-v2.5）",
+        "default": "mimo-v2.5"
+      },
+      "timeout_sec": {
+        "type": "float",
+        "description": "单图像描述超时（秒），超时降级为无描述",
+        "default": 15
+      },
+      "cache_ttl_sec": {
+        "type": "float",
+        "description": "同图描述缓存（秒），防表情包连发重复调用",
+        "default": 30
+      },
+      "max_images": {
+        "type": "int",
+        "description": "单条消息最多描述的图片数",
+        "default": 2
+      },
+      "desc_max_chars": {
+        "type": "int",
+        "description": "描述文本最大长度",
+        "default": 120
+      }
+    }
+  },
+
   "emotion": {
     "type": "object",
     "description": "情绪引擎（G10 v1：willingness/mood/sticker 三维 + 30s 缓存 + 3s 超时）",
