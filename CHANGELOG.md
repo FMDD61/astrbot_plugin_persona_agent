@@ -9,6 +9,12 @@
 ## [Unreleased]
 
 ### Added
+- **G15 识图能力（2026-08-23 全量实现）**:
+  - `services/vision.py`：图片/gif 表情 → 视觉模型（默认 mimo-v2.5，同网关同 key，懒解析不落密钥）→ ≤120 字中文描述；三源解析（convert_to_file_path 统一处理本地/url/base64 + 手动兜底）；gif/jpeg/png/webp mime 嗅探；30s 同图 hash 缓存；15s 超时与失败降级（不影响回复链路）
+  - QQ Face（系统表情）→ 本地 id→名称映射表（零成本）
+  - 描述文本并入消息内容进会话（空文本消息因此可被“看见”）；`vision.{enabled,model,timeout_sec,cache_ttl_sec,max_images,desc_max_chars}` 可配
+  - 测试 +8 例（face 映射/mime 嗅探/base64 解析/缓存/载荷/超时/空描述）
+- **G14 候选池筛选脚本（tools/select_examples.py）**: 7075 对 → 规则过滤 → 8 场景分桶 → 离线排序 → 可选 LLM 人设打分（≥4 保留）→ 输出候选池文件（不触碰 example_dialogs.json，人工抽查后才合并）
 - **第二批功能缺口修复（G7-G10, 2026-08-23）**:
   - G7 温度分档：`llm.temperature.{at_reply 0.8, active_interjection 1.0, cold_start 1.1}`（dream 档延后至 dream 具备 LLM 步骤），按 decision.trigger 透传 `llm_generate(**kwargs)`
   - G8 特权 QQ：`privileged_qq`（默认风格源），`/dream_now` 免 dream.enabled 开关
