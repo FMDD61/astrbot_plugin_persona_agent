@@ -23,6 +23,8 @@ class TestExamplesLoader(unittest.TestCase):
             block, st = load_examples_block(os.path.join(td, "example_dialogs.json"))
             self.assertIn("枣商蚝~", block)
             self.assertIn("[A]", block)
+            self.assertIn("规则A", block)
+            self.assertIn("规则B", block)
             # same mtime -> cached (no reload observable via same block)
             block2, st2 = load_examples_block(p, prev=st)
             self.assertEqual(block, block2)

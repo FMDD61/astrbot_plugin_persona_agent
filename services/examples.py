@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Optional
 
 MAX_ENTRIES = 12
-HEADER = "示例对话（风格参考，禁止复读原文）："
+HEADER = (
+    "示例对话（风格参考，禁止复读原文）：\n"
+    "规则A：钨钼钨钼 仅用于肯定/恍然大悟，禁止在问好、吃饭、闲聊中滥用。\n"
+    "规则B：谐音问候（枣商蚝~等）仅在对方整词说出「早上好/中午好/下午好/晚上好」时使用。"
+)
 
 
 @dataclass
