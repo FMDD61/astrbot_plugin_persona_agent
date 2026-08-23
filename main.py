@@ -469,6 +469,7 @@ class PersonaAgent(Star):
                     return
 
         if self._generating.get(group_id):
+            event.stop_event()
             return
 
         live_ctx = self.buffer.format_recent(max_lines=20) if self.buffer else ""
@@ -546,12 +547,14 @@ class PersonaAgent(Star):
                 )
             except Exception as e:
                 logger.exception(f"[persona_agent] LLM generation failed: {e}")
+                event.stop_event()
                 return
 
             clean_text, quote_n = text_style.extract_quote(reply_text)
             reply_text = self._postprocess(clean_text)
             if not reply_text:
                 logger.info("[persona_agent] empty reply after postprocess; skipping send")
+                event.stop_event()
                 return
 
             # G2: [r:-N] -> OneBot reply chain (needs a real group message id)
@@ -710,6 +713,10 @@ class PersonaAgent(Star):
                         else:
                             extra += "（配图：" + "；".join(
                                 f"{i + 1}:{d}" for i, d in enumerate(non_empty)) + "）"
+                    else:
+                        # Descriptions failed: say so honestly so the reply LLM
+                        # never hallucinates content about an unseen image.
+                        extra += "（配图：无法识别）"
             if not extra:
                 return text
             return f"{text} {extra}".strip() if text.strip() else extra
