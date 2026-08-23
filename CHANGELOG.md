@@ -14,6 +14,9 @@
 - 描述失败时注入「（配图：无法识别）」诚实占位，杜绝主 LLM 对未见图凭空猜“芳乃”类幻觉
 - 事件循环防泄漏加固：生成锁分支 / LLM 失败 / 空回复三条早退路径补 `stop_event()`，避免 AstrBot 核心兜底回复将错误文本广播到群
 - 说明：此前「LLM 响应错误」外泄为 AstrBot 核心默认 agent 行为（非目标群未处理消息 + 图片多模态调用失败），非插件代码泄漏；生产切换（test_mode=0）后目标群由插件接管可避免，或在 AstrBot WebUI 配置 `provider_ltm_settings.image_caption_provider_id` 指定视觉模型
+### Fixed
+- **AstrBot 占位标记泄漏**：`_clean_message_text`/`_postprocess` 新增剥离 `[图片: 文件名]`、`[表情...]`、`[ComponentType.X]`（实测 02-21 回复中图片文件名被模型复读的根因）
+- **指令别名**：`/persona_awake` 与 `/persona_wake` 均可唤醒（此前仅后者注册，实测名字不匹配导致无响应）
 ### Added
 - **睡眠窗即时开关（2026-08-24）**: `/persona_wake`（特权，测试期唤醒）/ `/persona_sleep`（恢复），内存态即时生效免重启；`_is_sleeping()` 改为每消息热读配置（WebUI 改 sleep.* 亦即时生效）
 ### Added

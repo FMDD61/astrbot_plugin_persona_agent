@@ -32,6 +32,8 @@ RE_PAREN_META = re.compile(
     r"\s*[）)]"
 )
 RE_REPLY_MARKER = re.compile(r"\[(?:回复|r:)[^\]]*\]")
+# AstrBot message_str renders media as [图片: <file>] / [ComponentType.X] etc.
+RE_ASTRBOT_MARKER = re.compile(r"\[(?:图片|表情|ComponentType\.[A-Za-z]+)[^\]]*\]")
 RE_QUOTE_MARK = re.compile(r"^\s*\[r:\s*(-?\d+)\]\s*")
 
 KOUPI_LIST = ("啃啃", "搓搓", "呜嘿", "bakabaka", "钨钼钨钼", "嗷呜", "捏猫猫的")
@@ -44,9 +46,11 @@ _AI_PHRASES = (
 
 
 def clean_message_text(text: str) -> str:
-    """Strip [引用消息(...)] and [At:QQ] blocks from raw message text."""
+    """Strip AstrBot/OneBot render markers from raw message text:
+    [引用消息(...)], [At:QQ], [图片: file], [ComponentType.X], [表情...]."""
     t = RE_QUOTE_BLOCK.sub("", text)
     t = RE_AT_MARKER.sub("", t)
+    t = RE_ASTRBOT_MARKER.sub("", t)
     return t.strip()
 
 
@@ -130,6 +134,7 @@ def postprocess(text: str) -> str:
     out = strip_at_mentions(out)
     out = strip_meta_parens(out)
     out = RE_REPLY_MARKER.sub("", out)
+    out = RE_ASTRBOT_MARKER.sub("", out)
     out = re.sub(r"(?<=[\u4e00-\u9fff]) +(?=[\u4e00-\u9fff])", "", out)
     out = cap_koupi(out)
     out = strip_emoji(out)
