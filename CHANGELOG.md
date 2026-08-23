@@ -19,6 +19,8 @@
 - **指令别名**：`/persona_awake` 与 `/persona_wake` 均可唤醒（此前仅后者注册，实测名字不匹配导致无响应）
 ### Added
 - **睡眠窗即时开关（2026-08-24）**: `/persona_wake`（特权，测试期唤醒）/ `/persona_sleep`（恢复），内存态即时生效免重启；`_is_sleeping()` 改为每消息热读配置（WebUI 改 sleep.* 亦即时生效）
+### Fixed
+- **G14 A/B 首轮实证精修（2026-08-24）**: 注入块头部加「规则A/B」——钨钼钨钼 仅限肯定/恍然大悟（Phase1 实测泛滥至 4/10 次）；谐音问候仅整词触发（实测“鸡没醒”被误回枣商蚝~）
 ### Added
 - **G14 静态注入落地（2026-08-24）**: `services/examples.py`（纳秒 mtime 热重载，A/B=改文件名零重启）；注入位置=会话与 KG 尾之间（内容恒定，前缀缓存稳定）；`examples.{enabled,max_entries}` 可配；终稿示例 13 条（人工评审 v2 全量并入：极简单发/暴力萌/胡言乱语/无括号动作），文件 `data_out/example_dialogs.json`（旧版已备份 .bak.20260824）；测试 +4（46 全绿）
 ### Added
