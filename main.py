@@ -48,6 +48,7 @@ from .services.context_buffer import ContextBuffer
 from .services.session_manager import SessionManager
 from .services.kg_provider import KGProvider, MultiSignalKGProvider, KGContext
 from .services.emotion import EmotionProvider, DefaultEmotionProvider, EmotionState, LLMEmotionProvider, EMOTION_SYSTEM_PROMPT
+from .services.vision import VisionService, face_name
 from .services.memory_store import MemoryStore, MemoryEvent
 from .services.dream_job import DreamJob
 from .services.conflict_detector import ConflictDetector
@@ -179,6 +180,12 @@ class PersonaAgent(Star):
         diary_cfg = self.config.get("diary", {}) or {}
         self._diary_enabled = int(diary_cfg.get("enabled", 1)) == 1
         self._last_provider_id: Optional[str] = None
+
+        vision_cfg = self.config.get("vision", {}) or {}
+        self._vision_enabled = int(vision_cfg.get("enabled", 1)) == 1
+        self._vision_max_images = int(vision_cfg.get("max_images", 2))
+        self._vision: Optional[VisionService] = None
+        self._vision_resolving = False
 
         if self._diary_enabled and self.context.cron_manager is not None:
             await self.context.cron_manager.add_basic_job(
@@ -400,9 +407,14 @@ class PersonaAgent(Star):
         text = self._clean_message_text(event.message_str or "")
         group_id = str(event.get_group_id() or "")
 
-        # v3: media-only messages (forward/images/emotes without text) are
-        # recorded by the buffer for stats but excluded from the session;
-        # image understanding is a future design item.
+        # G15: describe images/gif stickers via vision model; QQ Face ids are
+        # mapped locally. Descriptions join the message text before the
+        # media filter, so captioned media enters the session as text.
+        if self._vision_enabled:
+            text = await self._augment_with_vision(event, text)
+
+        # v3: media-only messages still excluded when vision failed or none
+        # (recorded by the buffer for stats; forwards stay filtered).
         if not text.strip():
             event.stop_event()
             return
@@ -669,6 +681,79 @@ class PersonaAgent(Star):
             logger.warning(f"[persona_agent] llm returned error response, suppressed ({len(text)} chars)")
             return ""
         return text
+
+    async def _augment_with_vision(self, event: AstrMessageEvent, text: str) -> str:
+        """G15: append vision descriptions / face names to the message text."""
+        try:
+            segs = list(event.get_messages())
+            imgs = [seg for seg in segs if isinstance(seg, Comp.Image)][: self._vision_max_images]
+            faces = [seg for seg in segs if isinstance(seg, Comp.Face)]
+            if not imgs and not faces:
+                return text
+            extra = ""
+            if faces:
+                extra += "".join(f"（表情：{face_name(getattr(f, 'id', 0))}）" for f in faces)
+            if imgs:
+                if self._vision is None:
+                    await self._ensure_vision(event)
+                if self._vision is not None:
+                    descs = []
+                    for seg in imgs:
+                        try:
+                            descs.append(await self._vision.describe_image(seg) or "")
+                        except Exception:
+                            descs.append("")
+                    non_empty = [d for d in descs if d]
+                    if non_empty:
+                        if len(non_empty) == 1:
+                            extra += f"（配图：{non_empty[0]}）"
+                        else:
+                            extra += "（配图：" + "；".join(
+                                f"{i + 1}:{d}" for i, d in enumerate(non_empty)) + "）"
+            if not extra:
+                return text
+            return f"{text} {extra}".strip() if text.strip() else extra
+        except Exception as e:
+            logger.warning(f"[persona_agent] vision augment failed: {e}")
+            return text
+
+    async def _ensure_vision(self, event: AstrMessageEvent) -> None:
+        """Lazily resolve api_base/key from the same chat provider source and
+        build the VisionService (secrets stay in provider config, never here)."""
+        if self._vision is not None or self._vision_resolving:
+            return
+        self._vision_resolving = True
+        try:
+            provider_id = (self.config.get("llm") or {}).get("provider_id", "") or self._last_provider_id
+            if not provider_id:
+                try:
+                    provider_id = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+                except Exception:
+                    provider_id = None
+            if not provider_id:
+                logger.warning("[persona_agent] vision init skipped: no provider id")
+                return
+            prov = await self.context.provider_manager.get_provider_by_id(provider_id)
+            cfg = getattr(prov, "provider_config", None) or {}
+            api_base = str(cfg.get("api_base", "") or "")
+            keys = cfg.get("key") or []
+            if not api_base or not keys:
+                logger.warning("[persona_agent] vision init skipped: provider has no api_base/key")
+                return
+            vcfg = self.config.get("vision", {}) or {}
+            self._vision = VisionService(
+                api_base=api_base,
+                api_key=str(keys[0]),
+                model=str(vcfg.get("model", "mimo-v2.5")),
+                timeout=float(vcfg.get("timeout_sec", 15)),
+                cache_ttl=float(vcfg.get("cache_ttl_sec", 30)),
+                desc_max_chars=int(vcfg.get("desc_max_chars", 120)),
+            )
+            logger.info(f"[persona_agent] vision service ready (model={self._vision._model})")
+        except Exception as e:
+            logger.warning(f"[persona_agent] vision init failed: {e}")
+        finally:
+            self._vision_resolving = False
 
     def _temperature_for(self, trigger: str) -> Optional[float]:
         """G7: per-trigger temperature tiers (v0.2 4.5; dream tier deferred
