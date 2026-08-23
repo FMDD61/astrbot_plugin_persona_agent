@@ -258,8 +258,8 @@
       },
       "model": {
         "type": "string",
-        "description": "视觉模型（网关内，默认 mimo-v2.5）",
-        "default": "mimo-v2.5"
+        "description": "视觉模型（网关内；实测 deepseek-v4-flash-vision-exp 可用，mimo-v2.5 视觉返回空）",
+        "default": "deepseek-v4-flash-vision-exp"
       },
       "timeout_sec": {
         "type": "float",
