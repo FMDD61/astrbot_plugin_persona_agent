@@ -49,6 +49,7 @@ from .services.session_manager import SessionManager
 from .services.kg_provider import KGProvider, MultiSignalKGProvider, KGContext
 from .services.emotion import EmotionProvider, DefaultEmotionProvider, EmotionState, LLMEmotionProvider, EMOTION_SYSTEM_PROMPT
 from .services.vision import VisionService, face_name
+from .services.examples import load_examples_block, ExamplesState
 from .services.memory_store import MemoryStore, MemoryEvent
 from .services.dream_job import DreamJob
 from .services.conflict_detector import ConflictDetector
@@ -186,6 +187,7 @@ class PersonaAgent(Star):
         self._vision_max_images = int(vision_cfg.get("max_images", 2))
         self._vision: Optional[VisionService] = None
         self._vision_resolving = False
+        self._examples_state = ExamplesState()
 
         if self._diary_enabled and self.context.cron_manager is not None:
             await self.context.cron_manager.add_basic_job(
@@ -537,6 +539,11 @@ class PersonaAgent(Star):
                 logger.warning(f"[persona_agent] KG query failed: {e}")
 
             contexts = self.session_mgr.get_contexts(group_id)
+            # G14: fixed example dialogs between session and KG tail
+            # (constant content -> prefix cache stays stable).
+            ex_block = self._examples_block()
+            if ex_block:
+                contexts.append({"role": "system", "content": ex_block})
             if kg_result and kg_result.content:
                 contexts.append({"role": "system", "content": kg_result.content})
 
@@ -762,6 +769,23 @@ class PersonaAgent(Star):
             logger.warning(f"[persona_agent] vision init failed: {e}")
         finally:
             self._vision_resolving = False
+
+    def _examples_block(self) -> str:
+        """G14: hot-reloadable example-dialog block (A/B = rename the file)."""
+        try:
+            cfg = self.config.get("examples", {}) or {}
+            if int(cfg.get("enabled", 1)) != 1:
+                self._examples_state = ExamplesState()
+                return ""
+            block, state = load_examples_block(
+                self.data_dir / "example_dialogs.json",
+                max_entries=int(cfg.get("max_entries", 12)),
+                prev=self._examples_state,
+            )
+            self._examples_state = state
+            return block
+        except Exception:
+            return ""
 
     def _temperature_for(self, trigger: str) -> Optional[float]:
         """G7: per-trigger temperature tiers (v0.2 4.5; dream tier deferred

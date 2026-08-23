@@ -31,9 +31,13 @@ class TestRotation(unittest.TestCase):
     def test_rotate_archives_and_restores(self):
         with tempfile.TemporaryDirectory() as td:
             sm = SessionManager(data_dir=td, max_messages=None, rotation_hour=2, tz_offset_hours=8)
-            sm.append('grp', 'user', '早上好', name='焦糖')
-            sm.append('grp', 'assistant', '枣商蚝~')
             orig = time.time
+            time.time = lambda: cst("2026-08-23 10:00")  # pin append day deterministically
+            try:
+                sm.append('grp', 'user', '早上好', name='焦糖')
+                sm.append('grp', 'assistant', '枣商蚝~')
+            finally:
+                time.time = orig
             time.time = lambda: cst("2026-08-24 03:00")
             try:
                 old = sm.rotate_if_day_changed('grp')

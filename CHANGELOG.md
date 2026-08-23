@@ -15,6 +15,8 @@
 - 事件循环防泄漏加固：生成锁分支 / LLM 失败 / 空回复三条早退路径补 `stop_event()`，避免 AstrBot 核心兜底回复将错误文本广播到群
 - 说明：此前「LLM 响应错误」外泄为 AstrBot 核心默认 agent 行为（非目标群未处理消息 + 图片多模态调用失败），非插件代码泄漏；生产切换（test_mode=0）后目标群由插件接管可避免，或在 AstrBot WebUI 配置 `provider_ltm_settings.image_caption_provider_id` 指定视觉模型
 ### Added
+- **G14 静态注入落地（2026-08-24）**: `services/examples.py`（纳秒 mtime 热重载，A/B=改文件名零重启）；注入位置=会话与 KG 尾之间（内容恒定，前缀缓存稳定）；`examples.{enabled,max_entries}` 可配；终稿示例 13 条（人工评审 v2 全量并入：极简单发/暴力萌/胡言乱语/无括号动作），文件 `data_out/example_dialogs.json`（旧版已备份 .bak.20260824）；测试 +4（46 全绿）
+### Added
 - **G15 识图能力（2026-08-23 全量实现）**:
   - `services/vision.py`：图片/gif 表情 → 视觉模型（默认 mimo-v2.5，同网关同 key，懒解析不落密钥）→ ≤120 字中文描述；三源解析（convert_to_file_path 统一处理本地/url/base64 + 手动兜底）；gif/jpeg/png/webp mime 嗅探；30s 同图 hash 缓存；15s 超时与失败降级（不影响回复链路）
   - QQ Face（系统表情）→ 本地 id→名称映射表（零成本）
