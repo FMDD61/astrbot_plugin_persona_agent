@@ -317,6 +317,7 @@ class PersonaAgent(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.command("persona_wake")
+    @filter.command("persona_awake")
     async def cmd_persona_wake(self, event: AstrMessageEvent):
         """Test-time wake: sleep window disabled until /persona_sleep or restart."""
         if not self._is_privileged(event):
