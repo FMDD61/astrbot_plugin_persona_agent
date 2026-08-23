@@ -91,6 +91,55 @@ class StyleProfile:
         rel = self._get("member_relations.json")
         return rel.get("members", rel.get("top_members", []))
 
+    def add_new_member(self, uin: str, name: str) -> bool:
+        """Append a brand-new member entry (G9, auto-join).
+
+        Append-only and non-destructive: re-reads the file fresh (mtime
+        reload), skips existing uins, never touches other entries. Falls back
+        to 群友<uin> when the nickname is empty or already used as an alias.
+        Returns True when the file was actually appended.
+        """
+        uin = str(uin or "").strip()
+        if not uin:
+            return False
+        rel = self._get("member_relations.json")
+        members = rel.get("members", [])
+        if any(str(m.get("uin", "")) == uin for m in members):
+            return False
+        alias = (name or "").strip() or f"群友{uin}"
+        if any((m.get("alias") or "").strip() == alias for m in members):
+            alias = f"群友{uin}"
+        entry = {
+            "uin": uin,
+            "alias": alias,
+            "other_names": [],
+            "closeness": "new",
+            "auto_added": True,
+            "first_seen": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+            "notes": "",
+        }
+        members.append(entry)
+        rel["members"] = members
+        path = self._path("member_relations.json")
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(
+                __import__("json").dumps(rel, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            import os
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            return False
+        self._mtime["member_relations.json"] = 0.0  # force reload on next access
+        self._get("member_relations.json")
+        return True
+
     def system_prompt(self, local_hour: Optional[int] = None) -> str:
         f = self._get("system_prompt_fragments.json")
         parts: list[str] = []
