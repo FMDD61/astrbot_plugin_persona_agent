@@ -9,6 +9,12 @@
 ## [Unreleased]
 
 ### Added
+- **第二批功能缺口修复（G7-G10, 2026-08-23）**:
+  - G7 温度分档：`llm.temperature.{at_reply 0.8, active_interjection 1.0, cold_start 1.1}`（dream 档延后至 dream 具备 LLM 步骤），按 decision.trigger 透传 `llm_generate(**kwargs)`
+  - G8 特权 QQ：`privileged_qq`（默认风格源），`/dream_now` 免 dream.enabled 开关
+  - G9 新人自动入列：`StyleProfile.add_new_member()` 原子追加（只增不改、昵称空/冲突回退 群友+uin、auto_added/first_seen 标记），未知 uin 异步触发
+  - G10 LLM 情绪引擎 v1：`LLMEmotionProvider`（willingness/mood/sticker 三维，30s 同群缓存，3s 超时回退中性，JSON 解析+钳制 0.3-1.5）；`emotion.{enabled,timeout_sec,cache_ttl_sec}` 可配；willingness 调制插话、mood 注入 system prompt 尾、sticker 触发表情包发送
+  - 测试 +10 例（情绪解析/钳制/缓存/超时降级、add_new_member 幂等/回退），累计 33 例
 - **第一批功能缺口修复（G1-G4, 2026-08-23）**:
   - G1: RAG 查询移出事件循环 —— 决策阶段 `rag.query` 与 KG dense 检索改 `asyncio.to_thread`（BGE 编码不再冻结所有群）
   - G2: 引用回复实现 —— `[r:-N]` 标记解析（`services/text_style.py::extract_quote`，`-1`=最新消息）→ `ContextBuffer.quote_target(n)` 查 message_id → `Comp.Reply` 构造 OneBot reply chain；查不到则降级纯文本

@@ -35,6 +35,12 @@
     "hint": "机器人模仿这个 QQ 的发言风格。离线数据已按此号生成。",
     "default": "337934842"
   },
+  "privileged_qq": {
+    "type": "string",
+    "description": "特权 QQ（G8：风格源/管理员命令豁免）",
+    "hint": "该 QQ 可跳过 dream.enabled 等开关执行命令",
+    "default": "337934842"
+  },
 
   "reply_on_at": {
     "type": "int",
@@ -241,10 +247,53 @@
     }
   },
 
+  "emotion": {
+    "type": "object",
+    "description": "情绪引擎（G10 v1：willingness/mood/sticker 三维 + 30s 缓存 + 3s 超时）",
+    "items": {
+      "enabled": {
+        "type": "int",
+        "description": "0 关闭（退回中性）/ 1 开启",
+        "default": 1
+      },
+      "timeout_sec": {
+        "type": "float",
+        "description": "情绪 LLM 调用超时（秒），超时回退中性",
+        "default": 3
+      },
+      "cache_ttl_sec": {
+        "type": "float",
+        "description": "同群情绪缓存时长（秒）",
+        "default": 30
+      }
+    }
+  },
+
   "llm": {
     "type": "object",
     "description": "LLM provider 选择",
     "items": {
+      "temperature": {
+        "type": "object",
+        "description": "场景温度分档（G7，v0.2 §4.5）",
+        "items": {
+          "at_reply": {
+            "type": "float",
+            "description": "@ 回复温度",
+            "default": 0.8
+          },
+          "active_interjection": {
+            "type": "float",
+            "description": "主动插话温度",
+            "default": 1.0
+          },
+          "cold_start": {
+            "type": "float",
+            "description": "冷场话题温度（TopicBank 实现后生效）",
+            "default": 1.1
+          }
+        }
+      },
       "provider_id": {
         "type": "string",
         "description": "LLM provider ID",

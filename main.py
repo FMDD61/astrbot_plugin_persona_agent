@@ -47,7 +47,7 @@ from .services.json_store import JsonStore
 from .services.context_buffer import ContextBuffer
 from .services.session_manager import SessionManager
 from .services.kg_provider import KGProvider, MultiSignalKGProvider, KGContext
-from .services.emotion import EmotionProvider, DefaultEmotionProvider, EmotionState
+from .services.emotion import EmotionProvider, DefaultEmotionProvider, EmotionState, LLMEmotionProvider, EMOTION_SYSTEM_PROMPT
 from .services.memory_store import MemoryStore, MemoryEvent
 from .services.dream_job import DreamJob
 from .services.conflict_detector import ConflictDetector
@@ -65,6 +65,7 @@ class PersonaAgent(Star):
         self.test_group_id: str = str(config.get("test_group_id", ""))
         self.bot_qq: str = str(config.get("bot_qq", ""))
         self.style_source_qq: str = str(config.get("style_source_qq", ""))
+        self.privileged_qq: str = str(config.get("privileged_qq", ""))
 
         # Services (lazy heavy deps; created in initialize())
         self.style: Optional[StyleProfile] = None
@@ -136,7 +137,16 @@ class PersonaAgent(Star):
             top_n_final=int(rag_cfg.get("top_n_final", 3)),
             max_chars=int(rag_cfg.get("max_example_chars", 400)),
         )
-        self._emotion = DefaultEmotionProvider()
+        emotion_cfg = self.config.get("emotion", {}) or {}
+        if int(emotion_cfg.get("enabled", 1)) == 1:
+            self._emotion = LLMEmotionProvider(
+                self._emotion_llm,
+                timeout=float(emotion_cfg.get("timeout_sec", 3)),
+                cache_ttl=float(emotion_cfg.get("cache_ttl_sec", 30)),
+            )
+            logger.info("[persona_agent] LLM emotion provider enabled (v1, G10)")
+        else:
+            self._emotion = DefaultEmotionProvider()
         self._dream_job = DreamJob(self._memory_store, str(self.data_dir))
 
         dream_cfg = self.config.get("dream", {}) or {}
@@ -348,9 +358,13 @@ class PersonaAgent(Star):
 
     @filter.command("dream_now")
     async def cmd_dream_now(self, event: AstrMessageEvent):
-        if int((self.config.get("dream") or {}).get("enabled", 0)) != 1:
+        sender_uin = str(event.get_sender_id() or "")
+        privileged = bool(self.privileged_qq) and sender_uin == self.privileged_qq
+        if int((self.config.get("dream") or {}).get("enabled", 0)) != 1 and not privileged:
             yield event.plain_result("dream.enabled=0，已禁用做梦。")
             return
+        if privileged:
+            logger.info(f"[persona_agent] privileged /dream_now from {sender_uin}")
         if self._dream_job is None:
             yield event.plain_result("DreamJob 尚未初始化。")
             return
@@ -399,6 +413,10 @@ class PersonaAgent(Star):
             asyncio.create_task(self._generate_diary(group_id, old_msgs))
 
         alias = self.style.preferred_alias(sender_uin) or f"群友{sender_uin}"
+        if alias.startswith("群友") and sender_uin and sender_uin != self.bot_qq:
+            # G9: unknown caller -> append a 'new' member entry (async, safe)
+            sender_name = str(event.get_sender_name() or "")
+            asyncio.create_task(asyncio.to_thread(self._auto_add_member, str(sender_uin), sender_name))
         self.session_mgr.append(group_id, "user", text, name=alias)
 
         # v3: sleep window — bot stays silent (mimics human rest) but the
@@ -510,7 +528,10 @@ class PersonaAgent(Star):
                 contexts.append({"role": "system", "content": kg_result.content})
 
             try:
-                reply_text = await self._generate_reply(event, text, contexts, emotion_state)
+                reply_text = await self._generate_reply(
+                    event, text, contexts, emotion_state,
+                    temperature=self._temperature_for(decision.trigger),
+                )
             except Exception as e:
                 logger.exception(f"[persona_agent] LLM generation failed: {e}")
                 return
@@ -583,6 +604,7 @@ class PersonaAgent(Star):
         user_text: str,
         contexts: list[dict],
         emotion: Optional[EmotionState] = None,
+        temperature: Optional[float] = None,
     ) -> str:
         local_hour = self._local_hour()
         sys_prompt = self.style.system_prompt(local_hour=local_hour) if self.style else ""
@@ -624,12 +646,16 @@ class PersonaAgent(Star):
             return ""
         self._last_provider_id = provider_id
 
+        gen_kwargs = {}
+        if temperature is not None:
+            gen_kwargs["temperature"] = temperature
         try:
             resp = await self.context.llm_generate(
                 chat_provider_id=provider_id,
                 prompt=None,
                 system_prompt=sys_prompt,
                 contexts=contexts,
+                **gen_kwargs,
             )
         except Exception as e:
             logger.exception(f"[persona_agent] llm_generate raised: {e}")
@@ -643,6 +669,38 @@ class PersonaAgent(Star):
             logger.warning(f"[persona_agent] llm returned error response, suppressed ({len(text)} chars)")
             return ""
         return text
+
+    def _temperature_for(self, trigger: str) -> Optional[float]:
+        """G7: per-trigger temperature tiers (v0.2 4.5; dream tier deferred
+        until dream has an LLM step)."""
+        t = (self.config.get("llm") or {}).get("temperature") or {}
+        if trigger == TRIGGER_AT:
+            return float(t.get("at_reply", 0.8))
+        if trigger == TRIGGER_RAG:
+            return float(t.get("active_interjection", 1.0))
+        if trigger == TRIGGER_COLD:
+            return float(t.get("cold_start", 1.1))
+        return None
+
+    def _auto_add_member(self, uin: str, name: str) -> None:
+        """G9: append unknown callers to member_relations (new tier)."""
+        try:
+            if self.style is not None and self.style.add_new_member(uin, name):
+                logger.info(f"[persona_agent] auto-added member uin={uin} alias={name or f'群友{uin}'}")
+        except Exception as e:
+            logger.warning(f"[persona_agent] auto-add member failed: {e}")
+
+    async def _emotion_llm(self, prompt: str) -> str:
+        """G10: emotion analysis call (3s timeout enforced by the provider)."""
+        provider = (self.config.get("llm") or {}).get("provider_id", "") or self._last_provider_id
+        if not provider:
+            raise RuntimeError("no LLM provider available for emotion")
+        resp = await self.context.llm_generate(
+            chat_provider_id=provider,
+            prompt=prompt,
+            system_prompt=EMOTION_SYSTEM_PROMPT,
+        )
+        return (getattr(resp, "completion_text", "") or "").strip()
 
     def _log_llm_probe(
         self,
