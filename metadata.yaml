@@ -2,7 +2,7 @@ name: astrbot_plugin_persona_agent
 display_name: 人格 Agent
 desc: 让机器人在目标 QQ 群内模仿指定用户的发言风格。基于 RAG（ChromaDB + BGE 嵌入）+ 离线风格画像，支持 @ 回复、识图、示例注入、主动插话、戳一戳、做梦、主动话题；按日会话轮换 + 睡眠窗 + 每日日记 + 情绪引擎，高级功能默认关闭，渐进式开启。
 short_desc: 个人风格模仿插件
-version: v0.4.0
+version: v0.5.0
 author: persona-agent
 repo: https://github.com/local/astrbot_plugin_persona_agent
 support_platforms:
