@@ -584,7 +584,14 @@ class PersonaAgent(Star):
             top_rag_score=top_score,
             emotion_multiplier=emotion_state.global_willingness,
         )
-        self._log_decision(decision.to_log(time.time(), sender_uin))
+        # G16 observability: every branch keeps the raw RAG score + emotion
+        # multiplier so threshold tuning is data-driven (2026-08-25 replay:
+        # production p95=0.676 max=0.698 -> 0.65 ≈ 5% trigger rate).
+        decision_log = decision.to_log(time.time(), sender_uin)
+        decision_log["extra"] = dict(decision_log.get("extra") or {})
+        decision_log["extra"]["top_rag_score"] = round(top_score, 4)
+        decision_log["extra"]["emotion_multiplier"] = round(emotion_state.global_willingness, 3)
+        self._log_decision(decision_log)
 
         if decision.action == ACTION_SILENT:
             event.stop_event()
