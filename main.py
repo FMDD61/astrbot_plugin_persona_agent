@@ -39,16 +39,21 @@ from .services.interjection import (
     InterjectionManager,
     TRIGGER_AT,
     TRIGGER_RAG,
+    TRIGGER_COLD,
     ACTION_REPLY,
     ACTION_TOPIC,
     ACTION_SILENT,
+    Decision,
 )
+from .services.topic_bank import TopicBank
+from .services.summary import SummaryService, build_prompt, append_summary
 from .services.json_store import JsonStore
 from .services.context_buffer import ContextBuffer
 from .services.session_manager import SessionManager
 from .services.kg_provider import KGProvider, MultiSignalKGProvider, KGContext
 from .services.emotion import EmotionProvider, DefaultEmotionProvider, EmotionState, LLMEmotionProvider, EMOTION_SYSTEM_PROMPT
 from .services.vision import VisionService, face_name
+from .services.poke import PokeService
 from .services.examples import load_examples_block, ExamplesState
 from .services.memory_store import MemoryStore, MemoryEvent
 from .services.dream_job import DreamJob
@@ -79,6 +84,9 @@ class PersonaAgent(Star):
         self._emotion: Optional[EmotionProvider] = None
         self._memory_store: Optional[MemoryStore] = None
         self._dream_job: Optional[DreamJob] = None
+        self._poke: Optional[PokeService] = None
+        self._topic_bank: Optional[TopicBank] = None
+        self._summary: Optional[SummaryService] = None
         self._conflict_detector: Optional[ConflictDetector] = None
         self._generating: dict[str, bool] = {}
 
@@ -173,6 +181,16 @@ class PersonaAgent(Star):
             keywords_dir=str(self.data_dir),
         )
 
+        poke_cfg = self.config.get("poke", {}) or {}
+        self._poke = PokeService(
+            str(self.data_dir),
+            bot_qq=self.bot_qq,
+            cooldown_sec=float(poke_cfg.get("cooldown_sec", 300)),
+            hourly_cap=4,
+        )
+        self._topic_bank = TopicBank(str(self.data_dir))
+        self._summary = SummaryService(str(self.data_dir))
+
         # v3: sleep window + diary (rotation at 02:00 inside the sleep window)
         sleep_cfg = self.config.get("sleep", {}) or {}
         self._sleep_enabled = int(sleep_cfg.get("enabled", 1)) == 1
@@ -205,6 +223,34 @@ class PersonaAgent(Star):
             logger.info("[persona_agent] daily rotation cron registered (02:05 CST)")
         else:
             logger.warning("[persona_agent] diary.disabled or cron_manager missing; rotation cron NOT registered")
+
+        # G13: weekly/monthly summary pyramid over the daily diaries (default off)
+        summary_cfg = self.config.get("summary", {}) or {}
+        if self.context.cron_manager is not None:
+            if int(summary_cfg.get("weekly_enabled", 0)) == 1:
+                await self.context.cron_manager.add_basic_job(
+                    name="persona_weekly_summary",
+                    cron_expression="10 2 * * 1",
+                    handler=self._weekly_summary_job,
+                    description="Weekly summary of daily diaries + raw sampling (G13)",
+                    timezone="Asia/Shanghai",
+                    enabled=True,
+                    persistent=False,
+                )
+                logger.info("[persona_agent] weekly summary cron registered (Mon 02:10 CST)")
+            if int(summary_cfg.get("monthly_enabled", 0)) == 1:
+                await self.context.cron_manager.add_basic_job(
+                    name="persona_monthly_summary",
+                    cron_expression="15 2 1 * *",
+                    handler=self._monthly_summary_job,
+                    description="Monthly summary of daily diaries + raw sampling (G13)",
+                    timezone="Asia/Shanghai",
+                    enabled=True,
+                    persistent=False,
+                )
+                logger.info("[persona_agent] monthly summary cron registered (1st 02:15 CST)")
+        else:
+            logger.warning("[persona_agent] cron_manager not available; summary crons NOT registered")
 
         # Pre-warm RAG off the event loop so the first group message never
         # stalls on BGE/chroma lazy init (2026-08-22 watchdog incident).
@@ -305,6 +351,7 @@ class PersonaAgent(Star):
             f"topic_bank.enabled  : {(cfg.get('topic_bank') or {}).get('enabled', 0)}",
             f"poke.enabled        : {(cfg.get('poke') or {}).get('enabled', 0)}",
             f"dream.enabled       : {(cfg.get('dream') or {}).get('enabled', 0)}",
+            f"summary             : weekly={(cfg.get('summary') or {}).get('weekly_enabled', 0)} monthly={(cfg.get('summary') or {}).get('monthly_enabled', 0)}",
             f"data_dir         : {self.data_dir}",
         ]
         if self.interjection is not None:
@@ -544,7 +591,7 @@ class PersonaAgent(Star):
             return
 
         if decision.action == ACTION_TOPIC:
-            logger.info("[persona_agent] topic action requested, but topic_bank not implemented yet")
+            await self._send_topic(event, group_id, decision, live_ctx, sender_uin)
             event.stop_event()
             return
 
@@ -629,20 +676,144 @@ class PersonaAgent(Star):
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.OTHER_MESSAGE)
     async def on_other(self, event: AstrMessageEvent):
-        """Poke notice handler (skeleton — sub-agent D will fill)."""
-        if int((self.config.get("poke") or {}).get("enabled", 0)) != 1:
+        """G11: poke notice -> PokeService decision -> poke back.
+
+        Group/production routing mirrors _is_target_group() on the raw
+        group_id (notice events may not carry a resolved group context in
+        get_group_id()). poke.enabled=0 leaves this a complete no-op.
+        """
+        if self._poke is None:
             return
         raw = getattr(event.message_obj, "raw_message", None)
         if not raw:
             return
-        try:
-            if (raw.get("notice_type") == "notify"
-                    and raw.get("sub_type") == "poke"
-                    and str(raw.get("target_id")) == self.bot_qq):
-                poker = str(raw.get("user_id"))
-                logger.info(f"[persona_agent] poked by {poker} (handler not implemented)")
-        except AttributeError:
+        if raw.get("notice_type") != "notify" or raw.get("sub_type") != "poke":
             return
+        poker = str(raw.get("user_id") or "")
+        target = str(raw.get("target_id") or "")
+        group_id = str(raw.get("group_id") or "")
+        if not poker or str(target) != self.bot_qq or not group_id:
+            return
+        if self.test_mode == 1:
+            if group_id != self.test_group_id:
+                return
+        elif group_id != self.target_group_id:
+            return
+        poke_cfg = self.config.get("poke", {}) or {}
+        if int(poke_cfg.get("enabled", 0)) != 1:
+            return
+
+        self._poke.configure(cooldown_sec=float(poke_cfg.get("cooldown_sec", 300)))
+        alias = ""
+        if self.style is not None:
+            try:
+                alias = self.style.preferred_alias(poker)
+            except Exception:
+                alias = ""
+        recent_text = ""
+        if self.buffer is not None:
+            try:
+                recent_text = self.buffer.format_recent(max_lines=3, max_chars=400)
+            except Exception:
+                recent_text = ""
+        respond, reason = self._poke.decide(
+            now_utc=time.time(),
+            poker=poker,
+            group_id=group_id,
+            known_member=bool(alias),
+            recent_text=recent_text,
+        )
+        self._poke.record(
+            now_utc=time.time(),
+            poker=poker,
+            group_id=group_id,
+            responded=respond,
+            reason=reason,
+        )
+        if not respond:
+            logger.info(f"[persona_agent] poke ignored: poker={poker} reason={reason}")
+            return
+        try:
+            yield event.chain_result([Comp.Poke(id=poker)])
+            logger.info(f"[persona_agent] poke back to {poker} (alias={alias or '?'})")
+        except Exception as ex:
+            logger.warning(f"[persona_agent] poke reply failed: {ex}")
+
+    async def _send_topic(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        decision: Decision,
+        live_ctx: str,
+        sender_uin: str,
+    ) -> None:
+        """G12: cold-start topic utterance via TopicBank + LLM rewrite.
+
+        Sends actively to the group (no reply chain); archives the topic on
+        success; stays fully silent when there is no eligible topic, no
+        provider, or the LLM returns nothing usable. topic_bank.enabled=0
+        never reaches here (interjection master gate).
+        """
+        if self._topic_bank is None or self.style is None or self.session_mgr is None:
+            return
+        topic = self._topic_bank.pick(
+            now=time.time(),
+            silence_sec=decision.silence_sec,
+            live_text=live_ctx or "",
+        )
+        log = decision.to_log(time.time(), sender_uin)
+        if topic is None:
+            log["extra"] = {"topic_id": None, "sent": False}
+            self._log_decision(log)
+            logger.info("[persona_agent] topic action: no eligible topic, staying silent")
+            return
+        self._generating[group_id] = True
+        try:
+            await asyncio.sleep(0.5)
+            user_block = (
+                "（群里冷场了。现在需要你以本人的语气主动说一句开启新话题，"
+                "不要提“冷场/没人说话”，不要机械照抄素材，一两句自然的话即可。）\n"
+                f"【话题素材】{topic.content}\n"
+                f"【分类】{topic.category or '日常'}\n"
+                f"【最近聊天】{(live_ctx or '（无）').strip()}"
+            )
+            contexts = [{"role": "user", "content": user_block}]
+            text = await self._generate_reply(
+                event,
+                "",
+                contexts,
+                None,
+                temperature=self._temperature_for(TRIGGER_COLD),
+            )
+            clean_text, _ = text_style.extract_quote(text)
+            reply_text = self._postprocess(clean_text)
+            if not reply_text:
+                log["extra"] = {"topic_id": topic.id, "sent": False, "reason": "empty"}
+                self._log_decision(log)
+                logger.info("[persona_agent] topic: empty LLM output, staying silent")
+                return
+            chain = MessageChain().message(reply_text)
+            await self.context.send_message(event.unified_msg_origin, chain)
+            self._topic_bank.mark_sent(topic, reason="cold_start")
+            self.session_mgr.append(group_id, "assistant", reply_text)
+            if self.buffer is not None:
+                self.buffer.add(
+                    ts=time.time(),
+                    group_id=group_id,
+                    sender_id=self.bot_qq,
+                    sender_name="<bot>",
+                    text=reply_text,
+                    message_id="",
+                    message_type="bot",
+                )
+            self.interjection.register_reply(now_utc=time.time(), trigger=TRIGGER_COLD)
+            log["extra"] = {"topic_id": topic.id, "sent": True}
+            self._log_decision(log)
+            logger.info(f"[persona_agent] topic sent: id={topic.id} category={topic.category}")
+        except Exception as ex:
+            logger.warning(f"[persona_agent] topic send failed: {ex}")
+        finally:
+            self._generating[group_id] = False
 
     # ----------------------------------------------------------------- LLM
 
@@ -1021,6 +1192,106 @@ class PersonaAgent(Star):
             logger.info(f"[persona_agent] diary written: day={record['day']} n={len(msgs)}")
         except Exception as e:
             logger.warning(f"[persona_agent] diary generation failed: {e}")
+
+    # ----------------------------------------------------------------- G13 summary jobs
+
+    async def _weekly_summary_job(self) -> None:
+        """Cron: Monday 02:10 — weekly pyramid summary over daily diaries."""
+        await self._period_summary("weekly")
+
+    async def _monthly_summary_job(self) -> None:
+        """Cron: 1st 02:15 — monthly pyramid summary over daily diaries."""
+        await self._period_summary("monthly")
+
+    async def _period_summary(self, kind: str) -> None:
+        """G13: collect diaries + sampled raw messages -> LLM summary ->
+        jsonl append -> push to bind_dream private chat when bound.
+
+        Fully silent when disabled (crons are never registered), when there is
+        no data, no provider, or the LLM returns nothing usable.
+        """
+        if self._summary is None or self.style is None:
+            return
+        groups = [self.target_group_id] if self.test_mode == 0 else [self.test_group_id]
+        for gid in groups:
+            if not gid:
+                continue
+            try:
+                collected = self._summary.collect(kind, gid)
+            except Exception as ex:
+                logger.warning(f"[persona_agent] {kind} summary collect failed: {ex}")
+                continue
+            if not collected["diaries"] and not collected["samples"]:
+                logger.info(f"[persona_agent] {kind} summary: no data for {gid}, skipped")
+                continue
+            provider = (self.config.get("llm") or {}).get("provider_id", "") or self._last_provider_id
+            if not provider:
+                logger.warning(f"[persona_agent] {kind} summary skipped: no provider id")
+                continue
+            prompt = build_prompt(
+                kind, gid, collected["label"], collected["diaries"], collected["samples"],
+            )
+            sys_prompt = self.style.system_prompt(local_hour=self._local_hour())
+            try:
+                resp = await self.context.llm_generate(
+                    chat_provider_id=provider,
+                    prompt=None,
+                    system_prompt=sys_prompt,
+                    contexts=[{"role": "user", "content": prompt}],
+                )
+            except Exception as ex:
+                logger.warning(f"[persona_agent] {kind} summary LLM failed: {ex}")
+                continue
+            text = (getattr(resp, "completion_text", "") or "").strip()
+            if not text or self._is_error_response(text):
+                logger.warning(f"[persona_agent] {kind} summary empty/error, skipped")
+                continue
+            record = append_summary(
+                self._summary.output_path(kind),
+                kind,
+                gid,
+                collected["label"],
+                text,
+                {"n_diaries": collected["n_diaries"], "n_samples": collected["n_samples"]},
+            )
+            logger.info(
+                f"[persona_agent] {kind} summary written: group={gid} "
+                f"period={record['period']} n_diaries={record['n_diaries']} "
+                f"n_samples={record['n_samples']}"
+            )
+            # G13 extra: push the summary to the bound dream private chat
+            binding = self.store.load_json("dream_binding.json", {}) or {}
+            umo = binding.get("unified_msg_origin")
+            pushed = False
+            if umo:
+                try:
+                    head = "周记" if kind == "weekly" else "月记"
+                    chain = MessageChain().message(f"【{record['period']} {head}】\n{record['summary']}")
+                    await self.context.send_message(umo, chain)
+                    pushed = True
+                except Exception as ex:
+                    logger.warning(f"[persona_agent] {kind} summary push failed: {ex}")
+            self._log_decision({
+                "action": f"{kind}_summary",
+                "trigger": "cron",
+                "reason": "period summary",
+                "score": 0.0,
+                "hour": self._local_hour(),
+                "hourly_budget": 0.0,
+                "hourly_used": 0.0,
+                "silence_sec": 0.0,
+                "cooldown_left_sec": 0.0,
+                "extra": {
+                    "kind": kind,
+                    "group_id": gid,
+                    "period": record["period"],
+                    "n_diaries": record["n_diaries"],
+                    "n_samples": record["n_samples"],
+                    "pushed": pushed,
+                },
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "sender_uin": "cron",
+            })
 
     # ----------------------------------------------------------------- misc
 

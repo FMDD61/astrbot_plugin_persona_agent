@@ -328,6 +328,33 @@
     }
   },
 
+  "summary": {
+    "type": "object",
+    "description": "周/月摘要（G13：日日记之上的金字塔汇总；周一 02:10 / 月首 02:15 cron，输出 jsonl 并可推 bind_dream 私聊）",
+    "items": {
+      "weekly_enabled": {
+        "type": "int",
+        "description": "周摘要 0 关闭 / 1 开启",
+        "default": 0
+      },
+      "monthly_enabled": {
+        "type": "int",
+        "description": "月摘要 0 关闭 / 1 开启",
+        "default": 0
+      },
+      "max_sample_messages": {
+        "type": "int",
+        "description": "每个归档日最多抽样原文条数（防失真）",
+        "default": 6
+      },
+      "max_summary_chars": {
+        "type": "int",
+        "description": "摘要正文上限字符数",
+        "default": 800
+      }
+    }
+  },
+
   "llm": {
     "type": "object",
     "description": "LLM provider 选择",
