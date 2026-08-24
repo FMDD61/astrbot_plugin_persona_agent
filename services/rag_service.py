@@ -82,9 +82,15 @@ class RagService:
         with self._lock:
             if self._backend is not None:
                 return self._backend
+            # 双保险：即使宿主启动命令未带 HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE，
+            # 也禁止联网。实测（2026-08-25 smoke_rag --real 复现）：
+            # local_files_only=True 仍会走 sentence_transformers.model_card
+            # -> huggingface_hub.model_info() 联网校验；huggingface.co 不可达时
+            # TCP connect 可挂起数分钟（同步阻塞 AstrBot 事件循环的同一根因，
+            # 见 2026-08-22 看门狗事故 + CHANGELOG e3f1dc5）。
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
             from sentence_transformers import SentenceTransformer  # type: ignore
-            # 只从本地 HF 缓存加载，禁止 SentenceTransformer() 联网校验元数据。
-            # 否则在 huggingface.co 不可达时地址 http_backoff 无限重试，同步阻塞 AstrBot 事件循环（表现为“主动回复卡死”）。
             model = SentenceTransformer(self._model_name, local_files_only=True)
             dim = int(model.get_sentence_embedding_dimension())
 
