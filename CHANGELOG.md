@@ -26,6 +26,7 @@
 
 ### Fixed
 - 决策日志缺失 RAG 分数：主动插话评估（G16）前 silent 分支不记录 top_rag_score，现每个 decision entry 的 extra 落盘原始分与情绪乘数
+- **smoke_rag --real / 独立脚本 BGE 加载卡死根因（2026-08-25 修复，d218654）**: SentenceTransformer(local_files_only=True) 仍会经 model_card.set_base_model → huggingface_hub.model_info() 联网校验；huggingface.co 不可达时 TCP connect 挂起数分钟（faulthandler SIGABRT 栈定位）。修复：rag_service._ensure_backend() setdefault HF_HUB_OFFLINE=1 与 TRANSFORMERS_OFFLINE=1 双保险（不覆盖宿主已导出的值）。验证：smoke_rag --real 连续两次全绿（count=7075，scenarios_failed=0）；与 2026-08-22 看门狗事故同一根因的更深一层防御
 
 ### Changed/Fixed (G15 实测修正)
 - 视觉模型定稿（2026-08-24 实测）：默认 `deepseek-v4-flash-vision-exp` + `reasoning_effort=low` + `max_tokens=512`（思考不挤占输出；与本地 dsh settings.yaml 的视觉模型声明一致）。附录：mimo-v2.5 在 text-first 载荷下也能返回图像描述，但网关/dsh 均未声明其 image 输入，弃用
