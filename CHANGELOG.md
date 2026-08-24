@@ -11,6 +11,22 @@
 
 ## [Unreleased]
 
+### Added (2026-08-25, A1-A3 批次；生产切换 + 配置同步 + 第三批功能)
+- **A1 生产切换（test_mode=0）**: 目标群 881438753 接管，测试群不再由插件处理；ready 日志验证 + cache_probe 全部落在生产群；02:00 后核心兜底「LLM 响应错误」广播 0 次（含图片消息路径）
+- **A2 配置同步工具**: 新增 `tools/sync_config.py` — 按 `_conf_schema.json` 默认值只补缺失键、保留现有值（红线 #3）；UTF-8 BOM 兼容读写；写入前自动备份 `.bak.<ts>`；原子写（.tmp → rename）；默认 check 模式，`--write` 生效；12 例单测。桌面配置实测 in-sync（22 顶层键全含，added=0）
+- **G11 Poke 戳一戳响应**: `services/poke.py` + `on_other` 接线 — OneBot notify/poke 解码；仅目标群 + target=bot 才考虑；同人 300s 冷却（`poke.cooldown_sec` 可配）、全局小时配额 4、未知关系成员默认不回戳、`conflict_keywords.json` 命中抑制（mtime 热重载，严肃上下文不回戳）、`poke_log.jsonl` 留痕；`poke.enabled=0` 全静默（Day4 按 DEPLOYMENT_GUIDE 开启）
+- **G12 TopicBank 主动话题**: `services/topic_bank.py` + ACTION_TOPIC 接线 — IMPLEMENTATION_PLAN §10 评分（0.45·silence + 0.25·priority + 0.20·context_hints + 0.10·freshness）；`topic_bank.json` mtime_ns 热加载；发送后归档 `topic_sent.json`（追加、原子写）；无可发话题绝对沉默；冷场触发走 `llm.temperature.cold_start=1.1` LLM 改写 + `context.send_message` 主动发送（group UMO）；决策日志 extra.topic_id/sent；建议稿 `data_out/topic_bank.json`（8 条，人工可改，历史坏例置 enabled=false 即规避）；`topic_bank.enabled=0` 不触发（Day3 开启）
+- **G13 周/月摘要金字塔**: `services/summary.py` + cron（周一 02:10 / 月首 02:15 CST）— 聚合日日记 `daily_diary.jsonl`，每个归档日从 session_<group>_<day>.json 抽样 ≤6 条 user 原文防失真；输出 `weekly_summary.jsonl` / `monthly_summary.jsonl`（UTF-8 原子追加）并通过 dream_binding 私聊推送（未绑定仅落盘）；`summary.{weekly_enabled,monthly_enabled,max_sample_messages,max_summary_chars}` 可配（默认关，本次部署已开）
+- **G16 插话质量门**: 60 条生产消息真实 RAG 实播（chroma+BGE）：p50=0.436 / p75=0.504 / p90=0.573 / p95=0.676 / max=0.698 → 阈值定 0.65（≈5% 触发率）；`active_interjection=1` + `rag.score_threshold=0.65` 已生效（02:42 重启加载）；决策日志全分支落盘 `extra.top_rag_score` + `emotion_multiplier`（阈值可数据驱动调优）
+- **G17 dream 启用**: DreamJob 直跑验收（等价 /dream_now 特权路径）：90 天 800 edges / 21 成员分析 / 10 话题趋势 → `style_drift_report.json`（3.7KB）；`dream.enabled=1` + 周一 03:00 cron 已注册；`dream_binding.json` 预绑定 `aiocqhttp:FriendMessage:337934842`（等效 /bind_dream，运行时可改）
+
+### Changed
+- `_conf_schema.json` 新增 `summary` 节（weekly_enabled/monthly_enabled/max_sample_messages/max_summary_chars，默认 0）
+- `/persona_status` 增加 summary 开关行；测试 46 → 88 全绿；`main.py` 初始化新增 PokeService / TopicBank / SummaryService
+
+### Fixed
+- 决策日志缺失 RAG 分数：主动插话评估（G16）前 silent 分支不记录 top_rag_score，现每个 decision entry 的 extra 落盘原始分与情绪乘数
+
 ### Changed/Fixed (G15 实测修正)
 - 视觉模型定稿（2026-08-24 实测）：默认 `deepseek-v4-flash-vision-exp` + `reasoning_effort=low` + `max_tokens=512`（思考不挤占输出；与本地 dsh settings.yaml 的视觉模型声明一致）。附录：mimo-v2.5 在 text-first 载荷下也能返回图像描述，但网关/dsh 均未声明其 image 输入，弃用
 - 视觉模型默认改为 `deepseek-v4-flash-vision-exp`（实测 mimo-v2.5 视觉返回空 content；flash-vision-exp 可准确描述）
