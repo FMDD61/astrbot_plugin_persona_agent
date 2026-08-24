@@ -27,7 +27,7 @@ session (全量上下文，prefix caching)
 
 - AstrBot v4.25+
 - NapCatQQ (OneBot v11)
-- 火山引擎 LLM API
+- opencode-go 网关 LLM API（OpenAI 兼容；deepseek-v4-flash，1M 上下文；视觉用 deepseek-v4-flash-vision-exp）
 - Python 3.12
 
 ### 部署
@@ -66,9 +66,11 @@ WebUI: `http://<IP>:6185` → Astr 插件 → astrbot_plugin_persona_agent
 | `target_group_id` | 881438753 | 生产群号 |
 | `data_dir` | `/opt/AstrBot/data/...` | 运行时数据目录 (git pull 不覆盖) |
 
+> 完整配置见 `_conf_schema.json`：`sleep.*`（睡眠窗 02–07）、`diary.*`、`examples.*`、`vision.*`、`emotion.*`、`housekeeping.*`、`privileged_qq`、`llm.temperature`（温度分档）。
+
 ## 当前状态
 
-**v0.4-nuwa-interview** — 已部署运行（`test_mode=1`，仅测试群 `1047699954` 生效）。
+**v0.4.0（2026-08-24）** — 已部署运行（`test_mode=1`，仅测试群 `1047699954` 生效）。含：v3 按日会话+02:00轮换、睡眠窗 02–07、每日日记（复用会话前缀缓存）、识图（flash-vision-exp）、情绪引擎 v1、示例注入（规则A/B）、离线 A/B 通道。未启用（骨架或开关=0）：active_interjection / topic_bank / poke / dream。
 
 | Issue | 状态 |
 |-------|------|
@@ -91,20 +93,26 @@ astrbot_plugin_persona_agent/
 ├── services/
 │   ├── session_manager.py   # 每群持久 session (name 字段区分参与者)
 │   ├── kg_provider.py        # MultiSignalKGProvider (dense+BGE + BM25/FTS5 + entity)
-│   ├── emotion.py            # LLMEmotionProvider v2 (5 维, 30s 缓存, 3s 超时)
+│   ├── emotion.py            # LLMEmotionProvider v1 (3 维: 意愿/情绪/表情, 30s 缓存, 3s 超时)
 │   ├── interjection.py       # 决策引擎 (AT/RAG/COLD 三级)
 │   ├── style_profile.py      # 风格文件热加载 + alias 映射
 │   ├── rag_service.py        # ChromaDB 向量检索 (local_files_only 离线 BGE)
 │   ├── memory_store.py       # SQLite ADD-only 实体关系图 + FTS5 BM25
 │   ├── conflict_detector.py  # 三阶段冲突检测
 │   ├── dream_job.py          # 周 cron 记忆巩固 + 漂移报告
-│   └── context_buffer.py     # 滑动窗口 buffer (仅用于 interjection 决策)
+│   ├── context_buffer.py     # 滑动窗口 buffer (仅用于 interjection 决策)
+│   ├── examples.py           # G14 静态示例注入 (mtime_ns 热重载 + 规则A/B)
+│   ├── vision.py             # G15 识图 (flash-vision-exp, 三源解析, 诚实占位)
+│   └── text_style.py         # 纯文本清洗/后处理 (占位符剥离/引用标记/口癖/换行)
 ├── tools/
 │   ├── build_dataset.py      # 离线: merge.json → 对话对
 │   ├── verify_dataset.py     # 离线: 对话对验证
 │   ├── analyze_style.py      # 离线: 风格画像提取 (不覆盖已有文件)
 │   ├── rebuild_chroma.py     # 离线: 对话对 → ChromaDB 索引
-│   └── smoke_rag.py          # 离线: RAG 冒烟测试
+│   ├── smoke_rag.py          # 离线: RAG 冒烟测试
+│   ├── select_examples.py    # G14 候选池筛选 (规则+分桶+LLM打分)
+│   ├── ab_test_examples.py   # 离线 A/B 生成 harness (同源提示词/网关)
+│   └── ab_judge_style.py     # 风格 judge (正反清单 1-5 分)
 └── data_out/                 # (gitignored) 离线产物 + 风格文件
 ```
 

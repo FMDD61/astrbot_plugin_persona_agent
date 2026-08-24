@@ -1,3 +1,6 @@
+## [v0.4.0] - 2026-08-24
+- 版本号与 metadata 对齐（v0.1.0→v0.4.0）；文档全面校正（AGENTS/OPERATIONS/README/IMPLEMENTATION_PLAN/DEPLOYMENT_GUIDE）；本会话 G1-G18 闭环明细见根目录 TODO.md
+
 # Changelog
 
 本文档记录 `astrbot_plugin_persona_agent` 的所有功能变动。
