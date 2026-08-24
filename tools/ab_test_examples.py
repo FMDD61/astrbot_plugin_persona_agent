@@ -61,7 +61,8 @@ def get_creds(cmd_config="/opt/AstrBot/data/cmd_config.json"):
     return src.get("api_base", ""), (src.get("key") or [""])[0]
 
 
-def chat(api_base, key, model, system_prompt, msgs, temperature=0.8, max_tokens=256):
+def chat(api_base, key, model, system_prompt, msgs, temperature=0.8, max_tokens=256,
+         retries=3, timeout=100):
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system_prompt}] + msgs,
@@ -69,12 +70,20 @@ def chat(api_base, key, model, system_prompt, msgs, temperature=0.8, max_tokens=
         "max_tokens": max_tokens,
     }
     url = api_base.rstrip("/") + "/chat/completions"
-    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={
-        "Authorization": f"Bearer {key}", "Content-Type": "application/json",
-        "User-Agent": "ab-test-examples/1.0"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        out = json.loads(r.read().decode("utf-8"))
-    return (out.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+    last = None
+    for attempt in range(1, retries + 1):
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={
+            "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+            "User-Agent": "ab-test-examples/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                out = json.loads(r.read().decode("utf-8"))
+            return (out.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+        except Exception as e:  # noqa: BLE001 — gateway is flaky; retry
+            last = e
+            print(f"  (retry {attempt}/{retries}: {type(e).__name__} {str(e)[:80]})")
+            time.sleep(5 * attempt)
+    raise last
 
 
 def speaker_line(uin, alias, is_src):
@@ -113,9 +122,13 @@ def main() -> int:
                     if block:
                         msgs.append({"role": "system", "content": block})
                 msgs.append({"role": "system", "content": speaker_line("337934842", "焦糖", True)})
-                raw = chat(api_base, key, args.model, sys_prompt, msgs,
-                           temperature=args.temperature)
-                reply = ts_mod.postprocess(raw)
+                try:
+                    raw = chat(api_base, key, args.model, sys_prompt, msgs,
+                               temperature=args.temperature)
+                    reply = ts_mod.postprocess(raw)
+                except Exception as e:
+                    print(f"[{phase} r{rep}] {pid} FAILED: {type(e).__name__} {str(e)[:80]}")
+                    continue
                 results.append({
                     "phase": phase, "rep": rep, "probe": pid, "topic": topic,
                     "probe_text": text, "reply": reply, "chars": len(reply),
@@ -129,7 +142,7 @@ def main() -> int:
             prompt = f"用户：{r['probe_text']}\n回复：{r['reply']}\n得分："
             try:
                 raw = chat(api_base, key, args.model, judge_sys,
-                           [{"role": "user", "content": prompt}], temperature=0)
+                           [{"role": "user", "content": prompt}], temperature=0, retries=3)
                 m = re.search(r"[1-5]", raw)
                 r["judge"] = int(m.group(0)) if m else 0
             except Exception:
