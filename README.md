@@ -43,7 +43,7 @@ pip install -r requirements.txt
 python3 -c "import json; c=json.load(open('_conf_schema.json')); print(c['data_dir']['default'])"
 # → /opt/AstrBot/data/plugin_data/astrbot_plugin_persona_agent
 
-# BGE 模型必须预下载（插件 local_files_only=True，不会联网自动下载）
+# BGE 模型必须预下载（插件 local_files_only=True + HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE 双保险，不会联网自动下载）
 export HF_ENDPOINT=https://hf-mirror.com
 python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-base-zh-v1.5')"
 
@@ -66,11 +66,11 @@ WebUI: `http://<IP>:6185` → Astr 插件 → astrbot_plugin_persona_agent
 | `target_group_id` | 881438753 | 生产群号 |
 | `data_dir` | `/opt/AstrBot/data/...` | 运行时数据目录 (git pull 不覆盖) |
 
-> 完整配置见 `_conf_schema.json`：`sleep.*`（睡眠窗 02–07）、`diary.*`、`examples.*`、`vision.*`、`emotion.*`、`housekeeping.*`、`privileged_qq`、`llm.temperature`（温度分档）。
+> 完整配置见 `_conf_schema.json`：`sleep.*`（睡眠窗 02–07）、`diary.*`、`examples.*`、`vision.*`、`emotion.*`、`housekeeping.*`、`privileged_qq`、`llm.temperature`（温度分档）、`summary.*`（周/月摘要，G13）、`poke.*`、`topic_bank.*`、`dream.*`。
 
 ## 当前状态
 
-**v0.4.0（2026-08-24）** — 已部署运行（`test_mode=1`，仅测试群 `1047699954` 生效）。含：v3 按日会话+02:00轮换、睡眠窗 02–07、每日日记（复用会话前缀缓存）、识图（flash-vision-exp）、情绪引擎 v1、示例注入（规则A/B）、离线 A/B 通道。未启用（骨架或开关=0）：active_interjection / topic_bank / poke / dream。
+**v0.5.0（2026-08-25）** — **生产接管**（`test_mode=0`，目标群 `881438753`）。含：v3 按日会话+02:00轮换、睡眠窗 02–07、每日日记、识图（flash-vision-exp）、情绪引擎 v1、示例注入（规则A/B）、离线 A/B 通道、**主动插话（`active_interjection=1`，阈值 0.65）**、**DreamJob（`dream.enabled=1`，周一 03:00）**、**周/月摘要（`summary.*=1`，推 bind_dream 私聊）**、G11/G12 代码就绪（`poke.enabled` / `topic_bank.enabled` 待 Day3/4 开启）。测试 88 例全绿。
 
 | Issue | 状态 |
 |-------|------|
@@ -80,7 +80,8 @@ WebUI: `http://<IP>:6185` → Astr 插件 → astrbot_plugin_persona_agent
 | #2 RAG → AI 记忆层 | ✅ SQLite MemoryStore + KGProvider 已落地（PG 方案为远期规划） |
 | #4 口癖过度使用 + 风格不一致 | ✅ 已关闭（postprocess + system_prompt 调优） |
 | #6 Git 同步工作流 | ✅ 已关闭（git pull 流程） |
-| 主动回复卡死（BGE 联网校验） | ✅ 已修复（`local_files_only=True`，commit e3f1dc5） |
+| 主动回复卡死（BGE 联网校验） | ✅ 已修复（`local_files_only=True`，commit e3f1dc5；双保险 setdefault HF_HUB_OFFLINE，d218654） |
+| #7 smoke_rag --real 卡死（BGE 联网校验残留） | ✅ 已修复（d218654，faulthandler 栈定位） |
 
 ## 文件结构
 
@@ -103,16 +104,20 @@ astrbot_plugin_persona_agent/
 │   ├── context_buffer.py     # 滑动窗口 buffer (仅用于 interjection 决策)
 │   ├── examples.py           # G14 静态示例注入 (mtime_ns 热重载 + 规则A/B)
 │   ├── vision.py             # G15 识图 (flash-vision-exp, 三源解析, 诚实占位)
+│   ├── poke.py               # G11 戳一戳 (300s 冷却/小时配额/未知成员不回戳/严肃抑制/poke_log)
+│   ├── topic_bank.py         # G12 冷场话题 (§10 评分/热加载/topic_sent 归档)
+│   ├── summary.py            # G13 周/月摘要 (日日记聚合 + 原文抽样防失真 + bind_dream 推送)
 │   └── text_style.py         # 纯文本清洗/后处理 (占位符剥离/引用标记/口癖/换行)
 ├── tools/
 │   ├── build_dataset.py      # 离线: merge.json → 对话对
 │   ├── verify_dataset.py     # 离线: 对话对验证
 │   ├── analyze_style.py      # 离线: 风格画像提取 (不覆盖已有文件)
 │   ├── rebuild_chroma.py     # 离线: 对话对 → ChromaDB 索引
-│   ├── smoke_rag.py          # 离线: RAG 冒烟测试
+│   ├── smoke_rag.py          # 离线: RAG 冒烟测试 (--real 真实库验证)
 │   ├── select_examples.py    # G14 候选池筛选 (规则+分桶+LLM打分)
 │   ├── ab_test_examples.py   # 离线 A/B 生成 harness (同源提示词/网关)
-│   └── ab_judge_style.py     # 风格 judge (正反清单 1-5 分)
+│   ├── ab_judge_style.py     # 风格 judge (正反清单 1-5 分)
+│   └── sync_config.py        # A2 配置-schema 同步 (只补缺省/保留现有值/BOM 兼容/备份)
 └── data_out/                 # (gitignored) 离线产物 + 风格文件
 ```
 
