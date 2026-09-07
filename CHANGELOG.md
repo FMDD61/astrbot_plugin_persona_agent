@@ -11,6 +11,11 @@
 
 ## [Unreleased]
 
+### Added (2026-09-07, A7 批次①：GateLLM 决策层 + 群隔离改造)
+- **A7 GateLLM 决策层（双层 LLM 上层闸）**: 新增 `services/gate.py` — 独立非角色 LLM 判断「这句要不要回」；仅规则硬闸内、非 @ 消息才调用（@ 必回不 gate）；中性分析师视角，输入最近 N 条 + RAG 风格片段，输出 `{reply, reason}`；同群决策节流窗口 `decide_cooldown_sec`（复用缓存）；失败/超时/坏 JSON → 保守静默降级、绝不抛出。`gate.enabled=0` 默认关（手动开），`_conf_schema.json` 新增 `gate` 块（timeout_sec/decide_cooldown_sec/recent_n/max_rag_hits）。main.py `on_group_message` 接线 + 每次决策落 `gate_log.jsonl`（含 fallback/cached/trigger）
+- **群隔离改造（A7 review 结论）**: `InterjectionManager` 用量状态（last_reply_ts / current_hour / hourly_used / at-cooldown）从全局单例改为**按 group_id 隔离**，持久化到 `usages/<group_id>.json`（JsonStore 原子写 + mtime 热重载 + `/reload_persona_config` 生效）；`JsonStore` 通用支持子目录自动创建。poke 保持跨群共享（QQ 拍一拍按目标用户限，现状正确，不改）
+- 补 `tests/test_interjection.py`（12 例：群隔离/持久化/重载/回归语义）；`tests/test_gate.py`（18 例）；测试 88 → **118 全绿**
+
 ### Added (2026-08-25, A1-A3 批次；生产切换 + 配置同步 + 第三批功能)
 - **A1 生产切换（test_mode=0）**: 目标群 123456789 接管，测试群不再由插件处理；ready 日志验证 + cache_probe 全部落在生产群；02:00 后核心兜底「LLM 响应错误」广播 0 次（含图片消息路径）
 - **A2 配置同步工具**: 新增 `tools/sync_config.py` — 按 `_conf_schema.json` 默认值只补缺失键、保留现有值（红线 #3）；UTF-8 BOM 兼容读写；写入前自动备份 `.bak.<ts>`；原子写（.tmp → rename）；默认 check 模式，`--write` 生效；12 例单测。桌面配置实测 in-sync（22 顶层键全含，added=0）

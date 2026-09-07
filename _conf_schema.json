@@ -355,6 +355,39 @@
     }
   },
 
+  "gate": {
+    "type": "object",
+    "description": "决策层 GateLLM（A7：独立判断要不要回的中性 LLM；双层 LLM 上层闸）",
+    "items": {
+      "enabled": {
+        "type": "int",
+        "description": "0 关闭 / 1 开启",
+        "hint": "默认 0（保守）。开启后非 @ 消息在规则硬闸内先经 GateLLM 判断值不值得回，放行才走 RP 生成。@ 回复不受影响（必回）。",
+        "default": 0
+      },
+      "timeout_sec": {
+        "type": "float",
+        "description": "GateLLM 调用超时（秒），超时保守静默",
+        "default": 3.0
+      },
+      "decide_cooldown_sec": {
+        "type": "float",
+        "description": "同群决策节流窗口（秒）：窗口内只决策一次，连续消息复用结果",
+        "default": 8.0
+      },
+      "recent_n": {
+        "type": "int",
+        "description": "决策输入取最近 N 条消息",
+        "default": 15
+      },
+      "max_rag_hits": {
+        "type": "int",
+        "description": "决策时可参考的 RAG 风格片段上限（条）",
+        "default": 3
+      }
+    }
+  },
+
   "llm": {
     "type": "object",
     "description": "LLM provider 选择",

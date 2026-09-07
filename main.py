@@ -52,6 +52,7 @@ from .services.context_buffer import ContextBuffer
 from .services.session_manager import SessionManager
 from .services.kg_provider import KGProvider, MultiSignalKGProvider, KGContext
 from .services.emotion import EmotionProvider, DefaultEmotionProvider, EmotionState, LLMEmotionProvider, EMOTION_SYSTEM_PROMPT
+from .services.gate import GateService, GateDecision, GATE_SYSTEM_PROMPT
 from .services.vision import VisionService, face_name
 from .services.poke import PokeService
 from .services.examples import load_examples_block, ExamplesState
@@ -82,6 +83,7 @@ class PersonaAgent(Star):
         self.session_mgr: Optional[SessionManager] = None
         self.kg_provider: Optional[KGProvider] = None
         self._emotion: Optional[EmotionProvider] = None
+        self._gate: Optional[GateService] = None
         self._memory_store: Optional[MemoryStore] = None
         self._dream_job: Optional[DreamJob] = None
         self._poke: Optional[PokeService] = None
@@ -108,6 +110,7 @@ class PersonaAgent(Star):
         topic_cfg = self.config.get("topic_bank", {}) or {}
         self.interjection = InterjectionManager(
             self.style,
+            data_dir=str(self.data_dir),
             active_interjection=int(self.config.get("active_interjection", 0)),
             reply_on_at=int(self.config.get("reply_on_at", 1)),
             topic_bank_enabled=int(topic_cfg.get("enabled", 0)),
@@ -157,6 +160,22 @@ class PersonaAgent(Star):
             logger.info("[persona_agent] LLM emotion provider enabled (v1, G10)")
         else:
             self._emotion = DefaultEmotionProvider()
+
+        # A7: GateLLM decision layer (independent "should we reply" judge).
+        # Default off (conservative); enabled only when gate.enabled=1.
+        gate_cfg = self.config.get("gate", {}) or {}
+        if int(gate_cfg.get("enabled", 0)) == 1:
+            self._gate = GateService(
+                self._gate_llm,
+                timeout=float(gate_cfg.get("timeout_sec", 3.0)),
+                decide_cooldown_sec=float(gate_cfg.get("decide_cooldown_sec", 8.0)),
+                recent_n=int(gate_cfg.get("recent_n", 15)),
+                max_rag_hits=int(gate_cfg.get("max_rag_hits", 3)),
+            )
+            logger.info("[persona_agent] GateLLM decision layer enabled (A7)")
+        else:
+            logger.info("[persona_agent] GateLLM decision layer disabled (gate.enabled=0)")
+
         self._dream_job = DreamJob(self._memory_store, str(self.data_dir))
 
         dream_cfg = self.config.get("dream", {}) or {}
@@ -577,6 +596,7 @@ class PersonaAgent(Star):
             ),
         ) if self._emotion else EmotionState.neutral()
         decision = self.interjection.decide(
+            group_id=group_id,
             now_utc=time.time(),
             is_at_me=is_at,
             sender_uin=sender_uin,
@@ -588,6 +608,7 @@ class PersonaAgent(Star):
         # multiplier so threshold tuning is data-driven (2026-08-25 replay:
         # production p95=0.676 max=0.698 -> 0.65 ≈ 5% trigger rate).
         decision_log = decision.to_log(time.time(), sender_uin)
+        decision_log["group_id"] = group_id
         decision_log["extra"] = dict(decision_log.get("extra") or {})
         decision_log["extra"]["top_rag_score"] = round(top_score, 4)
         decision_log["extra"]["emotion_multiplier"] = round(emotion_state.global_willingness, 3)
@@ -601,6 +622,38 @@ class PersonaAgent(Star):
             await self._send_topic(event, group_id, decision, live_ctx, sender_uin)
             event.stop_event()
             return
+
+        # A7: GateLLM decision layer — non-@ replies get a second, independent
+        # "is this worth replying to?" judgment before RP generation. The RP
+        # model never makes this call itself (keeps roleplay context clean).
+        # AT replies bypass the gate (user-driven, always reply).
+        if (
+            self._gate is not None
+            and decision.action == ACTION_REPLY
+            and decision.trigger != TRIGGER_AT
+        ):
+            try:
+                gate_d = await self._gate.decide(
+                    group_id,
+                    self.session_mgr.recent(group_id, n=int((self.config.get("gate") or {}).get("recent_n", 15))),
+                    alias,
+                    text,
+                    rag_hits=hits if hits else None,
+                )
+            except Exception as e:
+                logger.warning(f"[persona_agent] gate decide raised: {e}")
+                gate_d = GateDecision(reply=False, reason="gate error", fallback=True)
+            gate_log = gate_d.to_log(group_id, sender_uin)
+            gate_log["decision_action"] = decision.action
+            gate_log["decision_trigger"] = decision.trigger
+            self.store.append_jsonl("gate_log.jsonl", gate_log)
+            if not gate_d.reply:
+                logger.info(
+                    f"[persona_agent] gate silent: {gate_d.reason}"
+                    + (" (fallback)" if gate_d.fallback else "")
+                )
+                event.stop_event()
+                return
 
         self._generating[group_id] = True
         try:
@@ -660,6 +713,7 @@ class PersonaAgent(Star):
                     pass
 
             self.interjection.register_reply(
+                group_id=group_id,
                 now_utc=time.time(),
                 trigger=decision.trigger,
                 sender_uin=sender_uin,
@@ -813,7 +867,9 @@ class PersonaAgent(Star):
                     message_id="",
                     message_type="bot",
                 )
-            self.interjection.register_reply(now_utc=time.time(), trigger=TRIGGER_COLD)
+            self.interjection.register_reply(
+                group_id=group_id, now_utc=time.time(), trigger=TRIGGER_COLD
+            )
             log["extra"] = {"topic_id": topic.id, "sent": True}
             self._log_decision(log)
             logger.info(f"[persona_agent] topic sent: id={topic.id} category={topic.category}")
@@ -1020,6 +1076,23 @@ class PersonaAgent(Star):
             chat_provider_id=provider,
             prompt=prompt,
             system_prompt=EMOTION_SYSTEM_PROMPT,
+        )
+        return (getattr(resp, "completion_text", "") or "").strip()
+
+    async def _gate_llm(self, prompt: str) -> str:
+        """A7: GateLLM decision call (independent of RP provider context).
+
+        Shares the provider resolution pattern of _emotion_llm but uses the
+        gate-specific system prompt. Failures surface as exceptions to
+        GateService, which converts them to conservative silence.
+        """
+        provider = (self.config.get("llm") or {}).get("provider_id", "") or self._last_provider_id
+        if not provider:
+            raise RuntimeError("no LLM provider available for gate")
+        resp = await self.context.llm_generate(
+            chat_provider_id=provider,
+            prompt=prompt,
+            system_prompt=GATE_SYSTEM_PROMPT,
         )
         return (getattr(resp, "completion_text", "") or "").strip()
 

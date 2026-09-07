@@ -71,6 +71,11 @@ class JsonStore:
         payload = json.dumps(data, ensure_ascii=False, indent=2)
 
         with self._lock:
+            # auto-create parent dirs (names may include subdirs like usages/)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
             # backup current
             if path.exists():
                 try:
