@@ -7,10 +7,12 @@ AstrBot 插件 — 在 QQ 群内模仿指定用户（QQ `234567`）的发言风�
 ## 架构
 
 ```
-session (全量上下文，prefix caching)
-  └─ KGProvider.query() → 结构化风格指引 → 注入 LLM contexts
-       └─ MemoryStore (SQLite ADD-only + FTS5 BM25)
-            └─ DreamJob (周 cron, 关系漂移检测)
+群消息 → 前置（识图/睡眠/冲突检测）→ PersonaPipeline.run()（A7 共享主链路）
+   ├─ RAG 检索（风格源历史）→ Emotion（三维）→ interjection 硬闸（规则）
+   ├─ GateLLM 决策层（可选，gate.enabled=1；非 @ 判断值不值得回）
+   ├─ KG 风格指引 + session 全量上下文（prefix caching）+ 固定示例
+   ├─ LLM 生成 → postprocess → SendIntent（含 [r:-N] 引用/表情意图）
+   └─ 全链路 trace → logs/<group_id>/trace_log.jsonl（trace_view 可读）
 ```
 
 ### 三层记忆
@@ -20,6 +22,13 @@ session (全量上下文，prefix caching)
 | 检索层 `KGProvider` | 每次 LLM 调用 | "现在该怎么说话？" → 图遍历 + 向量检索 → 注入提示 |
 | 存储层 `MemoryStore` | 每条消息 | 实体/关系抽取 → SQLite ADD-only 图写入 + FTS5 |
 | 进化层 `DreamJob` | 每周 cron | 回放近期对话 → 更新权重 → 漂移报告 (只建议不改) |
+
+### 双层 LLM（A7）
+
+| 层 | 模型 | 职责 |
+|----|------|------|
+| 决策层 `GateService` | 独立中性 LLM（deepseek-v4-flash 轻量） | "这句要不要回" + 理由；同群节流；失败保守静默 |
+| 扮演层 `PersonaPipeline` → LLM | 主 RP 模型 | 纯粹表演（上下文不掺工具/决策噪音） |
 
 ## 快速开始
 
@@ -66,11 +75,13 @@ WebUI: `http://<IP>:6185` → Astr 插件 → astrbot_plugin_persona_agent
 | `target_group_id` | 123456789 | 生产群号 |
 | `data_dir` | `/opt/AstrBot/data/...` | 运行时数据目录 (git pull 不覆盖) |
 
-> 完整配置见 `_conf_schema.json`：`sleep.*`（睡眠窗 02–07）、`diary.*`、`examples.*`、`vision.*`、`emotion.*`、`housekeeping.*`、`privileged_qq`、`llm.temperature`（温度分档）、`summary.*`（周/月摘要，G13）、`poke.*`、`topic_bank.*`、`dream.*`。
+> 完整配置见 `_conf_schema.json`：`sleep.*`（睡眠窗 02–07）、`diary.*`、`examples.*`、`vision.*`、`emotion.*`、`housekeeping.*`、`privileged_qq`、`llm.temperature`（温度分档）、`summary.*`（周/月摘要，G13）、`poke.*`、`topic_bank.*`、`dream.*`、`gate.*`（A7 GateLLM 决策层，enabled=0 默认关）、`trace.*`（A7 全链路 trace，enabled=1 默认开）。
 
 ## 当前状态
 
-**v0.5.0（2026-08-25）** — **生产接管**（`test_mode=0`，目标群 `123456789`）。含：v3 按日会话+02:00轮换、睡眠窗 02–07、每日日记、识图（flash-vision-exp）、情绪引擎 v1、示例注入（规则A/B）、离线 A/B 通道、**主动插话（`active_interjection=1`，阈值 0.65）**、**DreamJob（`dream.enabled=1`，周一 03:00）**、**周/月摘要（`summary.*=1`，推 bind_dream 私聊）**、G11/G12 代码就绪（`poke.enabled` / `topic_bank.enabled` 待 Day3/4 开启）。测试 88 例全绿。
+**v0.5.0（2026-09-07）** — **生产接管**（`test_mode=0`，目标群 `123456789`）。含：v3 按日会话+02:00轮换、睡眠窗 02–07、每日日记、识图（flash-vision-exp）、情绪引擎 v1、示例注入（规则A/B）、离线 A/B 通道、**主动插话（`active_interjection=1`，阈值 0.65）**、**DreamJob（`dream.enabled=1`，周一 03:00）**、**周/月摘要（`summary.*=1`，推 bind_dream 私聊）**、G11/G12 代码就绪（`poke.enabled` / `topic_bank.enabled` 待 Day3/4 开启）。**A7（2026-09-07）**：GateLLM 决策层 + PersonaPipeline 共享主链路 + 全链路 trace 日志 + 群隔离 + 日志按群分目录（`gate.enabled=0` 未开，待手动验证）。测试 132 例全绿。
+
+> A7 计划书：`docs/specs/chatbox-rp-tool-dual-channel.md`（工作区根）
 
 | Issue | 状态 |
 |-------|------|
@@ -95,7 +106,9 @@ astrbot_plugin_persona_agent/
 │   ├── session_manager.py   # 每群持久 session (name 字段区分参与者)
 │   ├── kg_provider.py        # MultiSignalKGProvider (dense+BGE + BM25/FTS5 + entity)
 │   ├── emotion.py            # LLMEmotionProvider v1 (3 维: 意愿/情绪/表情, 30s 缓存, 3s 超时)
-│   ├── interjection.py       # 决策引擎 (AT/RAG/COLD 三级)
+│   ├── interjection.py       # 规则硬闸 (AT/RAG/COLD 三级; 用量按群隔离 + usages/<gid>.json)
+│   ├── gate.py               # A7 GateLLM 决策层 (非 @ 判断值不值得回; 同群节流; 保守静默)
+│   ├── pipeline.py           # A7 共享主链路 (RAG→情绪→硬闸→Gate→KG→生成→SendIntent+trace)
 │   ├── style_profile.py      # 风格文件热加载 + alias 映射
 │   ├── rag_service.py        # ChromaDB 向量检索 (local_files_only 离线 BGE)
 │   ├── memory_store.py       # SQLite ADD-only 实体关系图 + FTS5 BM25
@@ -104,9 +117,10 @@ astrbot_plugin_persona_agent/
 │   ├── context_buffer.py     # 滑动窗口 buffer (仅用于 interjection 决策)
 │   ├── examples.py           # G14 静态示例注入 (mtime_ns 热重载 + 规则A/B)
 │   ├── vision.py             # G15 识图 (flash-vision-exp, 三源解析, 诚实占位)
-│   ├── poke.py               # G11 戳一戳 (300s 冷却/小时配额/未知成员不回戳/严肃抑制/poke_log)
-│   ├── topic_bank.py         # G12 冷场话题 (§10 评分/热加载/topic_sent 归档)
+│   ├── poke.py               # G11 戳一戳 (同人冷却/小时配额/未知成员不回戳/严肃抑制/poke_log)
+│   ├── topic_bank.py         # G12 冷场话题 (§10 评分/热加载/topic_sent 按群归档)
 │   ├── summary.py            # G13 周/月摘要 (日日记聚合 + 原文抽样防失真 + bind_dream 推送)
+│   ├── json_store.py         # 原子 JSON/JSONL 读写 (自动建子目录: usages/, logs/<gid>/)
 │   └── text_style.py         # 纯文本清洗/后处理 (占位符剥离/引用标记/口癖/换行)
 ├── tools/
 │   ├── build_dataset.py      # 离线: merge.json → 对话对
@@ -117,9 +131,15 @@ astrbot_plugin_persona_agent/
 │   ├── select_examples.py    # G14 候选池筛选 (规则+分桶+LLM打分)
 │   ├── ab_test_examples.py   # 离线 A/B 生成 harness (同源提示词/网关)
 │   ├── ab_judge_style.py     # 风格 judge (正反清单 1-5 分)
-│   └── sync_config.py        # A2 配置-schema 同步 (只补缺省/保留现有值/BOM 兼容/备份)
+│   ├── sync_config.py        # A2 配置-schema 同步 (只补缺省/保留现有值/BOM 兼容/备份)
+│   └── trace_view.py         # A7 trace 渲染工具 (层级可读报告, dsh 内查看)
 └── data_out/                 # (gitignored) 离线产物 + 风格文件
-```
+
+运行时数据目录 (data_dir, git pull 不覆盖):
+├── usages/<group_id>.json    # interjection 用量状态 (按群, 原子写 + 热重载)
+├── logs/<group_id>/          # trace/decision/gate/cache_probe/diary 日志 (按群分目录)
+├── session_<group>_<day>.json# 按日会话
+└── topic_bank.json / topic_sent.json / member_relations.json / ...
 
 ## 操作手册
 
