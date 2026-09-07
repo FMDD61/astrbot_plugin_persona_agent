@@ -100,6 +100,11 @@ class JsonStore:
         path = self._path(name)
         line = json.dumps(record, ensure_ascii=False) + "\n"
         with self._lock:
+            # auto-create parent dirs (names may include subdirs like logs/<g>/)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
             with open(path, "a", encoding="utf-8", newline="\n") as f:
                 f.write(line)
 

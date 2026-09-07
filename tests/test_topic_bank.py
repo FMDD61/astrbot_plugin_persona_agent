@@ -105,6 +105,36 @@ class TopicBankTests(unittest.TestCase):
         self.assertIsNotNone(top)
         self.assertEqual(top.id, "t4")
 
+    def test_sent_isolated_per_group(self) -> None:
+        """A topic sent in group A must remain eligible in group B."""
+        topA = self.bank.pick(now=1000.0, silence_sec=9999, live_text="", group_id="A")
+        self.assertIsNotNone(topA)
+        self.bank.mark_sent(topA, now=1000.0, group_id="A")
+        # group A: sent topic excluded from its own picks
+        againA = self.bank.pick(now=2000.0, silence_sec=9999, live_text="", group_id="A")
+        self.assertNotEqual(againA.id, topA.id)  # won't re-pick the archived one
+        # group B: same topic still eligible (A's archive doesn't leak)
+        topB = self.bank.pick(now=2000.0, silence_sec=9999, live_text="", group_id="B")
+        self.assertIsNotNone(topB)
+        self.assertEqual(topB.id, topA.id)  # B unaffected, picks the highest-prio one
+
+    def test_sent_group_isolated_persist(self) -> None:
+        """Group-aware sent records survive restart."""
+        # exhaust group A's view of the whole pool via mark_sent per group
+        picked = []
+        for _ in range(len(self.bank._topics)):
+            t = self.bank.pick(now=1000.0, silence_sec=9999, live_text="", group_id="123456789")
+            if t is None:
+                break
+            picked.append(t.id)
+            self.bank.mark_sent(t, now=1000.0, group_id="123456789")
+        self.assertTrue(len(picked) >= 1)
+        bank2 = TopicBank(str(self.dir))
+        # group A's pool exhausted (all eligible topics it sent are excluded)
+        self.assertIsNone(bank2.pick(now=2000.0, silence_sec=9999, live_text="", group_id="123456789"))
+        # group B: topics still available (A's archive isolated)
+        self.assertIsNotNone(bank2.pick(now=2000.0, silence_sec=9999, live_text="", group_id="123456788"))
+
 
 if __name__ == "__main__":
     unittest.main()
