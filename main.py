@@ -341,7 +341,10 @@ class PersonaAgent(Star):
 
     def _log_decision(self, payload: dict) -> None:
         try:
-            self.store.append_jsonl("decision_log.jsonl", payload)
+            gid = str(payload.get("group_id") or "")
+            # A7 2b: per-group log dir (logs/<group_id>/); legacy root file kept
+            name = f"logs/{gid}/decision_log.jsonl" if gid else "decision_log.jsonl"
+            self.store.append_jsonl(name, payload)
         except Exception as e:  # never let logging crash the handler
             logger.warning(f"[persona_agent] decision log write failed: {e}")
 
@@ -650,11 +653,24 @@ class PersonaAgent(Star):
             dlog["extra"]["silent_reason"] = send_intent.silent_reason
         if "gate" in trace:
             dlog["extra"]["gate"] = trace["gate"]
+            # gate_log.jsonl (per-group dir): independent gate decision record
+            gate_entry = dict(trace["gate"])
+            gate_entry["decision_action"] = dlog["action"]
+            gate_entry["decision_trigger"] = dlog["trigger"]
+            gate_entry["group_id"] = group_id
+            try:
+                self.store.append_jsonl(
+                    f"logs/{group_id}/gate_log.jsonl", gate_entry)
+            except Exception:
+                pass
         self._log_decision(dlog)
 
-        # trace log (A7: full-chain record, caller-side persist)
+        # trace log (A7: full-chain record, caller-side persist, per-group dir)
         if self._trace_enabled():
-            self.store.append_jsonl("trace_log.jsonl", trace)
+            try:
+                self.store.append_jsonl(f"logs/{group_id}/trace_log.jsonl", trace)
+            except Exception:
+                pass
 
         if send_intent.action == "silent":
             event.stop_event()
@@ -800,6 +816,7 @@ class PersonaAgent(Star):
             now=time.time(),
             silence_sec=decision.silence_sec,
             live_text=live_ctx or "",
+            group_id=group_id,
         )
         log = decision.to_log(time.time(), sender_uin)
         if topic is None:
@@ -834,7 +851,7 @@ class PersonaAgent(Star):
                 return
             chain = MessageChain().message(reply_text)
             await self.context.send_message(event.unified_msg_origin, chain)
-            self._topic_bank.mark_sent(topic, reason="cold_start")
+            self._topic_bank.mark_sent(topic, reason="cold_start", group_id=group_id)
             self.session_mgr.append(group_id, "assistant", reply_text)
             if self.buffer is not None:
                 self.buffer.add(
@@ -1179,7 +1196,7 @@ class PersonaAgent(Star):
                 "raw_usage": raw_usage,
                 "resp_id": getattr(resp, "id", None),
             }
-            self.store.append_jsonl("llm_cache_probe.jsonl", record)
+            self.store.append_jsonl(f"logs/{gid}/llm_cache_probe.jsonl", record)
             logger.info(
                 f"[persona_agent] cache_probe group={gid} session={session_size} "
                 f"ctx={len(contexts)} kg={kg_tail_chars} "
@@ -1240,6 +1257,19 @@ class PersonaAgent(Star):
                         logger.info(f"[persona_agent] housekeeping rotated {name} ({max_mb}MB)")
                 except OSError:
                     pass
+            # A7 2b: rotate per-group jsonl under logs/<group_id>/
+            for path in self.data_dir.glob("logs/*/*.jsonl"):
+                try:
+                    if path.stat().st_size > max_mb * 1024 * 1024:
+                        p1 = Path(str(path) + ".1")
+                        p2 = Path(str(path) + ".2")
+                        p2.unlink(missing_ok=True)
+                        if p1.exists():
+                            p1.rename(p2)
+                        path.rename(p1)
+                        logger.info(f"[persona_agent] housekeeping rotated {path.name} ({max_mb}MB)")
+                except OSError:
+                    pass
         except Exception as e:
             logger.warning(f"[persona_agent] housekeeping failed: {e}")
 
@@ -1295,7 +1325,7 @@ class PersonaAgent(Star):
                 "n_messages": len(msgs),
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
-            self.store.append_jsonl("daily_diary.jsonl", record)
+            self.store.append_jsonl(f"logs/{group_id}/daily_diary.jsonl", record)
             logger.info(f"[persona_agent] diary written: day={record['day']} n={len(msgs)}")
         except Exception as e:
             logger.warning(f"[persona_agent] diary generation failed: {e}")

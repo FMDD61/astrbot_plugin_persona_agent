@@ -11,6 +11,13 @@
 
 ## [Unreleased]
 
+### Added (2026-09-07, A7 批次③：日志分群 + topic_bank 隔离 + trace_view — 2b)
+- **日志按群分目录**: decision/gate/trace/llm_cache_probe/daily_diary 全部迁移到 `logs/<group_id>/` 子目录（JsonStore append_jsonl 自动建子目录）；旧根目录文件保留兼容；housekeeping 轮转扩展覆盖 `logs/*/*.jsonl`
+- **gate_log 恢复独立落盘**: 2a 重构曾把 gate 决策并入 decision_log.extra，2b 恢复 `logs/<group>/gate_log.jsonl` 独立记录（含 decision_action/trigger/fallback/cached）
+- **TopicBank 群隔离**: 已发送归档 `topic_sent.json` 按 group_id 键控（pick/mark_sent 带 group_id；话题池仍全群共享；旧无 group_id 记录归 legacy 不参与排除——本仓从未启用无迁移负担）
+- **tools/trace_view.py**: trace_log.jsonl 渲染工具（`python -m tools.trace_view --data-dir <dir> [--group] [--limit]`），输出层级可读报告（入站/硬闸/GateLLM/RAG 命中原文/情绪/KG/session/生成/最终），dsh 内直接查看
+- 补 topic_bank 群隔离 2 测试；测试 130 → **132 全绿**
+
 ### Added (2026-09-07, A7 批次②：pipeline 抽取 2a — 共享主链路 + trace 落盘)
 - **PersonaPipeline 共享主链路**: 新增 `services/pipeline.py` — 把 RAG→emotion→硬闸→GateLLM→KG→contexts→生成→postprocess→quote 抽成纯数据编排（构造注入 services + generate 回调 + 可选 topic_handler），返回 `SendIntent`（action/text/quote_id/sticker_prompt + 预留 emote/poke 工具字段 + 全链路 trace dict）。**线上 main 与离线测试台共用同一份代码**，防逻辑漂移
 - **main.py on_group_message 瘦身**: 主链路改调 pipeline；前置副作用（睡眠/记忆/冲突/新人）留 main；发送按 SendIntent 翻译（含 [r:-N] quote 链）；`_send_topic` 冷场路径保留（从 trace.hard_gate 重建轻量 Decision）；`_generate_reply` 支持 standalone（speaker_uin/umo 覆盖，event=None 可离线用）
