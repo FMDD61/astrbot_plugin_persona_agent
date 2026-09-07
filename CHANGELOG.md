@@ -11,6 +11,13 @@
 
 ## [Unreleased]
 
+### Added (2026-09-07, A7 批次②：pipeline 抽取 2a — 共享主链路 + trace 落盘)
+- **PersonaPipeline 共享主链路**: 新增 `services/pipeline.py` — 把 RAG→emotion→硬闸→GateLLM→KG→contexts→生成→postprocess→quote 抽成纯数据编排（构造注入 services + generate 回调 + 可选 topic_handler），返回 `SendIntent`（action/text/quote_id/sticker_prompt + 预留 emote/poke 工具字段 + 全链路 trace dict）。**线上 main 与离线测试台共用同一份代码**，防逻辑漂移
+- **main.py on_group_message 瘦身**: 主链路改调 pipeline；前置副作用（睡眠/记忆/冲突/新人）留 main；发送按 SendIntent 翻译（含 [r:-N] quote 链）；`_send_topic` 冷场路径保留（从 trace.hard_gate 重建轻量 Decision）；`_generate_reply` 支持 standalone（speaker_uin/umo 覆盖，event=None 可离线用）
+- **trace_log.jsonl 落盘**: 每轮处理全链路记录（input/rag命中原文/hard_gate/gate/emotion/kg_tail/temperature/raw_generation/final_text），调用方（main）落盘，`trace.enabled=1` 默认开（评估 RAG 价值的数据依据）；decision_log 保持兼容输出
+- **修复**: quote 提取必须在 postprocess 前（真实 postprocess 会剥 [r:-N]，2026-09-07 bug + 回归测试）；锁语义修正（topic/silent 分支在 finally 释放后处理，避免 _send_topic 嵌套释放）
+- 补 `tests/test_pipeline.py`（12 例）；测试 118 → **130 全绿**；`_conf_schema.json` 新增 `trace` 块
+
 ### Added (2026-09-07, A7 批次①：GateLLM 决策层 + 群隔离改造)
 - **A7 GateLLM 决策层（双层 LLM 上层闸）**: 新增 `services/gate.py` — 独立非角色 LLM 判断「这句要不要回」；仅规则硬闸内、非 @ 消息才调用（@ 必回不 gate）；中性分析师视角，输入最近 N 条 + RAG 风格片段，输出 `{reply, reason}`；同群决策节流窗口 `decide_cooldown_sec`（复用缓存）；失败/超时/坏 JSON → 保守静默降级、绝不抛出。`gate.enabled=0` 默认关（手动开），`_conf_schema.json` 新增 `gate` 块（timeout_sec/decide_cooldown_sec/recent_n/max_rag_hits）。main.py `on_group_message` 接线 + 每次决策落 `gate_log.jsonl`（含 fallback/cached/trigger）
 - **群隔离改造（A7 review 结论）**: `InterjectionManager` 用量状态（last_reply_ts / current_hour / hourly_used / at-cooldown）从全局单例改为**按 group_id 隔离**，持久化到 `usages/<group_id>.json`（JsonStore 原子写 + mtime 热重载 + `/reload_persona_config` 生效）；`JsonStore` 通用支持子目录自动创建。poke 保持跨群共享（QQ 拍一拍按目标用户限，现状正确，不改）

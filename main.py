@@ -40,9 +40,7 @@ from .services.interjection import (
     TRIGGER_AT,
     TRIGGER_RAG,
     TRIGGER_COLD,
-    ACTION_REPLY,
     ACTION_TOPIC,
-    ACTION_SILENT,
     Decision,
 )
 from .services.topic_bank import TopicBank
@@ -50,9 +48,10 @@ from .services.summary import SummaryService, build_prompt, append_summary
 from .services.json_store import JsonStore
 from .services.context_buffer import ContextBuffer
 from .services.session_manager import SessionManager
-from .services.kg_provider import KGProvider, MultiSignalKGProvider, KGContext
+from .services.kg_provider import KGProvider, MultiSignalKGProvider
 from .services.emotion import EmotionProvider, DefaultEmotionProvider, EmotionState, LLMEmotionProvider, EMOTION_SYSTEM_PROMPT
-from .services.gate import GateService, GateDecision, GATE_SYSTEM_PROMPT
+from .services.gate import GateService, GATE_SYSTEM_PROMPT
+from .services.pipeline import PersonaPipeline, PipelineInput, SendIntent
 from .services.vision import VisionService, face_name
 from .services.poke import PokeService
 from .services.examples import load_examples_block, ExamplesState
@@ -84,6 +83,7 @@ class PersonaAgent(Star):
         self.kg_provider: Optional[KGProvider] = None
         self._emotion: Optional[EmotionProvider] = None
         self._gate: Optional[GateService] = None
+        self._pipeline: Optional[PersonaPipeline] = None
         self._memory_store: Optional[MemoryStore] = None
         self._dream_job: Optional[DreamJob] = None
         self._poke: Optional[PokeService] = None
@@ -276,6 +276,31 @@ class PersonaAgent(Star):
         warmed = await asyncio.to_thread(self.rag.warmup)
         logger.info(f"[persona_agent] RAG warmup {'OK' if warmed else 'FAILED (will retry lazily)'}")
 
+        # A7: assemble the shared decision/generation pipeline (main + testbed
+        # run the same code path). Generate callback wraps the LLM call with
+        # per-event provider resolution done in main.
+        rag_cfg = self.config.get("rag", {}) or {}
+        gate_cfg = self.config.get("gate", {}) or {}
+        self._pipeline = PersonaPipeline(
+            style=self.style,
+            rag=self.rag,
+            interjection=self.interjection,
+            emotion=self._emotion,
+            gate=self._gate,
+            session_mgr=self.session_mgr,
+            kg_provider=self.kg_provider,
+            buffer=self.buffer,
+            generate=self._pipeline_generate,
+            examples_block=self._examples_block,
+            postprocess=self._postprocess_plain,
+            temperature_for=self._temperature_for,
+            rag_k=int(rag_cfg.get("k_retrieve", 8)),
+            rag_top_n=int(rag_cfg.get("top_n_final", 3)),
+            gate_recent_n=int(gate_cfg.get("recent_n", 15)),
+            debounce_sec=0.5,
+        )
+        logger.info("[persona_agent] pipeline ready (shared decision/generation path)")
+
         logger.info(
             f"[persona_agent] ready: target_group={self.target_group_id} "
             f"test_mode={self.test_mode} test_group={self.test_group_id} "
@@ -319,6 +344,13 @@ class PersonaAgent(Star):
             self.store.append_jsonl("decision_log.jsonl", payload)
         except Exception as e:  # never let logging crash the handler
             logger.warning(f"[persona_agent] decision log write failed: {e}")
+
+    def _trace_enabled(self) -> bool:
+        """A7: trace_log 写开关（默认开——trace 是评估 RAG 价值的依据）。"""
+        try:
+            return int((self.config.get("trace") or {}).get("enabled", 1)) == 1
+        except Exception:
+            return True
 
     async def _notify_admin(self, context_summary: str, group_id: str, speaker: str) -> None:
         binding = self.store.load_json("admin_binding.json", {})
@@ -541,6 +573,7 @@ class PersonaAgent(Star):
                 "extra": {},
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "sender_uin": sender_uin,
+                "group_id": group_id,
             })
             event.stop_event()
             return
@@ -566,173 +599,119 @@ class PersonaAgent(Star):
             event.stop_event()
             return
 
-        live_ctx = self.buffer.format_recent(max_lines=20) if self.buffer else ""
-
-        top_score = 0.0
-        hits: list[dict] = []
-        rag_cfg = self.config.get("rag", {}) or {}
-        try:
-            # G1: BGE embed + chroma search are CPU-bound; keep them off the loop.
-            hits = await asyncio.to_thread(
-                self.rag.query,
-                live_ctx + ("\n" + text if text else ""),
-                k=int(rag_cfg.get("k_retrieve", 8)),
-                top_n_final=int(rag_cfg.get("top_n_final", 3)),
-            )
-            if hits:
-                top_score = float(hits[0].get("score", 0.0))
-        except Exception as e:
-            logger.warning(f"[persona_agent] RAG query failed: {e}")
-
-        last_msg_ts = self.buffer.last_ts() if self.buffer else time.time()
-        emotion_state = await self._emotion.query(
-            group_id,
-            self.session_mgr.recent(group_id, n=20),
-            kg_ctx=KGContext(
-                recent_messages=self.session_mgr.recent(group_id, n=20),
-                current_speaker=alias,
-                current_text=text,
-                group_id=group_id,
-            ),
-        ) if self._emotion else EmotionState.neutral()
-        decision = self.interjection.decide(
-            group_id=group_id,
-            now_utc=time.time(),
-            is_at_me=is_at,
-            sender_uin=sender_uin,
-            last_group_msg_ts=last_msg_ts,
-            top_rag_score=top_score,
-            emotion_multiplier=emotion_state.global_willingness,
-        )
-        # G16 observability: every branch keeps the raw RAG score + emotion
-        # multiplier so threshold tuning is data-driven (2026-08-25 replay:
-        # production p95=0.676 max=0.698 -> 0.65 ≈ 5% trigger rate).
-        decision_log = decision.to_log(time.time(), sender_uin)
-        decision_log["group_id"] = group_id
-        decision_log["extra"] = dict(decision_log.get("extra") or {})
-        decision_log["extra"]["top_rag_score"] = round(top_score, 4)
-        decision_log["extra"]["emotion_multiplier"] = round(emotion_state.global_willingness, 3)
-        self._log_decision(decision_log)
-
-        if decision.action == ACTION_SILENT:
+        # A7 (2a): 主决策/生成链路交给共享 pipeline（线上 main 与离线测试台
+        # 同一份代码）。pipeline 内部完成 RAG→emotion→硬闸→GateLLM→KG→生成
+        # →postprocess→quote 解析，返回 SendIntent + 全链路 trace。
+        # 锁语义：_generating 保护"decide→生成→发送"整段；topic/silent 分支
+        # 在 finally 释放锁后处理（_send_topic 内部自设锁，避免嵌套释放）。
+        if self._pipeline is None:
             event.stop_event()
             return
-
-        if decision.action == ACTION_TOPIC:
-            await self._send_topic(event, group_id, decision, live_ctx, sender_uin)
-            event.stop_event()
-            return
-
-        # A7: GateLLM decision layer — non-@ replies get a second, independent
-        # "is this worth replying to?" judgment before RP generation. The RP
-        # model never makes this call itself (keeps roleplay context clean).
-        # AT replies bypass the gate (user-driven, always reply).
-        if (
-            self._gate is not None
-            and decision.action == ACTION_REPLY
-            and decision.trigger != TRIGGER_AT
-        ):
-            try:
-                gate_d = await self._gate.decide(
-                    group_id,
-                    self.session_mgr.recent(group_id, n=int((self.config.get("gate") or {}).get("recent_n", 15))),
-                    alias,
-                    text,
-                    rag_hits=hits if hits else None,
-                )
-            except Exception as e:
-                logger.warning(f"[persona_agent] gate decide raised: {e}")
-                gate_d = GateDecision(reply=False, reason="gate error", fallback=True)
-            gate_log = gate_d.to_log(group_id, sender_uin)
-            gate_log["decision_action"] = decision.action
-            gate_log["decision_trigger"] = decision.trigger
-            self.store.append_jsonl("gate_log.jsonl", gate_log)
-            if not gate_d.reply:
-                logger.info(
-                    f"[persona_agent] gate silent: {gate_d.reason}"
-                    + (" (fallback)" if gate_d.fallback else "")
-                )
-                event.stop_event()
-                return
-
+        send_intent: Optional[SendIntent] = None
         self._generating[group_id] = True
         try:
-            await asyncio.sleep(0.5)
-
-            kg_result = None
-            try:
-                recent = self.session_mgr.recent(group_id, n=20)
-                kg_result = await self.kg_provider.query(KGContext(
-                    recent_messages=recent,
-                    current_speaker=alias,
-                    current_text=text,
-                    group_id=group_id,
-                ))
-            except Exception as e:
-                logger.warning(f"[persona_agent] KG query failed: {e}")
-
-            contexts = self.session_mgr.get_contexts(group_id)
-            # G14: fixed example dialogs between session and KG tail
-            # (constant content -> prefix cache stays stable).
-            ex_block = self._examples_block()
-            if ex_block:
-                contexts.append({"role": "system", "content": ex_block})
-            if kg_result and kg_result.content:
-                contexts.append({"role": "system", "content": kg_result.content})
-
-            try:
-                reply_text = await self._generate_reply(
-                    event, text, contexts, emotion_state,
-                    temperature=self._temperature_for(decision.trigger),
-                )
-            except Exception as e:
-                logger.exception(f"[persona_agent] LLM generation failed: {e}")
-                event.stop_event()
-                return
-
-            clean_text, quote_n = text_style.extract_quote(reply_text)
-            reply_text = self._postprocess(clean_text)
-            if not reply_text:
-                logger.info("[persona_agent] empty reply after postprocess; skipping send")
-                event.stop_event()
-                return
-
-            # G2: [r:-N] -> OneBot reply chain (needs a real group message id)
-            qid = None
-            if quote_n is not None and self.buffer is not None:
-                qid = self.buffer.quote_target(quote_n)
-            if qid:
-                yield event.chain_result([Comp.Reply(id=qid), Comp.Plain(reply_text)])
-            else:
-                yield event.plain_result(reply_text)
-
-            if emotion_state.sticker_prompt:
-                try:
-                    yield event.chain_result([Comp.Image.fromText(emotion_state.sticker_prompt)])
-                except Exception:
-                    pass
-
-            self.interjection.register_reply(
+            send_intent = await self._pipeline.run(PipelineInput(
                 group_id=group_id,
-                now_utc=time.time(),
-                trigger=decision.trigger,
+                text=text,
+                is_at=is_at,
                 sender_uin=sender_uin,
-            )
-
-            self.session_mgr.append(group_id, "assistant", reply_text)
-
-            if self.buffer is not None:
-                self.buffer.add(
-                    ts=time.time(),
-                    group_id=str(event.get_group_id() or ""),
-                    sender_id=self.bot_qq,
-                    sender_name="<bot>",
-                    text=reply_text,
-                    message_id="",
-                    message_type="bot",
-                )
+                sender_alias=alias,
+                umo=str(event.unified_msg_origin or ""),
+            ))
         finally:
             self._generating[group_id] = False
+
+        if send_intent is None:
+            event.stop_event()
+            return
+        trace = send_intent.trace or {}
+
+        # decision log (back-compat: keep decision_log.jsonl emitting)
+        dlog = {
+            "action": "silent" if send_intent.action == "silent" else send_intent.action,
+            "trigger": (trace.get("hard_gate") or {}).get("trigger", ""),
+            "reason": send_intent.silent_reason
+            or (trace.get("hard_gate") or {}).get("reason", ""),
+            "score": (trace.get("hard_gate") or {}).get("score", 0.0),
+            "hour": self._local_hour(),
+            "hourly_budget": 0.0,
+            "hourly_used": 0.0,
+            "silence_sec": 0.0,
+            "cooldown_left_sec": (trace.get("hard_gate") or {}).get("cooldown_left_sec", 0.0),
+            "extra": {},
+            "ts": trace.get("ts", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+            "sender_uin": sender_uin,
+            "group_id": group_id,
+        }
+        rag_hits = trace.get("rag") or []
+        dlog["extra"]["top_rag_score"] = rag_hits[0].get("score", 0.0) if rag_hits else 0.0
+        dlog["extra"]["emotion_multiplier"] = (trace.get("emotion") or {}).get("willingness", 1.0)
+        if send_intent.action == "silent":
+            dlog["extra"]["silent_reason"] = send_intent.silent_reason
+        if "gate" in trace:
+            dlog["extra"]["gate"] = trace["gate"]
+        self._log_decision(dlog)
+
+        # trace log (A7: full-chain record, caller-side persist)
+        if self._trace_enabled():
+            self.store.append_jsonl("trace_log.jsonl", trace)
+
+        if send_intent.action == "silent":
+            event.stop_event()
+            return
+
+        if send_intent.action == "topic":
+            # Cold-start topic: pipeline flagged the slot; send via the
+            # existing main-side _send_topic (needs event for active send).
+            # Rebuild a light Decision from trace.hard_gate for it.
+            hg = trace.get("hard_gate") or {}
+            topic_decision = Decision(
+                action=ACTION_TOPIC,
+                trigger=str(hg.get("trigger", TRIGGER_COLD)),
+                reason=str(hg.get("reason", "cold_start")),
+                score=float(hg.get("score", 0.0) or 0.0),
+                silence_sec=float(hg.get("silence_sec", 0.0) or 0.0),
+            )
+            live_ctx = self.buffer.format_recent(max_lines=20) if self.buffer else ""
+            await self._send_topic(event, group_id, topic_decision, live_ctx, sender_uin)
+            event.stop_event()
+            return
+
+        # ---- reply: send per SendIntent ----
+        reply_text = send_intent.text
+        if not reply_text:
+            event.stop_event()
+            return
+        if send_intent.quote_id:
+            yield event.chain_result([Comp.Reply(id=send_intent.quote_id), Comp.Plain(reply_text)])
+        else:
+            yield event.plain_result(reply_text)
+
+        if send_intent.sticker_prompt:
+            try:
+                yield event.chain_result([Comp.Image.fromText(send_intent.sticker_prompt)])
+            except Exception:
+                pass
+
+        # register reply + persist session/buffer (main-side side effects)
+        trigger = (trace.get("hard_gate") or {}).get("trigger", "rag_hit")
+        self.interjection.register_reply(
+            group_id=group_id,
+            now_utc=time.time(),
+            trigger=trigger,
+            sender_uin=sender_uin,
+        )
+        self.session_mgr.append(group_id, "assistant", reply_text)
+        if self.buffer is not None:
+            self.buffer.add(
+                ts=time.time(),
+                group_id=str(event.get_group_id() or ""),
+                sender_id=self.bot_qq,
+                sender_name="<bot>",
+                text=reply_text,
+                message_id="",
+                message_type="bot",
+            )
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.OTHER_MESSAGE)
@@ -887,7 +866,15 @@ class PersonaAgent(Star):
         contexts: list[dict],
         emotion: Optional[EmotionState] = None,
         temperature: Optional[float] = None,
+        *,
+        speaker_uin: Optional[str] = None,
+        umo: Optional[str] = None,
     ) -> str:
+        """Generate a reply via LLM.
+
+        `speaker_uin`/`umo` override event-derived values (used by pipeline,
+        where no event object exists). When omitted, falls back to event.
+        """
         local_hour = self._local_hour()
         sys_prompt = self.style.system_prompt(local_hour=local_hour) if self.style else ""
         if emotion and emotion.current_mood:
@@ -896,7 +883,8 @@ class PersonaAgent(Star):
         # Dynamic current-speaker hint (2026-08-23 fix): inserted BEFORE the
         # KG tail (KG stays the last message -> cache prefix untouched; line is
         # per-speaker constant so it is stable across consecutive messages).
-        speaker_uin = str(event.get_sender_id() or "")
+        if speaker_uin is None:
+            speaker_uin = str(event.get_sender_id() or "")
         alias_txt = ""
         if self.style is not None:
             try:
@@ -919,7 +907,9 @@ class PersonaAgent(Star):
         provider_id = (self.config.get("llm") or {}).get("provider_id", "") or None
         if not provider_id:
             try:
-                provider_id = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+                provider_id = await self.context.get_current_chat_provider_id(
+                    umo if umo is not None else event.unified_msg_origin
+                )
             except Exception:
                 provider_id = None
 
@@ -944,13 +934,50 @@ class PersonaAgent(Star):
             return ""
 
         if int((self.config.get("llm") or {}).get("cache_probe_enabled", 1)) == 1:
-            self._log_llm_probe(event, contexts, sys_prompt, provider_id, resp, local_hour)
+            # probe needs a real event (group_id); skip in standalone mode
+            if event is not None:
+                self._log_llm_probe(event, contexts, sys_prompt, provider_id, resp, local_hour)
 
         text = (getattr(resp, "completion_text", "") or "").strip()
         if self._is_error_response(text):
             logger.warning(f"[persona_agent] llm returned error response, suppressed ({len(text)} chars)")
             return ""
         return text
+
+    async def _pipeline_generate(
+        self,
+        user_text: str,
+        contexts: list[dict],
+        emotion: Optional[EmotionState],
+        temperature: Optional[float],
+        sender_uin: str,
+        umo: Optional[str],
+    ) -> str:
+        """Pipeline generate callback: standalone LLM call (no event object).
+
+        Reuses _generate_reply in standalone mode (event=None + explicit
+        speaker_uin/umo); probe is skipped because there is no event.
+        """
+        if self.style is None:
+            return ""
+        try:
+            return await self._generate_reply(
+                None,  # type: ignore[arg-type]  # standalone mode
+                user_text,
+                contexts,
+                emotion,
+                temperature,
+                speaker_uin=sender_uin,
+                umo=umo,
+            )
+        except Exception as e:
+            logger.exception(f"[persona_agent] pipeline generate failed: {e}")
+            return ""
+
+    @staticmethod
+    def _postprocess_plain(text: str) -> str:
+        """Pipeline postprocess callback (pure text; no state needed)."""
+        return text_style.postprocess(text)
 
     async def _augment_with_vision(self, event: AstrMessageEvent, text: str) -> str:
         """G15: append vision descriptions / face names to the message text."""
