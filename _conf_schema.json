@@ -388,6 +388,19 @@
     }
   },
 
+  "trace": {
+    "type": "object",
+    "description": "全链路 trace 日志（A7：每次处理记录决策/检索/情绪/生成全过程，供评估 RAG 价值）",
+    "items": {
+      "enabled": {
+        "type": "int",
+        "description": "0 关闭 / 1 开启",
+        "hint": "trace_log.jsonl 写开关。默认开——trace 是评估 RAG/BGE 是否值得保留的数据依据。",
+        "default": 1
+      }
+    }
+  },
+
   "llm": {
     "type": "object",
     "description": "LLM provider 选择",
