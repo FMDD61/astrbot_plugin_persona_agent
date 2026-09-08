@@ -50,6 +50,7 @@ class MultiSignalKGProvider(KGProvider):
         w_dense: float = 0.60,
         w_bm25: float = 0.20,
         w_entity: float = 0.20,
+        dense_enabled: bool = True,
     ) -> None:
         self._rag = rag
         self._store = store
@@ -59,20 +60,51 @@ class MultiSignalKGProvider(KGProvider):
         self._w_dense = w_dense
         self._w_bm25 = w_bm25
         self._w_entity = w_entity
+        # A7③: dense(BGE) 检索开关。0 时 KG 不注入历史话术示例（走关系块-only
+        # 退化分支），用于 A/B 验证 BGE 价值。main reload 时随 pipeline 重建。
+        self.dense_enabled = bool(dense_enabled)
 
-    async def query(self, ctx: KGContext) -> Optional[KGResult]:
+    async def query(
+        self,
+        ctx: KGContext,
+        external_dense_hits: Optional[list[dict]] = None,
+    ) -> Optional[KGResult]:
+        """多信号融合检索。external_dense_hits 由 pipeline 传入（单次检索复用，
+        省一次 BGE）；未传且 dense_enabled 时自查 rag；dense 关闭时退化。"""
         query_text = self._build_query(ctx)
         if not query_text:
             return None
 
+        # ---- A7③ 退化分支：dense(BGE) 关闭 → 不注入历史话术，仅关系块 ----
+        # 背景：memory_store 只存 member/topic 实体 + mentions/talks_about 边
+        # （无完整历史发言文本），BM25 检的是实体碎片，无法按 _format 注入
+        # "你当时的回复" 风格示例 —— dense(Chroma 历史回复对) 是话术示例的
+        # 唯一来源。故 rag.enabled=0 时 KG 只保留关系图谱记忆（edges 表，
+        # 不依赖 BGE），对照"有 BGE 话术 vs 纯关系记忆"。
+        if not self.dense_enabled:
+            relation_block = self._format_relation(ctx)
+            if not relation_block:
+                return None
+            return KGResult(
+                content=relation_block,
+                metadata={
+                    "provider": "relation_only",
+                    "dense_enabled": False,
+                },
+            )
+
         # 1. dense (BGE vector) — CPU-bound, keep off the event loop (G1)
-        dense_hits = await asyncio.to_thread(
-            self._rag.query,
-            context_text=query_text,
-            k=self._k_retrieve,
-            now_utc=time.time(),
-            top_n_final=self._k_retrieve,
-        )
+        #    外部已传（pipeline 单次检索复用）则不自查，省一次 BGE 编码+查询。
+        if external_dense_hits is not None:
+            dense_hits = external_dense_hits
+        else:
+            dense_hits = await asyncio.to_thread(
+                self._rag.query,
+                context_text=query_text,
+                k=self._k_retrieve,
+                now_utc=time.time(),
+                top_n_final=self._k_retrieve,
+            )
         dense_map: dict[str, float] = {}
         for h in dense_hits:
             dense_map[h.get("id", "")] = h.get("score", 0.0)

@@ -84,7 +84,15 @@ PostFn = Callable[[str, dict], Awaitable[dict]]
 
 
 class VisionService:
-    """Vision description with per-image hash cache (TTL) and timeout."""
+    """Vision description with per-image hash cache (TTL) and timeout.
+
+    A7③ 持久哈希缓存：
+      - 内存 TTL 缓存（现状，第一道，防连发）
+      - 持久 JSON 缓存 image_desc_cache.json（第二道，跨重启复用描述；
+        sha256 → {desc, last_ts, hits}；LRU 淘汰最久未命中；上限 persist_max）
+      命中即刷新 last_ts + hits（LRU 语义：高频表情不被"早进缓存"误杀）。
+      落盘节流：新增/命中仅更新内存，标脏后惰性 flush + terminate flush。
+    """
 
     def __init__(
         self,
@@ -97,6 +105,8 @@ class VisionService:
         desc_max_chars: int = 120,
         reasoning_effort: str = "low",
         http_post: Optional[PostFn] = None,
+        persist_path: Optional[str] = None,
+        persist_max: int = 2000,
     ) -> None:
         self._url = api_base.rstrip("/") + "/chat/completions"
         self._key = api_key
@@ -108,6 +118,87 @@ class VisionService:
         self._http_post = http_post  # injectable for tests
         self._cache: dict[str, tuple[float, str]] = {}
         self._lock = threading.Lock()
+        # ---- A7③ 持久 LRU 缓存 ----
+        self._persist_path = str(persist_path) if persist_path else ""
+        self._persist_max = int(persist_max)
+        self._persist: dict[str, dict] = {}   # sha256 -> {desc,last_ts,hits}
+        self._persist_dirty = False           # 内存有未落盘变更
+        self._evicted = 0                     # 淘汰计数（观测上限是否够）
+        if self._persist_path:
+            self._load_persist()
+
+    # ---- A7③ 持久缓存 ----
+
+    def _load_persist(self) -> None:
+        """启动加载持久缓存（文件损坏/缺失则空）。"""
+        try:
+            import json as _json
+            with open(self._persist_path, encoding="utf-8") as f:
+                data = _json.load(f)
+            if isinstance(data, dict):
+                self._persist = {
+                    k: {
+                        "desc": str(v.get("desc", "")),
+                        "last_ts": float(v.get("last_ts", 0.0)),
+                        "hits": int(v.get("hits", 0)),
+                    }
+                    for k, v in data.items()
+                    if isinstance(v, dict) and v.get("desc")
+                }
+        except Exception:
+            self._persist = {}
+
+    def _flush_persist(self) -> None:
+        """落盘（原子写 tmp→rename）。仅在有脏数据时写；失败静默。"""
+        if not self._persist_path or not self._persist_dirty:
+            return
+        import json as _json
+        import os
+        try:
+            tmp = self._persist_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                _json.dump(self._persist, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._persist_path)
+            self._persist_dirty = False
+        except OSError:
+            pass  # 落盘失败不 crash
+
+    def _touch_persist(self, h: str, desc: str) -> None:
+        """命中/新增：更新 last_ts/hits + 标脏 + 超限 LRU 淘汰最久未用。"""
+        now = time.time()
+        entry = self._persist.get(h)
+        if entry:
+            entry["last_ts"] = now
+            entry["hits"] = entry.get("hits", 0) + 1
+        else:
+            self._persist[h] = {"desc": desc, "last_ts": now, "hits": 1}
+        self._persist_dirty = True
+        # LRU 淘汰：超上限时移除 last_ts 最旧（最久未使用）的条目
+        while len(self._persist) > self._persist_max and self._persist:
+            oldest_k = min(self._persist, key=lambda k: self._persist[k]["last_ts"])
+            del self._persist[oldest_k]
+            self._evicted += 1
+
+    def flush(self) -> None:
+        """显式落盘（terminate/定时调用）。"""
+        with self._lock:
+            self._flush_persist()
+
+    def snapshot(self) -> dict:
+        """观测：缓存大小/上限/淘汰数/命中分布（判断 persist_max 是否够）。"""
+        with self._lock:
+            return {
+                "persist_enabled": bool(self._persist_path),
+                "persist_size": len(self._persist),
+                "persist_max": self._persist_max,
+                "persist_evicted": self._evicted,
+                "hits_top": sorted(
+                    (v.get("hits", 0) for v in self._persist.values()),
+                    reverse=True,
+                )[:10],
+            }
 
     async def _post(self, payload: dict) -> dict:
         if self._http_post is not None:
@@ -130,6 +221,13 @@ class VisionService:
             hit = self._cache.get(h)
             if hit and time.time() - hit[0] < self._cache_ttl:
                 return hit[1]
+            # A7③ 第二道：持久缓存命中 → 免调视觉模型（跨重启复用）
+            if self._persist_path:
+                pent = self._persist.get(h)
+                if pent:
+                    self._touch_persist(h, str(pent.get("desc", "")))
+                    self._cache[h] = (time.time(), str(pent["desc"]))
+                    return str(pent["desc"])
         try:
             b64 = base64.b64encode(data).decode()
             mime = sniff_mime(data)
@@ -154,6 +252,9 @@ class VisionService:
                 return None
             with self._lock:
                 self._cache[h] = (time.time(), desc)
+                # A7③: 新描述写持久层（标脏，惰性 flush）
+                if self._persist_path:
+                    self._touch_persist(h, desc)
             return desc
         except Exception:
             return None
