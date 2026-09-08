@@ -246,6 +246,40 @@ class PersonaPipeline:
         if decision.action == ACTION_SILENT:
             return SendIntent(action="silent", silent_reason=decision.reason, trace=trace)
 
+        # ---- GateLLM (A7; A7④ 安全阀化) ----
+        # 覆盖所有候选发言（REPLY 含 @、以及 TOPIC 主动话题——冷场可能是
+        # 刚吵完的冷场，主动发言易惹事，故 TOPIC 也过 conflict 判定）。
+        # @ 也 gate：@ 时 reply 通常 true 但 conflict 仍判（冲突中被 @ 也不煽风）。
+        if self.gate is not None:
+            gate_d = GateDecision(reply=False, reason="gate error", fallback=True)
+            try:
+                recent = (
+                    self.session_mgr.recent(group_id, n=self._gate_recent_n)
+                    if self.session_mgr is not None
+                    else []
+                )
+                gate_d = await self.gate.decide(
+                    group_id,
+                    recent,
+                    alias,
+                    text,
+                    rag_hits=hits if hits else None,
+                    is_at=inp.is_at,
+                )
+            except Exception as e:
+                trace["gate_error"] = f"{type(e).__name__}: {e}"
+            trace["gate"] = gate_d.to_log(group_id, inp.sender_uin)
+            # 安全阀：conflict=true 强制不发言（无论 reply/action，含 @ 与 topic）
+            if gate_d.conflict or not gate_d.reply:
+                reason = gate_d.reason
+                if gate_d.conflict:
+                    reason = f"conflict: {reason}"
+                return SendIntent(
+                    action="silent",
+                    silent_reason=f"gate: {reason}",
+                    trace=trace,
+                )
+
         if decision.action == ACTION_TOPIC:
             # TopicBank send is a main-side side effect (needs event/主动发送).
             # When a topic_handler is injected (main), call it; otherwise
@@ -262,35 +296,6 @@ class PersonaPipeline:
                     trace["topic_error"] = f"{type(e).__name__}: {e}"
                 return SendIntent(action="topic", trace=trace)
             return SendIntent(action="topic", trace=trace)
-
-        # ---- GateLLM (A7) ----
-        if (
-            self.gate is not None
-            and decision.trigger != TRIGGER_AT
-        ):
-            gate_d = GateDecision(reply=False, reason="gate error", fallback=True)
-            try:
-                recent = (
-                    self.session_mgr.recent(group_id, n=self._gate_recent_n)
-                    if self.session_mgr is not None
-                    else []
-                )
-                gate_d = await self.gate.decide(
-                    group_id,
-                    recent,
-                    alias,
-                    text,
-                    rag_hits=hits if hits else None,
-                )
-            except Exception as e:
-                trace["gate_error"] = f"{type(e).__name__}: {e}"
-            trace["gate"] = gate_d.to_log(group_id, inp.sender_uin)
-            if not gate_d.reply:
-                return SendIntent(
-                    action="silent",
-                    silent_reason=f"gate: {gate_d.reason}",
-                    trace=trace,
-                )
 
         # ---- KG（A7③：外部传入 dense hits → KG 不自查，单次检索复用）----
         kg_content = ""

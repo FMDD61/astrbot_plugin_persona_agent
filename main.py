@@ -92,6 +92,8 @@ class PersonaAgent(Star):
         self._summary: Optional[SummaryService] = None
         self._conflict_detector: Optional[ConflictDetector] = None
         self._generating: dict[str, bool] = {}
+        # A7④: 冲突通知冷却（30min，防刷屏；仅限通知，不影响发言闸）
+        self._conflict_notify_ts: float = 0.0
 
         self._decision_log_path = self.data_dir / "decision_log.jsonl"
 
@@ -375,6 +377,11 @@ class PersonaAgent(Star):
             return True
 
     async def _notify_admin(self, context_summary: str, group_id: str, speaker: str) -> None:
+        # A7④: 30min 冷却防刷屏（沿用旧 conflict_detector._COOLDOWN 语义；仅通知侧）
+        now = time.time()
+        if now - self._conflict_notify_ts < 1800:
+            logger.info("[persona_agent] conflict notify suppressed by cooldown (30min)")
+            return
         binding = self.store.load_json("admin_binding.json", {})
         umo = binding.get("unified_msg_origin")
         if not umo:
@@ -389,6 +396,7 @@ class PersonaAgent(Star):
             from astrbot.api.event import MessageChain
             chain = MessageChain().message(msg)
             await self.context.send_message(umo, chain)
+            self._conflict_notify_ts = now
             logger.info(f"[persona_agent] conflict notification sent to admin")
         except Exception as e:
             logger.warning(f"[persona_agent] failed to send admin notification: {e}")
@@ -618,7 +626,12 @@ class PersonaAgent(Star):
                 MemoryEvent(speaker_alias=alias, text=text, group_id=group_id),
             ))
 
-        if self._conflict_detector is not None:
+        # A7④: 冲突安全阀路径分流——
+        #   gate.enabled=1: conflict 判定由 GateLLM 承担（pipeline 内，覆盖 @/topic；
+        #     每次候选都判，无 keyword 漏检）；此处不跑旧 detector。
+        #   gate.enabled=0: 保留旧 conflict_detector（keyword+burst+verify）作兜底，
+        #     避免关 Gate 连带失去全部冲突保护。
+        if self._conflict_detector is not None and self._gate is None:
             conflict_ctx = self._conflict_detector.feed(time.time(), alias, text)
             if conflict_ctx:
                 is_conflict = await self._conflict_detector.verify_with_llm(
@@ -704,6 +717,23 @@ class PersonaAgent(Star):
                 pass
 
         if send_intent.action == "silent":
+            # A7④: Gate 判 conflict → 旁路通知管理员（30min 冷却在 _notify_admin
+            # 内；通知为附加功能，发言闸已由 pipeline 拦截——冲突中绝不发言）。
+            gconf = (trace.get("gate") or {}).get("conflict")
+            if gconf:
+                try:
+                    ctx_lines = []
+                    recent = self.session_mgr.recent(group_id, n=15) if self.session_mgr else []
+                    for m in recent:
+                        nm = m.get("name") or m.get("role", "")
+                        ct = (m.get("content") or "").strip()
+                        if ct:
+                            ctx_lines.append(f"{nm}: {ct}")
+                    await self._notify_admin(
+                        "\n".join(ctx_lines[-10:]), group_id, alias
+                    )
+                except Exception as e:
+                    logger.warning(f"[persona_agent] conflict notify failed: {e}")
             event.stop_event()
             return
 

@@ -188,5 +188,46 @@ class TestDecide(unittest.TestCase):
                 self.assertIsInstance(d, GateDecision)
 
 
+
+class TestConflictSafety(unittest.TestCase):
+    """A7\u2462 \u5b89\u5168\u9600\uff1aconflict \u89e3\u6790 / \u5f3a\u5236\u4e0d\u53d1\u8a00 / \u65e7\u683c\u5f0f\u517c\u5bb9 / \u7f13\u5b58\u952e\u5206 @\u3002"""
+
+    def test_parse_conflict_true_forces_reply_false(self):
+        d = GateService._parse('{"reply": true, "conflict": true, "reason": "\u5728\u5435"}')
+        self.assertTrue(d.conflict)
+        self.assertFalse(d.reply)   # \u51b2\u7a81\u4e2d\u5f3a\u5236\u4e0d\u53d1\u8a00
+
+    def test_parse_conflict_false_keeps_reply(self):
+        d = GateService._parse('{"reply": true, "conflict": false, "reason": "\u5728\u95ee"}')
+        self.assertFalse(d.conflict)
+        self.assertTrue(d.reply)
+
+    def test_parse_legacy_format_no_conflict_key(self):
+        # \u65e7\u683c\u5f0f {reply, reason} \u65e0 conflict\u2192 \u9ed8\u8ba4 false\uff08\u5411\u540e\u517c\u5bb9\uff09
+        d = GateService._parse('{"reply": false, "reason": "\u5bd2\u6684"}')
+        self.assertFalse(d.conflict)
+        self.assertFalse(d.reply)
+
+    def test_parse_conflict_string_tolerated(self):
+        d = GateService._parse('{"reply": true, "conflict": "true", "reason": "x"}')
+        self.assertTrue(d.conflict)
+        self.assertFalse(d.reply)
+
+    def test_cache_key_separates_at(self):
+        calls = []
+
+        async def llm(p):
+            calls.append(p)
+            return '{"reply": true, "conflict": false, "reason": "x"}'
+
+        svc = GateService(llm, decide_cooldown_sec=60)
+        _run(svc.decide("g1", _msgs(2), "a", "m1", None, is_at=False))
+        _run(svc.decide("g1", _msgs(2), "a", "m2", None, is_at=True))
+        self.assertEqual(len(calls), 2)  # @ \u4e0e\u975e @ \u4e0d\u5171\u4eab\u7f13\u5b58
+        # \u540c\u6837 is_at \u518d\u6b21\u547d\u4e2d\u7f13\u5b58
+        _run(svc.decide("g1", _msgs(2), "a", "m3", None, is_at=True))
+        self.assertEqual(len(calls), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

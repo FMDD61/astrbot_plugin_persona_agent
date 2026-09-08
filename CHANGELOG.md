@@ -11,6 +11,14 @@
 
 ## [Unreleased]
 
+### Added (2026-09-08, A7 批次⑤：LLM 参数矩阵 + Gate 安全阀化 — A7④)
+- **LLM 参数矩阵**: `_conf_schema` 加 `llm.reasoning_effort`(默认 off)、`gate.temperature`(0.2)+`gate.reasoning_effort`(off)、`emotion.temperature`(0.2)+`emotion.reasoning_effort`(off)；`services/llm_params.py` `reasoning_value()` 容错映射（off→none，未知→none）；RP/Gate/Emotion 三处 `llm_generate` 透传 temperature+reasoning_effort（采样参数不进 prompt，不破坏前缀缓存）；Diary/Summary 跟随 RP（同 system_prompt）
+- **Gate 安全阀化（conflict 并入）**: Gate 单 prompt 双任务（参与度 reply + 安全 conflict），输出 `{reply, conflict, reason}`；conflict=true → 强制不发言（防煽风点火）；**@ 也过 Gate**（@ 提示通常应回但冲突除外；缓存键含 is_at 不串）；**TOPIC 也过 Gate**（刚吵完的冷场不主动惹事）；Gate 节流窗口内冲突结果复用
+- **conflict_detector 降级为兜底**: `gate.enabled=1` 时旧 detector（keyword+burst+verify）不跑（Gate 语义判定每次候选都查，无 keyword 漏检）；`gate.enabled=0` 时保留旧 detector（避免关 Gate 连带失去冲突保护）
+- **通知旁路工具化**: Gate conflict → main 从 session recent 取上下文 → `_notify_admin`（30min 冷却防刷屏，仅通知侧不影响发言闸）
+- 补测试：gate conflict 5 例（解析/强制 false/旧格式兼容/@ 缓存键）+ pipeline topic-gate 2 例 + @ gate 语义改造；测试 147 → **155 全绿**
+- 设计文档：`docs/specs/a7-step4-llm-params-gate-conflict.md`
+
 ### Added (2026-09-07, A7 批次④：RAG 动态开关 + 单次检索 + 图片持久哈希 — A7③)
 - **`rag.enabled` 总开关**: `_conf_schema.json` `rag` 块新增顶层 `enabled`（默认 1）。=0 时 pipeline 完全不查向量库（决策无 RAG 分数 → rag_hit 不触发、Gate 无参考片段、trace 记 `rag_disabled`），用于 A/B 验证 RAG 价值。`/reload_persona_config` 重建 pipeline 即时生效（抽 `_build_pipeline()`）
 - **KG 退化分支（B1）**: `rag.enabled=0` 时 KG 不注入历史话术示例（memory_store 只存实体碎片无完整发言，BM25 无法顶替 dense 候选池——实现中发现原方案 B 数据不可行），保留关系块（互动次数/关系等级/共同话题，edges 表不依赖 BGE）；无关系块则返回 None。`MultiSignalKGProvider` 加 `dense_enabled` 开关
