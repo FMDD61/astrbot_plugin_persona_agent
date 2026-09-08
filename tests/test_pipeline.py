@@ -67,15 +67,17 @@ class _FakeEmotion:
 
 
 class _FakeGate:
-    def __init__(self, reply=True, reason="ok"):
+    def __init__(self, reply=True, reason="ok", conflict=False):
         self._reply = reply
         self._reason = reason
+        self._conflict = conflict
         self.calls = []
 
-    async def decide(self, group_id, recent_msgs, speaker, text, rag_hits=None):
-        self.calls.append((group_id, text))
+    async def decide(self, group_id, recent_msgs, speaker, text, rag_hits=None, is_at=False):
+        self.calls.append((group_id, text, is_at))
         from services.gate import GateDecision
-        return GateDecision(reply=self._reply, reason=self._reason, ts=__import__("time").time())
+        return GateDecision(reply=self._reply, conflict=self._conflict,
+                            reason=self._reason, ts=__import__("time").time())
 
 
 class _FakeInterjection:
@@ -136,12 +138,22 @@ class TestRunBasics(unittest.TestCase):
         self.assertIn("hard_gate", si.trace)
         self.assertIn("final_text", si.trace)
 
-    def test_at_passthrough_no_gate(self):
-        gate = _FakeGate(reply=False)  # would reject if called
+    def test_at_now_goes_through_gate(self):
+        """A7\u2462: @ \u4e5f\u8fc7 gate\uff08\u51b2\u7a81\u65f6 @ \u4e5f\u4e0d\u53d1\u8a00\uff09\u3002"""
+        gate = _FakeGate(reply=True)
         p = _pipeline(gate=gate)
         si = _run(p.run(PipelineInput("g1", "@bot 在吗", True, "1", "小红")))
-        self.assertEqual(si.action, "reply")  # @ always replies, gate not consulted
-        self.assertEqual(len(gate.calls), 0)
+        self.assertEqual(si.action, "reply")   # gate reply=true \u2192 \u653e\u884c
+        self.assertEqual(len(gate.calls), 1)   # @ \u4e5f\u88ab\u8c03
+        self.assertTrue(gate.calls[0][2])      # is_at=True \u4f20\u5165
+
+    def test_at_rejected_by_gate_conflict(self):
+        """\u51b2\u7a81\u4e2d @ \u4e5f\u4e0d\u56de\uff08\u5b89\u5168\u9600\uff09\u3002"""
+        gate = _FakeGate(reply=True, conflict=True)
+        p = _pipeline(gate=gate)
+        si = _run(p.run(PipelineInput("g1", "@bot 在吗", True, "1", "小红")))
+        self.assertEqual(si.action, "silent")
+        self.assertIn("conflict", si.silent_reason)
 
     def test_gate_rejects_silent(self):
         gate = _FakeGate(reply=False, reason="纯寒暄")
@@ -282,6 +294,28 @@ class TestRagEnabled(unittest.TestCase):
         si = _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
         self.assertEqual(len(si.trace.get("rag") or []), 8)
 
+
+
+    def test_topic_goes_through_gate_conflict(self):
+        """A7\u2462: TOPIC\uff08\u51b7\u573a\u4e3b\u52a8\u8bdd\u9898\uff09\u4e5f\u8fc7 gate conflict\u2014\u2014\u51b2\u7a81\u540e\u7684\u51b7\u573a\u4e0d\u4e3b\u52a8\u53d1\u8a00\u3002"""
+        from services.interjection import ACTION_TOPIC, Decision
+        ij = _FakeInterjection()
+        ij._action = ACTION_TOPIC
+        gate = _FakeGate(reply=True, conflict=True)
+        p = _pipeline(interjection=ij, gate=gate)
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+        self.assertEqual(si.action, "silent")
+        self.assertIn("conflict", si.silent_reason)
+
+    def test_topic_passes_gate_when_no_conflict(self):
+        """TOPIC \u65e0\u51b2\u7a81\u65f6\u6b63\u5e38\u53d1\u9001\u3002"""
+        from services.interjection import ACTION_TOPIC
+        ij = _FakeInterjection()
+        ij._action = ACTION_TOPIC
+        gate = _FakeGate(reply=True, conflict=False)
+        p = _pipeline(interjection=ij, gate=gate)
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+        self.assertEqual(si.action, "topic")
 
 if __name__ == "__main__":
     unittest.main()
