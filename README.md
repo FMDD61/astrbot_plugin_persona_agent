@@ -9,7 +9,8 @@ AstrBot 插件 — 在 QQ 群内模仿指定用户（QQ `234567`）的发言风�
 ```
 群消息 → 前置（识图/睡眠/冲突检测）→ PersonaPipeline.run()（A7 共享主链路）
    ├─ RAG 检索（风格源历史）→ Emotion（三维）→ interjection 硬闸（规则）
-   ├─ GateLLM 决策层（可选，gate.enabled=1；非 @ 判断值不值得回）
+   ├─ GateLLM 决策层+安全阀（可选，gate.enabled=1；所有 REPLY/含@/TOPIC 都过；
+  │      单 prompt 双任务 {reply, conflict, reason}；conflict=true 强制不发言；0.2 温度+off 思考）
    ├─ KG 风格指引 + session 全量上下文（prefix caching）+ 固定示例
    ├─ LLM 生成 → postprocess → SendIntent（含 [r:-N] 引用/表情意图）
    └─ 全链路 trace → logs/<group_id>/trace_log.jsonl（trace_view 可读）
@@ -27,8 +28,8 @@ AstrBot 插件 — 在 QQ 群内模仿指定用户（QQ `234567`）的发言风�
 
 | 层 | 模型 | 职责 |
 |----|------|------|
-| 决策层 `GateService` | 独立中性 LLM（deepseek-v4-flash 轻量） | "这句要不要回" + 理由；同群节流；失败保守静默 |
-| 扮演层 `PersonaPipeline` → LLM | 主 RP 模型 | 纯粹表演（上下文不掺工具/决策噪音） |
+| 决策层+安全阀 `GateService` | 独立中性 LLM（provider 同源 dsv4f） | "这句要不要回" + conflict 判定（{reply, conflict, reason}）；conflict=true 强制不发言（防煽风点火）；0.2 温度 + off 思考；同群节流；失败保守静默 |
+| 扮演层 `PersonaPipeline` → LLM | 主 RP 模型 | 纯粹表演（上下文不掺工具/决策噪音）；reasoning off + 温度分档 |
 
 ## 快速开始
 
@@ -75,11 +76,11 @@ WebUI: `http://<IP>:6185` → Astr 插件 → astrbot_plugin_persona_agent
 | `target_group_id` | 123456789 | 生产群号 |
 | `data_dir` | `/opt/AstrBot/data/...` | 运行时数据目录 (git pull 不覆盖) |
 
-> 完整配置见 `_conf_schema.json`：`sleep.*`（睡眠窗 02–07）、`diary.*`、`examples.*`、`vision.*`、`emotion.*`、`housekeeping.*`、`privileged_qq`、`llm.temperature`（温度分档）、`summary.*`（周/月摘要，G13）、`poke.*`、`topic_bank.*`、`dream.*`、`gate.*`（A7 GateLLM 决策层，enabled=0 默认关）、`trace.*`（A7 全链路 trace，enabled=1 默认开）。
+> 完整配置见 `_conf_schema.json`：`sleep.*`（睡眠窗 02–07）、`diary.*`、`examples.*`、`vision.*`、`emotion.*`、`housekeeping.*`、`privileged_qq`、`llm.temperature`（温度分档）、`summary.*`（周/月摘要，G13）、`poke.*`、`topic_bank.*`、`dream.*`、`gate.*`（A7 GateLLM 决策层+conflict 安全阀，enabled=0 默认关 / temperature=0.2 / reasoning_effort=off）、`trace.*`（A7 全链路 trace，enabled=1 默认开）、`rag.enabled`（RAG 总开关，A7③）、`vision.cache_persist*`（识图持久缓存，A7③）、`llm.reasoning_effort`（RP 思考 off）、`emotion.temperature/reasoning_effort`（0.2/off）。
 
 ## 当前状态
 
-**v0.5.0（2026-09-07）** — **生产接管**（`test_mode=0`，目标群 `123456789`）。含：v3 按日会话+02:00轮换、睡眠窗 02–07、每日日记、识图（flash-vision-exp）、情绪引擎 v1、示例注入（规则A/B）、离线 A/B 通道、**主动插话（`active_interjection=1`，阈值 0.65）**、**DreamJob（`dream.enabled=1`，周一 03:00）**、**周/月摘要（`summary.*=1`，推 bind_dream 私聊）**、G11/G12 代码就绪（`poke.enabled` / `topic_bank.enabled` 待 Day3/4 开启）。**A7（2026-09-07）**：GateLLM 决策层 + PersonaPipeline 共享主链路 + 全链路 trace 日志 + 群隔离 + 日志按群分目录（`gate.enabled=0` 未开，待手动验证）。测试 132 例全绿。
+**v0.5.0（2026-09-08）** — **生产接管**（`test_mode=0`，目标群 `123456789`）。含：v3 按日会话+02:00轮换、睡眠窗 02–07、每日日记、识图（flash-vision-exp，持久哈希缓存）、情绪引擎 v1、示例注入（规则A/B）、离线 A/B 通道、**主动插话（`active_interjection=1`，阈值 0.65）**、**DreamJob（`dream.enabled=1`）**、**周/月摘要（`summary.*=1`）**、G11/G12 代码就绪。**A7（至 2026-09-08）**：GateLLM 决策层+conflict 安全阀（含 @/TOPIC 覆盖）、PersonaPipeline 共享主链路、全链路 trace（trace_view 查看）、群隔离、日志按群分目录、RAG 动态开关（rag.enabled）、Vision 持久 LRU 缓存、LLM 参数矩阵（RP off 思考/结构化 0.2+off）。`gate.enabled=0` 未开待手动验证。测试 155 例全绿。
 
 > A7 计划书：`docs/specs/chatbox-rp-tool-dual-channel.md`（工作区根）
 
@@ -107,12 +108,13 @@ astrbot_plugin_persona_agent/
 │   ├── kg_provider.py        # MultiSignalKGProvider (dense+BGE + BM25/FTS5 + entity)
 │   ├── emotion.py            # LLMEmotionProvider v1 (3 维: 意愿/情绪/表情, 30s 缓存, 3s 超时)
 │   ├── interjection.py       # 规则硬闸 (AT/RAG/COLD 三级; 用量按群隔离 + usages/<gid>.json)
-│   ├── gate.py               # A7 GateLLM 决策层 (非 @ 判断值不值得回; 同群节流; 保守静默)
+│   ├── llm_params.py         # A7④ reasoning_effort 容错映射 (off→none)
+│   ├── gate.py               # A7 GateLLM 决策层+安全阀 ({reply, conflict, reason}; @/TOPIC 全覆盖; 0.2+off; is_at 缓存键)
 │   ├── pipeline.py           # A7 共享主链路 (RAG→情绪→硬闸→Gate→KG→生成→SendIntent+trace)
 │   ├── style_profile.py      # 风格文件热加载 + alias 映射
 │   ├── rag_service.py        # ChromaDB 向量检索 (local_files_only 离线 BGE)
 │   ├── memory_store.py       # SQLite ADD-only 实体关系图 + FTS5 BM25
-│   ├── conflict_detector.py  # 三阶段冲突检测
+│   ├── conflict_detector.py  # 旧冲突检测 (仅 gate.enabled=0 兜底)
 │   ├── dream_job.py          # 周 cron 记忆巩固 + 漂移报告
 │   ├── context_buffer.py     # 滑动窗口 buffer (仅用于 interjection 决策)
 │   ├── examples.py           # G14 静态示例注入 (mtime_ns 热重载 + 规则A/B)
