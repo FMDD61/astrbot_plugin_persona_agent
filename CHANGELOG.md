@@ -11,6 +11,15 @@
 
 ## [Unreleased]
 
+### Added (2026-09-07, A7 批次④：RAG 动态开关 + 单次检索 + 图片持久哈希 — A7③)
+- **`rag.enabled` 总开关**: `_conf_schema.json` `rag` 块新增顶层 `enabled`（默认 1）。=0 时 pipeline 完全不查向量库（决策无 RAG 分数 → rag_hit 不触发、Gate 无参考片段、trace 记 `rag_disabled`），用于 A/B 验证 RAG 价值。`/reload_persona_config` 重建 pipeline 即时生效（抽 `_build_pipeline()`）
+- **KG 退化分支（B1）**: `rag.enabled=0` 时 KG 不注入历史话术示例（memory_store 只存实体碎片无完整发言，BM25 无法顶替 dense 候选池——实现中发现原方案 B 数据不可行），保留关系块（互动次数/关系等级/共同话题，edges 表不依赖 BGE）；无关系块则返回 None。`MultiSignalKGProvider` 加 `dense_enabled` 开关
+- **单次检索复用**: pipeline 一次查全量（`top_n_final=k` 拿回 k 条），截 top3 供决策/Gate，**全量传 KGProvider**（`query(ctx, external_dense_hits=...)`）→ KG 不自查 rag（每轮一次 BGE 编码+Chroma 查询，原两次）；不传 external 时 KG fallback 自查（向后兼容）
+- **trace 记全量 RAG 命中**: trace["rag"] 记录全部命中原文+score（"LLM 看到什么 trace 记什么"，评估 RAG 价值；规模可控，RAG 确认保留后可改回截断）
+- **Vision 持久 LRU 哈希缓存**: VisionService 加持久层 `data_dir/image_desc_cache.json`（sha256→{desc,last_ts,hits}，跨重启复用图片描述）；LRU 淘汰最久未命中（命中刷新 last_ts+hits，高频表情不被早进缓存误杀）；上限 `vision.cache_persist_max`（默认 2000）；落盘节流标脏 + terminate flush；`snapshot()` 暴露 size/max/evicted/hits 分布（观测 2000 是否够）；`vision.cache_persist=0` 关闭仅内存 TTL
+- 补测试：vision LRU 4 例 + kg 退化 4 例 + pipeline rag 3 例；测试 132 → **143 全绿**
+- 设计文档：`docs/specs/a7-step3-rag-switch-single-query-image-hash.md`
+
 ### Added (2026-09-07, A7 批次③：日志分群 + topic_bank 隔离 + trace_view — 2b)
 - **日志按群分目录**: decision/gate/trace/llm_cache_probe/daily_diary 全部迁移到 `logs/<group_id>/` 子目录（JsonStore append_jsonl 自动建子目录）；旧根目录文件保留兼容；housekeeping 轮转扩展覆盖 `logs/*/*.jsonl`
 - **gate_log 恢复独立落盘**: 2a 重构曾把 gate 决策并入 decision_log.extra，2b 恢复 `logs/<group>/gate_log.jsonl` 独立记录（含 decision_action/trigger/fallback/cached）

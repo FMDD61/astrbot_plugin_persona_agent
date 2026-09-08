@@ -50,10 +50,12 @@ class _FakeRag:
     def __init__(self, hits):
         self._hits = hits
         self.last_query = None
+        self.calls = 0
 
     def query(self, ctx, k=8, top_n_final=3):
+        self.calls += 1
         self.last_query = ctx
-        return [dict(h) for h in self._hits]
+        return [dict(h) for h in self._hits[:top_n_final]]
 
 
 class _FakeEmotion:
@@ -105,13 +107,14 @@ def _pipeline(**over):
         emotion=over.get("emotion", _FakeEmotion()),
         gate=over.get("gate", None),
         session_mgr=over.get("session", _FakeSession()),
-        kg_provider=None,
+        kg_provider=over.get("kg", None),
         buffer=over.get("buffer", None),
         generate=over.get("generate", lambda t, c, e, temp, su, umo: _async("好的~")),
         examples_block=lambda: "",
         postprocess=lambda s: s.strip(),
         temperature_for=lambda trig: 0.8,
         debounce_sec=0.0,
+        rag_enabled=over.get("rag_enabled", True),
     )
     return p
 
@@ -234,6 +237,50 @@ class TestTraceAndQuote(unittest.TestCase):
         # fields exist (reserved for later), empty by default
         self.assertIsNone(si.emote)
         self.assertIsNone(si.poke)
+
+
+
+class TestRagEnabled(unittest.TestCase):
+    """A7③: rag.enabled=0 \u4e0d\u67e5 RAG + trace \u8bb0 disabled; \u5355\u6b21\u68c0\u7d22\u590d\u7528 (pipeline+KG \u4e00\u8f6e\u53ea 1 \u6b21)."""
+
+    def test_rag_disabled_no_query(self):
+        rag = _FakeRag([{"document": "\u5386\u53f2", "score": 0.9}])
+        p = _pipeline(rag=rag, rag_enabled=False)
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+        self.assertEqual(rag.calls, 0)              # \u4e0d\u67e5\u5411\u91cf\u5e93
+        self.assertTrue(si.trace.get("rag_disabled"))
+        self.assertEqual(si.trace.get("rag"), [])
+        # \u51b3\u7b56\u65e0 RAG \u5206\u6570\uff08\u4ecd\u53ef\u56de\u590d\uff1a@\u6216\u901a\u8fc7 fake interjection\uff09
+        self.assertEqual(si.action, "reply")
+
+    def test_single_query_reused_by_kg(self):
+        """\u4e00\u8f6e pipeline+KG \u53ea\u8c03\u4e00\u6b21 rag.query\uff08KG \u6536\u5230 external hits\uff09\u3002"""
+        rag = _FakeRag([
+            {"document": "h1", "score": 0.9},
+            {"document": "h2", "score": 0.8},
+            {"document": "h3", "score": 0.7},
+        ])
+        received = {}
+
+        class FakeKG:
+            async def query(self, ctx, external_dense_hits=None):
+                received["ext"] = external_dense_hits
+                return None
+
+        p = _pipeline(rag=rag, kg=FakeKG())
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+        self.assertEqual(rag.calls, 1)              # \u53ea\u67e5\u4e00\u6b21
+        # \u5168\u91cf\u4f20\u7ed9 KG\uff08\u4e0d\u662f\u622a\u65ad\u7684 top3\uff09
+        self.assertEqual(len(received.get("ext") or []), 3)
+        # trace \u8bb0\u5168\u91cf
+        self.assertEqual(len(si.trace.get("rag") or []), 3)
+
+    def test_trace_full_hits(self):
+        """trace \u8bb0\u5168\u91cf\u547d\u4e2d\uff08LLM \u770b\u5230\u4ec0\u4e48 trace \u5c31\u8bb0\u4ec0\u4e48\uff09\u3002"""
+        rag = _FakeRag([{"document": f"h{i}", "score": 0.9 - i / 10} for i in range(8)])
+        p = _pipeline(rag=rag)
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+        self.assertEqual(len(si.trace.get("rag") or []), 8)
 
 
 if __name__ == "__main__":

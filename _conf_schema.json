@@ -59,6 +59,12 @@
     "type": "object",
     "description": "RAG 检索参数",
     "items": {
+      "enabled": {
+        "type": "int",
+        "description": "RAG/BGE 总开关（A7③：0 关闭 / 1 开启）",
+        "hint": "0 时完全不查向量库：决策无 RAG 分数、Gate 无参考片段、KG 退化 BM25+entity（无 BGE）。用于 A/B 验证 RAG 价值（trace 数据评估）。",
+        "default": 1
+      },
       "k_retrieve": {
         "type": "int",
         "description": "向量库召回 top-k",
@@ -302,6 +308,18 @@
         "type": "string",
         "description": "视觉模型思考强度（low/off/high；实测 low+512 tokens 最稳）",
         "default": "low"
+      },
+      "cache_persist": {
+        "type": "int",
+        "description": "同图描述持久哈希缓存（A7③：0 关闭 / 1 开启）",
+        "hint": "跨重启复用图片描述（sha256 → 描述，落 image_desc_cache.json）。重复表情包只识图一次，省视觉调用与延迟。",
+        "default": 1
+      },
+      "cache_persist_max": {
+        "type": "int",
+        "description": "持久缓存上限条目数（LRU 淘汰最久未使用）",
+        "hint": "超限淘汰最久未命中的条目。命中刷新时间。evicted 计数可在 snapshot 观察，判断是否调大。",
+        "default": 2000
       }
     }
   },

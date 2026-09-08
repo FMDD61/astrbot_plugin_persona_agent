@@ -95,6 +95,7 @@ class PersonaPipeline:
         gate_recent_n: int = 15,
         debounce_sec: float = 0.5,
         max_generation_tries: int = 1,
+        rag_enabled: bool = True,
     ) -> None:
         self.style = style
         self.rag = rag
@@ -113,6 +114,9 @@ class PersonaPipeline:
         self._rag_top_n = int(rag_top_n)
         self._gate_recent_n = int(gate_recent_n)
         self._debounce_sec = float(debounce_sec)
+        # A7③: RAG/BGE 总开关。0 时完全不查向量库（决策无分数、Gate 无参考、
+        # KG 走退化分支）。与 KGProvider.dense_enabled 联动（main 构造时同源）。
+        self.rag_enabled = bool(rag_enabled)
 
     # ------------------------------------------------------------------ run
 
@@ -151,28 +155,36 @@ class PersonaPipeline:
         if self.buffer is not None:
             live_ctx = self.buffer.format_recent(max_lines=20)
 
-        # ---- RAG ----
+        # ---- RAG（A7③：总开关 + 单次检索全量复用）----
         top_score = 0.0
         hits: list[dict] = []
-        if self.rag is not None:
+        hits_all: list[dict] = []
+        rag_disabled = not self.rag_enabled or self.rag is None
+        if not rag_disabled:
             try:
-                hits = await asyncio.to_thread(
+                # 单次检索：一次查全量（top_n_final=k 拿回全部 k 条），本模块
+                # 截取 topN 供决策/Gate，全量 hits_all 传给 KGProvider 做融合
+                # （KG 不再自查 rag → 每轮只一次 BGE 编码 + Chroma 查询）。
+                hits_all = await asyncio.to_thread(
                     self.rag.query,
                     live_ctx + ("\n" + text if text else ""),
                     k=self._rag_k,
-                    top_n_final=self._rag_top_n,
+                    top_n_final=self._rag_k,
                 )
+                hits = hits_all[: self._rag_top_n]
                 if hits:
                     top_score = float(hits[0].get("score", 0.0))
             except Exception as e:
                 trace["rag_error"] = f"{type(e).__name__}: {e}"
-        # ★ trace: BGE/RAG 命中原文（评估 RAG 价值/污染的关键）
+        # ★ trace: 记全量命中原文（LLM/决策实际所见；A/B 评估 RAG 价值的关键，
+        #   不过度截断——用户决策：看到多少记多少，规模可控）
+        trace["rag_disabled"] = rag_disabled
         trace["rag"] = [
             {
                 "document": (h.get("document") or "")[:300],
                 "score": h.get("score"),
             }
-            for h in (hits or [])[: self._rag_top_n + 1]
+            for h in (hits_all or [])
         ]
 
         # ---- emotion ----
@@ -280,7 +292,7 @@ class PersonaPipeline:
                     trace=trace,
                 )
 
-        # ---- KG ----
+        # ---- KG（A7③：外部传入 dense hits → KG 不自查，单次检索复用）----
         kg_content = ""
         if self.kg_provider is not None:
             try:
@@ -289,12 +301,17 @@ class PersonaPipeline:
                     if self.session_mgr is not None
                     else []
                 )
-                kg_result = await self.kg_provider.query(KGContext(
-                    recent_messages=recent,
-                    current_speaker=alias,
-                    current_text=text,
-                    group_id=group_id,
-                ))
+                kg_result = await self.kg_provider.query(
+                    KGContext(
+                        recent_messages=recent,
+                        current_speaker=alias,
+                        current_text=text,
+                        group_id=group_id,
+                    ),
+                    # 全量 hits（若 RAG 开且有结果）；RAG 关/空则 None →
+                    # KG 内部自查 fallback 或走退化分支（dense_enabled 由 main 同源设置）。
+                    external_dense_hits=hits_all if hits_all else None,
+                )
                 kg_content = kg_result.content if kg_result else ""
             except Exception as e:
                 trace["kg_error"] = f"{type(e).__name__}: {e}"

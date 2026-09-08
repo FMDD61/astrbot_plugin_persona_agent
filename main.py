@@ -143,12 +143,15 @@ class PersonaAgent(Star):
         if restored:
             logger.info(f"[persona_agent] restored sessions: {restored}")
         self._memory_store = MemoryStore(str(self.data_dir))
+        # A7③: dense_enabled 与 rag.enabled 同源（reload 时重建 KG 生效）
+        rag_on = int(rag_cfg.get("enabled", 1)) == 1
         self.kg_provider = MultiSignalKGProvider(
             rag=self.rag,
             store=self._memory_store,
             k_retrieve=int(rag_cfg.get("k_retrieve", 8)),
             top_n_final=int(rag_cfg.get("top_n_final", 3)),
             max_chars=int(rag_cfg.get("max_example_chars", 400)),
+            dense_enabled=rag_on,
         )
         emotion_cfg = self.config.get("emotion", {}) or {}
         if int(emotion_cfg.get("enabled", 1)) == 1:
@@ -279,6 +282,39 @@ class PersonaAgent(Star):
         # A7: assemble the shared decision/generation pipeline (main + testbed
         # run the same code path). Generate callback wraps the LLM call with
         # per-event provider resolution done in main.
+        self._build_pipeline()
+        logger.info("[persona_agent] pipeline ready (shared decision/generation path)")
+
+        logger.info(
+            f"[persona_agent] ready: target_group={self.target_group_id} "
+            f"test_mode={self.test_mode} test_group={self.test_group_id} "
+            f"bot={self.bot_qq} style_src={self.style_source_qq} "
+            f"reply_on_at={self.config.get('reply_on_at')} "
+            f"active_interjection={self.config.get('active_interjection')}"
+        )
+
+    async def terminate(self) -> None:
+        logger.info("[persona_agent] terminating")
+        if self.session_mgr is not None:
+            try:
+                self.session_mgr.save_all()
+            except Exception as e:
+                logger.warning(f"[persona_agent] session save on terminate failed: {e}")
+        # A7③: flush vision 持久哈希缓存（脏数据落盘）
+        if self._vision is not None:
+            try:
+                self._vision.flush()
+            except Exception as e:
+                logger.warning(f"[persona_agent] vision persist flush failed: {e}")
+
+    # ----------------------------------------------------------------- helpers
+
+    def _build_pipeline(self) -> None:
+        """Assemble (or rebuild on /reload_persona_config) the shared pipeline.
+
+        A7③: reads rag.enabled — 0 时 pipeline 不查 RAG、KG 走退化分支。
+        Reload 时重建让开关即时生效（与 initialize 同一构造逻辑，防漂移）。
+        """
         rag_cfg = self.config.get("rag", {}) or {}
         gate_cfg = self.config.get("gate", {}) or {}
         self._pipeline = PersonaPipeline(
@@ -298,26 +334,8 @@ class PersonaAgent(Star):
             rag_top_n=int(rag_cfg.get("top_n_final", 3)),
             gate_recent_n=int(gate_cfg.get("recent_n", 15)),
             debounce_sec=0.5,
+            rag_enabled=int(rag_cfg.get("enabled", 1)) == 1,
         )
-        logger.info("[persona_agent] pipeline ready (shared decision/generation path)")
-
-        logger.info(
-            f"[persona_agent] ready: target_group={self.target_group_id} "
-            f"test_mode={self.test_mode} test_group={self.test_group_id} "
-            f"bot={self.bot_qq} style_src={self.style_source_qq} "
-            f"reply_on_at={self.config.get('reply_on_at')} "
-            f"active_interjection={self.config.get('active_interjection')}"
-        )
-
-    async def terminate(self) -> None:
-        logger.info("[persona_agent] terminating")
-        if self.session_mgr is not None:
-            try:
-                self.session_mgr.save_all()
-            except Exception as e:
-                logger.warning(f"[persona_agent] session save on terminate failed: {e}")
-
-    # ----------------------------------------------------------------- helpers
 
     def _is_target_group(self, event: AstrMessageEvent) -> bool:
         gid = event.get_group_id()
@@ -442,10 +460,12 @@ class PersonaAgent(Star):
 
     @filter.command("reload_persona_config")
     async def cmd_reload(self, event: AstrMessageEvent):
-        """Apply config toggles to the live InterjectionManager.
+        """Apply config toggles to the live InterjectionManager (+ rebuild
+        pipeline for rag.enabled etc.).
 
         The 7 editable JSON files (style profile etc.) auto-hot-reload via
-        mtime; this command only rebinds the interjection toggles.
+        mtime; this command rebinds interjection toggles and rebuilds the
+        shared pipeline / KG so `rag.enabled` (A7③) takes effect.
         """
         if self.interjection is None:
             yield event.plain_result("插件尚未完成初始化。")
@@ -456,10 +476,20 @@ class PersonaAgent(Star):
             reply_on_at=int(self.config.get("reply_on_at", 1)),
             topic_bank_enabled=int(topic_cfg.get("enabled", 0)),
         )
+        # A7③: rag.enabled 可能变更 → 重建 KG(dense_enabled) + pipeline
+        try:
+            rag_cfg = self.config.get("rag", {}) or {}
+            rag_on = int(rag_cfg.get("enabled", 1)) == 1
+            if self.kg_provider is not None:
+                self.kg_provider.dense_enabled = rag_on
+            self._build_pipeline()
+        except Exception as e:
+            logger.warning(f"[persona_agent] reload pipeline rebuild failed: {e}")
         yield event.plain_result(
             f"已重载: reply_on_at={self.config.get('reply_on_at')} "
             f"active_interjection={self.config.get('active_interjection')} "
-            f"topic_bank.enabled={topic_cfg.get('enabled', 0)}"
+            f"topic_bank.enabled={topic_cfg.get('enabled', 0)} "
+            f"rag.enabled={int((self.config.get('rag') or {}).get('enabled', 1))}"
         )
 
     @filter.command("bind_dream")
@@ -1059,6 +1089,10 @@ class PersonaAgent(Star):
                 logger.warning("[persona_agent] vision init skipped: provider has no api_base/key")
                 return
             vcfg = self.config.get("vision", {}) or {}
+            # A7③: 持久哈希缓存（跨重启复用图片描述；cache_persist=0 则仅内存 TTL）
+            persist_path = None
+            if int(vcfg.get("cache_persist", 1)) == 1:
+                persist_path = str(self.data_dir / "image_desc_cache.json")
             self._vision = VisionService(
                 api_base=api_base,
                 api_key=str(keys[0]),
@@ -1067,6 +1101,8 @@ class PersonaAgent(Star):
                 cache_ttl=float(vcfg.get("cache_ttl_sec", 30)),
                 desc_max_chars=int(vcfg.get("desc_max_chars", 120)),
                 reasoning_effort=str(vcfg.get("reasoning_effort", "low")),
+                persist_path=persist_path,
+                persist_max=int(vcfg.get("cache_persist_max", 2000)),
             )
             logger.info(f"[persona_agent] vision service ready (model={self._vision._model})")
         except Exception as e:
