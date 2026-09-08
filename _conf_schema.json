@@ -342,6 +342,17 @@
         "type": "float",
         "description": "同群情绪缓存时长（秒）",
         "default": 30
+      },
+      "temperature": {
+        "type": "float",
+        "description": "情绪分析温度（A7④：结构化 JSON，低温保稳定）",
+        "default": 0.2
+      },
+      "reasoning_effort": {
+        "type": "string",
+        "description": "情绪分析思考强度（A7④：off/low/medium/high）",
+        "hint": "结构化任务默认 off；网关不认 off 时映射 none。",
+        "default": "off"
       }
     }
   },
@@ -402,6 +413,17 @@
         "type": "int",
         "description": "决策时可参考的 RAG 风格片段上限（条）",
         "default": 3
+      },
+      "temperature": {
+        "type": "float",
+        "description": "GateLLM 温度（A7④：结构化判断/未来工具选择，低温保稳定）",
+        "default": 0.2
+      },
+      "reasoning_effort": {
+        "type": "string",
+        "description": "GateLLM 思考强度（A7④：off/low/medium/high）",
+        "hint": "结构化任务默认 off；网关不认 off 时映射 none。",
+        "default": "off"
       }
     }
   },
@@ -461,6 +483,12 @@
         "type": "int",
         "description": "回复最大 token 数",
         "default": 256
+      },
+      "reasoning_effort": {
+        "type": "string",
+        "description": "RP 主生成思考强度（A7④：off/low/medium/high）",
+        "hint": "off=关闭思考（用户实测角色扮演效果最佳）。网关不认 off 时自动映射 none。",
+        "default": "off"
       }
     }
   }
