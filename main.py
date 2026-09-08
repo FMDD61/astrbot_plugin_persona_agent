@@ -33,6 +33,7 @@ from .services.text_style import (
     RE_REPLY_MARKER,
 )
 from .services import text_style
+from .services.llm_params import reasoning_value
 from .services.style_profile import StyleProfile
 from .services.rag_service import RagService
 from .services.interjection import (
@@ -968,6 +969,11 @@ class PersonaAgent(Star):
         gen_kwargs = {}
         if temperature is not None:
             gen_kwargs["temperature"] = temperature
+        # A7④: RP 思考强度（llm.reasoning_effort，默认 off——用户实测角色效果最佳；
+        # 采样参数不进 prompt，不破坏前缀缓存）。网关不认 off 时 _reasoning_value 映射 none。
+        gen_kwargs["reasoning_effort"] = reasoning_value(
+            (self.config.get("llm") or {}).get("reasoning_effort", "off")
+        )
         try:
             resp = await self.context.llm_generate(
                 chat_provider_id=provider_id,
@@ -1148,14 +1154,20 @@ class PersonaAgent(Star):
             logger.warning(f"[persona_agent] auto-add member failed: {e}")
 
     async def _emotion_llm(self, prompt: str) -> str:
-        """G10: emotion analysis call (3s timeout enforced by the provider)."""
+        """G10: emotion analysis call (3s timeout enforced by the provider).
+
+        A7④: 结构化 JSON 任务 → 低温(0.2) + 思考 off（配置可调），输出稳定。
+        """
         provider = (self.config.get("llm") or {}).get("provider_id", "") or self._last_provider_id
         if not provider:
             raise RuntimeError("no LLM provider available for emotion")
+        ecfg = self.config.get("emotion", {}) or {}
         resp = await self.context.llm_generate(
             chat_provider_id=provider,
             prompt=prompt,
             system_prompt=EMOTION_SYSTEM_PROMPT,
+            temperature=float(ecfg.get("temperature", 0.2)),
+            reasoning_effort=reasoning_value(ecfg.get("reasoning_effort", "off")),
         )
         return (getattr(resp, "completion_text", "") or "").strip()
 
@@ -1165,14 +1177,18 @@ class PersonaAgent(Star):
         Shares the provider resolution pattern of _emotion_llm but uses the
         gate-specific system prompt. Failures surface as exceptions to
         GateService, which converts them to conservative silence.
+        A7④: 结构化判断/未来工具选择 → 低温(0.2) + 思考 off（配置可调）。
         """
         provider = (self.config.get("llm") or {}).get("provider_id", "") or self._last_provider_id
         if not provider:
             raise RuntimeError("no LLM provider available for gate")
+        gcfg = self.config.get("gate", {}) or {}
         resp = await self.context.llm_generate(
             chat_provider_id=provider,
             prompt=prompt,
             system_prompt=GATE_SYSTEM_PROMPT,
+            temperature=float(gcfg.get("temperature", 0.2)),
+            reasoning_effort=reasoning_value(gcfg.get("reasoning_effort", "off")),
         )
         return (getattr(resp, "completion_text", "") or "").strip()
 
