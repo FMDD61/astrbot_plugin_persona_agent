@@ -356,6 +356,13 @@ def main() -> int:
     parser.add_argument("--top-phrases", type=int, default=200)
     parser.add_argument("--top-emojis", type=int, default=100)
     parser.add_argument("--top-members", type=int, default=80)
+    parser.add_argument(
+        "--daily-budget", type=float, default=2400.0,
+        help=("机器人全天发言预算上限（宽松保险丝，非精确限额）。"
+              "= 风格源日均发言量(2026 实测单群 200+) × 系数；旧值 24 使低谷"
+              "小时预算 <1 条/时结构性静音（2026-09-09 复盘：0.51/0.16/0.0）。"
+              "真实发言节奏由决策门槛(rag.score_threshold 等)控制，预算仅防失控。"),
+    )
     args = parser.parse_args()
 
     data = Path(args.data)
@@ -445,8 +452,8 @@ def main() -> int:
     # --- hourly distribution ---
     hour_counts = {str(h): int(a["hour_counter"].get(h, 0)) for h in range(24)}
     total_h = sum(hour_counts.values()) or 1
-    # default daily budget (interjection upper cap, conservative)
-    daily_budget = 24
+    # default daily budget (宽松保险丝：防失控不设精限额；实际节奏由决策门槛控制)
+    daily_budget = args.daily_budget
     budget = {}
     for h in range(24):
         share = hour_counts[str(h)] / total_h
