@@ -11,6 +11,9 @@ Spec: docs/specs/chatbox-rp-tool-dual-channel.md §4.5 + A7。
     本模块不接触 astrbot event / context。
   - trace: 每次 run 返回 SendIntent.trace（dict），由调用方落盘 trace_log.jsonl；
     本模块无 IO（可离线单测）。
+  - 时钟注入（A7④ 离线重放）：`now_utc_fn` 可选；缺省 time.time。测试台把
+    虚拟时钟推到场景消息时刻，硬闸预算/冷却/RAG recency 按"当时"而非"回放时"
+    决策（与线上语义一致）。main 不传 → 行为不变。
 """
 from __future__ import annotations
 
@@ -96,6 +99,7 @@ class PersonaPipeline:
         debounce_sec: float = 0.5,
         max_generation_tries: int = 1,
         rag_enabled: bool = True,
+        now_utc_fn: Optional[Callable[[], float]] = None,
     ) -> None:
         self.style = style
         self.rag = rag
@@ -117,6 +121,11 @@ class PersonaPipeline:
         # A7③: RAG/BGE 总开关。0 时完全不查向量库（决策无分数、Gate 无参考、
         # KG 走退化分支）。与 KGProvider.dense_enabled 联动（main 构造时同源）。
         self.rag_enabled = bool(rag_enabled)
+        # A7④: 时钟注入（离线重放按场景时刻决策；缺省真实时钟）
+        self._now_utc = now_utc_fn or time.time
+
+    def _now(self) -> float:
+        return float(self._now_utc())
 
     # ------------------------------------------------------------------ run
 
@@ -125,9 +134,10 @@ class PersonaPipeline:
         任何内部失败都收敛为 silent + trace 记录 fallback。"""
         import asyncio
 
+        _now_utc = self._now()
         trace: dict = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "ts_epoch": round(time.time(), 3),
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now_utc)),
+            "ts_epoch": round(_now_utc, 3),
             "group_id": inp.group_id,
             "input": {
                 "text": inp.text,
@@ -169,6 +179,7 @@ class PersonaPipeline:
                     self.rag.query,
                     live_ctx + ("\n" + text if text else ""),
                     k=self._rag_k,
+                    now_utc=self._now(),
                     top_n_final=self._rag_k,
                 )
                 hits = hits_all[: self._rag_top_n]
@@ -215,12 +226,12 @@ class PersonaPipeline:
         }
 
         # ---- interjection hard gate ----
-        last_msg_ts = self.buffer.last_ts() if self.buffer is not None else time.time()
+        last_msg_ts = self.buffer.last_ts() if self.buffer is not None else self._now()
         decision: Decision
         if self.interjection is not None:
             decision = self.interjection.decide(
                 group_id=group_id,
-                now_utc=time.time(),
+                now_utc=self._now(),
                 is_at_me=inp.is_at,
                 sender_uin=inp.sender_uin,
                 last_group_msg_ts=last_msg_ts,
