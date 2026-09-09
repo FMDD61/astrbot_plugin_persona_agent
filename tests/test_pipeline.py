@@ -51,10 +51,12 @@ class _FakeRag:
         self._hits = hits
         self.last_query = None
         self.calls = 0
+        self.last_now_utc = None
 
-    def query(self, ctx, k=8, top_n_final=3):
+    def query(self, ctx, k=8, top_n_final=3, now_utc=None):
         self.calls += 1
         self.last_query = ctx
+        self.last_now_utc = now_utc
         return [dict(h) for h in self._hits[:top_n_final]]
 
 

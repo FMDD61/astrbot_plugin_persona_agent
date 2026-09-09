@@ -74,6 +74,7 @@ class LLMEmotionProvider(EmotionProvider):
         timeout: float = 3.0,
         cache_ttl: float = 30.0,
         recent_n: int = 12,
+        now_utc_fn=None,
     ) -> None:
         import asyncio
         import threading as _threading
@@ -83,6 +84,8 @@ class LLMEmotionProvider(EmotionProvider):
         self._recent_n = int(recent_n)
         self._cache: dict[str, tuple[float, EmotionState]] = {}
         self._lock = _threading.Lock()
+        # A7④: 时钟注入（离线重放按场景时刻推进情绪缓存；缺省真实时钟）
+        self._now = now_utc_fn or time.time
 
     def _build_prompt(self, recent_msgs: list[dict], speaker: str, text: str) -> str:
         lines = []
@@ -122,7 +125,7 @@ class LLMEmotionProvider(EmotionProvider):
         kg_ctx: Optional["KGContext"] = None,
     ) -> EmotionState:
         import asyncio as _asyncio
-        now = time.time()
+        now = self._now()
         with self._lock:
             hit = self._cache.get(group_id)
             if hit and now - hit[0] < self._cache_ttl:
@@ -136,5 +139,5 @@ class LLMEmotionProvider(EmotionProvider):
         except Exception:
             st = EmotionState.neutral()
         with self._lock:
-            self._cache[group_id] = (time.time(), st)
+            self._cache[group_id] = (self._now(), st)
         return st

@@ -76,6 +76,7 @@ class GateService:
         recent_n: int = 15,
         max_rag_hits: int = 3,
         system_prompt: str = GATE_SYSTEM_PROMPT,
+        now_utc_fn: Optional[Callable[[], float]] = None,
     ) -> None:
         self._llm_fn = llm_fn
         self._timeout = float(timeout)
@@ -86,6 +87,8 @@ class GateService:
         self._lock = threading.Lock()
         # per-group decision cache for cooldown-window reuse
         self._cache: dict[str, tuple[float, GateDecision]] = {}
+        # A7④: 时钟注入（离线重放按场景时刻推进节流窗口；缺省真实时钟）
+        self._now = now_utc_fn or time.time
 
     # ---- prompt building ----
 
@@ -202,7 +205,7 @@ class GateService:
         """
         import asyncio
 
-        now = time.time()
+        now = self._now()
         cache_key = f"{group_id}:{'@' if is_at else '-'}"
         with self._lock:
             hit = self._cache.get(cache_key)
