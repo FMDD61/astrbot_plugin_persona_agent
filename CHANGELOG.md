@@ -11,6 +11,17 @@
 
 ## [Unreleased]
 
+### Added (2026-09-09, A7 批次⑥：离线测试台 replay_scene — A7④)
+- **tools/replay_scene.py 双子命令**：
+  - `extract`（开发机，两级选样）：第一级 ijson 流式抽 merge.json 时间窗（UTC+8，`--start/--end`）→ 小文件（`[2025-10-07 20:03:12][小红]: 内容`，多行消息压 `⏎`，风格源即普通群友无特殊标记）；第二级 `--from-draft + --range "N..M"` 按行号截取 → 场景 JSON（`{scene_id, group_id, messages[{ts epoch, uin, name, text}], meta}`）
+  - `run`（部署机，真 services 重放）：读场景 + 生产插件数据目录 + cmd_config → import services/* 自组构造（不 import main.py）→ 按场景时间线每条消息喂 PersonaPipeline（硬闸/Gate 决定回不回，回了才生成，与线上同决策）→ dsh 风格日志（`# replay:` 头 + `━━━ [#n] 时间 别名: 原文 ━━━` + 【决策】reply/silent/topic + RAG top + 回复）
+- **凭据/模型跟随（不硬编码 provider id）**：读 AstrBot cmd_config `provider_sources` 第一个 enable chat provider 的 api_base/key（key 只内存，绝不落盘/打印）；model = CLI `--model` > env `PERSONA_TEST_MODEL`；插件 config 读 `data/config/`（`--plugin-config` 覆盖）
+- **隔离红线**：重放 session/usages/logs 全写 `--tmp`（默认 out 同目录 `replay_tmp_<scene_id>`）；只读生产风格/chroma；`memory_store.db`（±wal/shm）复制到 tmp 副本再打开（重放中 ingest 自积累、生产零写）
+- **services 时钟注入（A7④ 重放语义）**：pipeline/gate/emotion 加可选 `now_utc_fn`（缺省 time.time，main 不传行为不变）——重放虚拟时钟推到消息时刻，硬闸预算/冷却、Gate 节流、情绪缓存、RAG recency 按"当时"决策
+- CLI 开关：`--rag-off` / `--no-gate` / `--gate-enabled`（A/B 对照）；RAG/示例开关同 config
+- 补 `tests/test_replay_scene.py`（14 例：extract 时间窗/草稿行/range 截取/场景 JSON；run fake services：逐条走 pipeline/硬闸与 gate silent 不生成/回复续 session/生产零写/日志渲染）；测试 155 → **169 全绿**
+- 设计文档：`docs/specs/a7-step4-replay-scene.md`（已同步落地细节与冒烟结果）
+
 ### Added (2026-09-08, A7 批次⑤：LLM 参数矩阵 + Gate 安全阀化 — A7④)
 - **LLM 参数矩阵**: `_conf_schema` 加 `llm.reasoning_effort`(默认 off)、`gate.temperature`(0.2)+`gate.reasoning_effort`(off)、`emotion.temperature`(0.2)+`emotion.reasoning_effort`(off)；`services/llm_params.py` `reasoning_value()` 容错映射（off→none，未知→none）；RP/Gate/Emotion 三处 `llm_generate` 透传 temperature+reasoning_effort（采样参数不进 prompt，不破坏前缀缓存）；Diary/Summary 跟随 RP（同 system_prompt）
 - **Gate 安全阀化（conflict 并入）**: Gate 单 prompt 双任务（参与度 reply + 安全 conflict），输出 `{reply, conflict, reason}`；conflict=true → 强制不发言（防煽风点火）；**@ 也过 Gate**（@ 提示通常应回但冲突除外；缓存键含 is_at 不串）；**TOPIC 也过 Gate**（刚吵完的冷场不主动惹事）；Gate 节流窗口内冲突结果复用
