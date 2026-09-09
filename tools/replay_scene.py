@@ -212,7 +212,15 @@ def _parse_draft_local(ts_s: str) -> Optional[float]:
 
 
 def _extract_range(args: argparse.Namespace) -> int:
-    """第二级：草稿小文件按行号起止截取 → 场景 JSON。"""
+    """第二级：草稿小文件按行号起止截取 → 场景 JSON。
+
+    无 --merge：仅解析 draft 文本行（uin 为空，run 端按 name 尽力反查）。
+    有 --merge：先读 draft 取起止行的时间戳作为时间边界，再流式扫 merge.json
+    重建该区间真实消息（带 sender.uin/name、message_id）——发言人识别精确，
+    风格源等昵称变体也能正确对到 QQ 号。行号范围与 merge 重建按 ts 对齐：
+    重建取 [首行 ts, 末行 ts] 闭区间（draft 是 merge 消息的子集投影，行号即
+    ts 有序，区间内 merge 消息数与 draft 行数一致——除非 draft 漏了非文本）。
+    """
     draft = Path(args.from_draft)
     if not draft.exists():
         print(f"error: draft not found: {draft}", file=sys.stderr)
@@ -234,8 +242,19 @@ def _extract_range(args: argparse.Namespace) -> int:
     if start_n > total:
         print(f"error: draft 只有 {total} 行，起止 {start_n} 越界", file=sys.stderr)
         return 1
-    picked = lines[start_n - 1: end_n]
 
+    scene_id = args.scene_id or f"{args.group or DEFAULT_GROUP_ID}-{Path(draft).stem}"
+    meta = {
+        "range": f"{start_n}..{end_n}",
+        "source_draft": str(draft),
+    }
+
+    merge_opt = getattr(args, "merge", "") or ""
+    if merge_opt:
+        return _extract_range_from_merge(args, draft, lines, start_n, end_n,
+                                         scene_id, meta)
+
+    picked = lines[start_n - 1: end_n]
     messages = []
     for ln in picked:
         mm = re.match(r"^\[([0-9-]+ [0-9:]+)\]\[([^\]]*)\]: (.*)$", ln)
@@ -246,28 +265,85 @@ def _extract_range(args: argparse.Namespace) -> int:
         messages.append(
             {
                 "ts": epoch if epoch is not None else ts_s,
-                "uin": "",  # extract 未知 uin；run 以 name 优先解析成员
+                "uin": "",  # 无 --merge 时未知 uin；run 以 name 尽力反查成员
                 "name": name,
                 "text": text,
             }
         )
+    meta["n_msgs"] = len(messages)
 
-    scene = {
-        "scene_id": args.scene_id or f"{args.group or DEFAULT_GROUP_ID}-{Path(draft).stem}",
-        "group_id": str(args.group or DEFAULT_GROUP_ID),
-        "messages": messages,
-        "meta": {
-            "range": f"{start_n}..{end_n}",
-            "n_msgs": len(messages),
-            "source_draft": str(draft),
-        },
-    }
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
-    tmp.write_text(json.dumps(scene, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps({
+        "scene_id": scene_id,
+        "group_id": str(args.group or DEFAULT_GROUP_ID),
+        "messages": messages,
+        "meta": meta,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, out)
     print(f"[extract] range {start_n}..{end_n} of {total} draft lines → {len(messages)} msgs")
+    print(f"  written {out}")
+    return 0
+
+
+def _extract_range_from_merge(args, draft, lines, start_n, end_n,
+                              scene_id: str, meta: dict) -> int:
+    """有 --merge 的重建：以 draft 首末行 ts 为界流式扫 merge 取真实消息（带 uin）。"""
+    import ijson
+
+    def _line_ts(ln: str):
+        mm = re.match(r"^\[([0-9-]+ [0-9:]+)\]", ln)
+        return _parse_draft_local(mm.group(1)) if mm else None
+
+    first_ts = _line_ts(lines[start_n - 1])
+    last_ts = _line_ts(lines[end_n - 1])
+    if first_ts is None or last_ts is None:
+        print("error: 起止行时间解析失败（draft 行格式异常）", file=sys.stderr)
+        return 1
+    if last_ts < first_ts:
+        print("error: 末行时间早于首行（draft 应按时间升序）", file=sys.stderr)
+        return 1
+
+    group = str(args.group or DEFAULT_GROUP_ID)
+    messages = []
+    with open(Path(args.merge), "rb") as fh:
+        for msg in ijson.items(fh, "messages.item"):
+            r = msg.get("receiver") or {}
+            if not (r.get("type") == "group" and str(r.get("uid")) == group):
+                continue
+            if msg.get("messageType") != 2 or msg.get("isSystemMessage") or msg.get("isRecalled"):
+                continue
+            ts = _parse_iso(msg.get("timestamp") or "")
+            if ts is None or ts < first_ts:
+                continue
+            if ts > last_ts:
+                break  # merge.json 时间有序，可早停
+            text = _extract_text(msg).strip()
+            if not text:
+                continue
+            s = msg.get("sender") or {}
+            messages.append({
+                "ts": round(ts, 3),
+                "uin": str(s.get("uin") or ""),
+                "name": str(s.get("name") or ""),
+                "text": text,
+                "message_id": str(msg.get("messageId") or ""),
+            })
+
+    meta["n_msgs"] = len(messages)
+    meta["range_ts"] = [first_ts, last_ts]
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    tmp.write_text(json.dumps({
+        "scene_id": scene_id,
+        "group_id": group,
+        "messages": messages,
+        "meta": meta,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, out)
+    print(f"[extract] merge-rebuild {start_n}..{end_n} → {len(messages)} msgs (带 uin/message_id)")
     print(f"  written {out}")
     return 0
 
@@ -785,7 +861,7 @@ def run_main(args: argparse.Namespace) -> int:
 
 # ---------------------------------------------------------------------------
 def _add_extract_parser(sp) -> None:
-    sp.add_argument("--merge", default="merge.json", help="merge.json 路径")
+    sp.add_argument("--merge", default="", help="merge.json 路径（第二级给则按 ts 重建场景带 uin）")
     sp.add_argument("--group", default=DEFAULT_GROUP_ID, help="目标群 uid")
     sp.add_argument("--start", help="窗口起点 'YYYY-MM-DD HH:MM'（本地 tz）")
     sp.add_argument("--end", help="窗口终点 'YYYY-MM-DD HH:MM'")

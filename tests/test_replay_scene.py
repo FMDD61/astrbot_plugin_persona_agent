@@ -144,6 +144,7 @@ class TestExtractRange(unittest.TestCase):
         a.out = str(Path(tmp) / out_name)
         a.group = "123456789"
         a.scene_id = ""
+        a.merge = ""
         return a
 
     def test_range_json(self):
@@ -167,6 +168,51 @@ class TestExtractRange(unittest.TestCase):
         self.assertEqual(_extract_range(self._args(tmp, d, "2..99")), 0)
         data = json.loads((Path(tmp) / "scene.json").read_text("utf-8"))
         self.assertEqual(len(data["messages"]), 2)
+
+    def test_range_merge_rebuild_carries_uin(self):
+        """给 --merge：按 draft 首末行 ts 重建，消息带 uin/message_id。"""
+        import tools.replay_scene as replay_scene
+        import sys as _sys
+        tmp = tempfile.mkdtemp()
+        # 假 merge：3 条消息，ts 覆盖 draft 时间（draft 是其中子集）
+        msgs = [
+            {"timestamp": "2025-10-07T12:03:09Z", "messageType": 2,
+             "receiver": {"uid": "123456789", "type": "group"},
+             "sender": {"uin": "234567", "name": "小明"},
+             "content": {"text": "风格源消息"}, "messageId": "m1"},
+            {"timestamp": "2025-10-07T12:05:00Z", "messageType": 2,
+             "receiver": {"uid": "123456789", "type": "group"},
+             "sender": {"uin": "1002", "name": "小红"},
+             "content": {"text": "普通消息"}, "messageId": "m2"},
+        ]
+        merge = Path(tmp) / "merge.json"
+        merge.write_text(json.dumps({"messages": msgs}), encoding="utf-8")
+
+        # draft 行号 1..2 对应上面两条
+        d = Path(tmp) / "draft.txt"
+        d.write_text("[2025-10-07 20:03:09][小明]: 风格源消息\n"
+                     "[2025-10-07 20:05:00][小红]: 普通消息\n", encoding="utf-8")
+
+        real = _sys.modules.get("ijson")
+        _sys.modules["ijson"] = _FakeIJ
+        try:
+            args = self._args(tmp, d, "1..2")
+            args.merge = str(merge)
+            args.out = str(Path(tmp) / "s2.json")
+            rc = _extract_range(args)
+            self.assertEqual(rc, 0)
+        finally:
+            if real is None:
+                _sys.modules.pop("ijson", None)
+            else:
+                _sys.modules["ijson"] = real
+
+        data = json.loads((Path(tmp) / "s2.json").read_text("utf-8"))
+        self.assertEqual(len(data["messages"]), 2)
+        self.assertEqual(data["messages"][0]["uin"], "234567")
+        self.assertEqual(data["messages"][0]["message_id"], "m1")
+        self.assertEqual(data["messages"][0]["name"], "小明")
+        self.assertIn("range_ts", data["meta"])
 
 
 class TestReplayRun(unittest.TestCase):
