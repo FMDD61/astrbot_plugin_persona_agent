@@ -86,8 +86,8 @@ class DerivationTests(unittest.TestCase):
 
     def test_cli_host_port_override(self):
         entry, _ = llbot_config.derive_entry(
-            _astrbot_cfg(), _Args(host="10.0.0.5", port=7000))
-        self.assertEqual(entry["url"], "ws://10.0.0.5:7000/ws")
+            _astrbot_cfg(), _Args(host="198.51.100.7", port=7000))
+        self.assertEqual(entry["url"], "ws://198.51.100.7:7000/ws")
 
     def test_disabled_platform_is_reported(self):
         _, problems = llbot_config.derive_entry(_astrbot_cfg(enable=False), _Args())
