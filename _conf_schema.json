@@ -149,6 +149,11 @@
         "type": "int",
         "description": "同一人回戳冷却（秒）",
         "default": 300
+      },
+      "protocol": {
+        "type": "string",
+        "description": "协议端声明：留空=自动（action 优先 + 消息段兜底）；可选 llbot / napcat。两者出站均不支持 poke 消息段（LLBot 出站转换表无 poke 分支、NapCat 为空实现桩），必须走 group_poke action；声明后跳过注定被丢弃的段通道。适配器名恒为 aiocqhttp、无法自动识别协议端，故需人工声明。",
+        "default": ""
       }
     }
   },
