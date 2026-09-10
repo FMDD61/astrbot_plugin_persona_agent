@@ -11,6 +11,19 @@
 
 ## [Unreleased]
 
+### Fixed (2026-09-10, A7④ 复盘：致命 reasoning bug + RAG 语料 + 预算)
+- **🔴 `reasoning_effort` 致命 bug（A7 上线会让 bot 全哑）**：旧实现 off→`"none"`，实测 commandcode 网关（OpenAI 兼容 `/chat/completions`）**拒绝任何非标准取值**（none/off/minimal/disabled/false 全部 HTTP 400）→ `_generate_reply` 的 try/except 吞掉 → 返回空 → 静默。修复：`reasoning_value()` 对 off/未知返回 **None（=不发送该参数）**，仅 low/medium/high/max 透传（佐证：dsh 自身配置 `reasoningEfforts: {False: None}` 即此语义）；main.py RP/Emotion/Gate 三处在 None 时跳过 kwarg；`tools/replay_scene._chat` 同步
+- **`max_tokens` 256 → 512**：v4-flash 下思考开销（实测 141-256 reasoning tokens）会吃光预算 → content 为空（重放实测 14 次 empty generation，修复后 **0 次**）；`_conf_schema` 默认值与 hint 同步
+- **RAG 语料清洗（相关性差的主因）**：`build_dataset` 从未过滤图片占位——merge 把图片消息渲染成 `[图片: xxx.jpg]` 当文本提取，**36% 的 reply 是纯图占位**、62% 的 context 含图行，导致 RAG 命中"看不出相关性"。新增 `tools/clean_pairs.py`（删纯图 reply 对 + context 图行→`[图]` 标记 + 长度过滤）；7075 → **4704 对**，chroma 已重建（部署机 48 分钟）
+- **hourly_budget 宽松化（用户实测校准）**：`analyze_style` 的 `daily_budget` 是 v0.1 随手拍的 24（注释 "conservative"），从未按真实活跃度校准 → 低谷小时预算 <1（17 点 0.51 / 20 点 0.0）而每次 reply 消耗整数 1 → **结构性每小时 ≤1 条、低峰静音**。改为可配 `--daily-budget`（默认 **2400**，= 用户 2026 实测单群日均 200+ × 12 倍裕度），预算降级为"宽松保险丝"，真实节奏交给决策门槛；两台机数据已从 raw count 精算同步（17 点 0.51→**50.54**）。重放实测 reply 3 → 57（预算不再压制，min_gap 25s 接管节奏）
+- **重放 recency 虚高（评测口径）**：重放虚拟时钟推到场景时刻（2025-08）而语料为 2025 全年 → recency 满分 1.0，总分虚高（0.67 vs 真实时钟 0.50）。**已知口径差异**，评测时以 dense 分为准或标注时钟；阈值定 0.65（新语料下 p75≈0.644）
+
+### Added (2026-09-10, A7④ 工具与选样)
+- **`tools/find_style_windows.py`**：滑动窗口 + 最小堆找风格源最活跃的 1h 窗口 top-N（O(n) 双指针 + 前缀和统计文字/图占比；避免人工盲找全年 86 万条）。产出 5 个候选窗口（w1 08-13 16:43 最佳：55 条纯文字、群 344 条活跃）
+- **`tools/replay_scene.py` extract 第二级支持 `--merge` 重建**：draft 行只有显示名（风格源昵称是不可见字符、无昵称者显示数字 QQ），run 靠 name 反查 member_relations 只能覆盖 3/30 人 → 发言人识别失真。给 `--from-draft` 加 `--merge`：以 draft 首末行时间戳为界流式重扫 merge 重建场景（带 `sender.uin/name/message_id`）；无 `--merge` 保持原文本解析
+- **首个正式场景**：`data_out/scene_20250813_w1.json`（357 条，16:40:57–17:44:41 UTC+8，含 13% 群 bot 消息——真实场景本就有，不剔除）
+- 测试 169 → **171 全绿**（`test_llm_params` 重写为 None 哨兵语义 + extract merge 重建 1 例）
+
 ### Added (2026-09-09, A7 批次⑥：离线测试台 replay_scene — A7④)
 - **tools/replay_scene.py 双子命令**：
   - `extract`（开发机，两级选样）：第一级 ijson 流式抽 merge.json 时间窗（UTC+8，`--start/--end`）→ 小文件（`[2025-10-07 20:03:12][小红]: 内容`，多行消息压 `⏎`，风格源即普通群友无特殊标记）；第二级 `--from-draft + --range "N..M"` 按行号截取 → 场景 JSON（`{scene_id, group_id, messages[{ts epoch, uin, name, text}], meta}`）
