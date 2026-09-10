@@ -999,11 +999,14 @@ class PersonaAgent(Star):
         gen_kwargs = {}
         if temperature is not None:
             gen_kwargs["temperature"] = temperature
-        # A7④: RP 思考强度（llm.reasoning_effort，默认 off——用户实测角色效果最佳；
-        # 采样参数不进 prompt，不破坏前缀缓存）。网关不认 off 时 _reasoning_value 映射 none。
-        gen_kwargs["reasoning_effort"] = reasoning_value(
+        # A7④: RP 思考强度（llm.reasoning_effort）。网关只认 low/high/max 等档位，
+        # "off"/"none" 会 HTTP 400 → reasoning_value 返回 None 表示不发送该参数
+        # （2026-09-10 实测：旧映射 off→"none" 导致每次调用 400 → 空回复静默）。
+        _rv = reasoning_value(
             (self.config.get("llm") or {}).get("reasoning_effort", "off")
         )
+        if _rv:
+            gen_kwargs["reasoning_effort"] = _rv
         try:
             resp = await self.context.llm_generate(
                 chat_provider_id=provider_id,
@@ -1192,12 +1195,13 @@ class PersonaAgent(Star):
         if not provider:
             raise RuntimeError("no LLM provider available for emotion")
         ecfg = self.config.get("emotion", {}) or {}
+        _erv = reasoning_value(ecfg.get("reasoning_effort", "off"))
         resp = await self.context.llm_generate(
             chat_provider_id=provider,
             prompt=prompt,
             system_prompt=EMOTION_SYSTEM_PROMPT,
             temperature=float(ecfg.get("temperature", 0.2)),
-            reasoning_effort=reasoning_value(ecfg.get("reasoning_effort", "off")),
+            **({"reasoning_effort": _erv} if _erv else {}),
         )
         return (getattr(resp, "completion_text", "") or "").strip()
 
@@ -1213,12 +1217,13 @@ class PersonaAgent(Star):
         if not provider:
             raise RuntimeError("no LLM provider available for gate")
         gcfg = self.config.get("gate", {}) or {}
+        _grv = reasoning_value(gcfg.get("reasoning_effort", "off"))
         resp = await self.context.llm_generate(
             chat_provider_id=provider,
             prompt=prompt,
             system_prompt=GATE_SYSTEM_PROMPT,
             temperature=float(gcfg.get("temperature", 0.2)),
-            reasoning_effort=reasoning_value(gcfg.get("reasoning_effort", "off")),
+            **({"reasoning_effort": _grv} if _grv else {}),
         )
         return (getattr(resp, "completion_text", "") or "").strip()
 

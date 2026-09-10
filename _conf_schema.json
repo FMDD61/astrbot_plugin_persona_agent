@@ -482,12 +482,13 @@
       "max_tokens": {
         "type": "int",
         "description": "回复最大 token 数",
-        "default": 256
+        "hint": "需容纳模型的思考开销（实测 ~200 tokens）；太小会导致思考吃光预算、正文为空。",
+        "default": 512
       },
       "reasoning_effort": {
         "type": "string",
-        "description": "RP 主生成思考强度（A7④：off/low/medium/high）",
-        "hint": "off=关闭思考（用户实测角色扮演效果最佳）。网关不认 off 时自动映射 none。",
+        "description": "RP 主生成思考档位（A7④：off/low/medium/high/max）",
+        "hint": "off=不发送该参数（网关默认；实测角色效果最佳）。注意网关只认 low/medium/high/max，发 off/none 会 HTTP 400。",
         "default": "off"
       }
     }
