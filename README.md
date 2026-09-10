@@ -28,8 +28,8 @@ AstrBot 插件 — 在 QQ 群内模仿指定用户（QQ `234567`）的发言风�
 
 | 层 | 模型 | 职责 |
 |----|------|------|
-| 决策层+安全阀 `GateService` | 独立中性 LLM（provider 同源 dsv4f） | "这句要不要回" + conflict 判定（{reply, conflict, reason}）；conflict=true 强制不发言（防煽风点火）；0.2 温度 + off 思考；同群节流；失败保守静默 |
-| 扮演层 `PersonaPipeline` → LLM | 主 RP 模型 | 纯粹表演（上下文不掺工具/决策噪音）；reasoning off + 温度分档 |
+| 决策层+安全阀 `GateService` | 独立中性 LLM（provider 同源 dsv4f） | "这句要不要回" + conflict 判定（{reply, conflict, reason}）；conflict=true 强制不发言（防煽风点火）；0.2 温度 + off 思考（不发该参数）；同群节流；失败保守静默 |
+| 扮演层 `PersonaPipeline` → LLM | 主 RP 模型 | 纯粹表演（上下文不掺工具/决策噪音）；reasoning off（不发参数）+ 温度分档；max_tokens 512 |
 
 ## 快速开始
 
@@ -76,11 +76,11 @@ WebUI: `http://<IP>:6185` → Astr 插件 → astrbot_plugin_persona_agent
 | `target_group_id` | 123456789 | 生产群号 |
 | `data_dir` | `/opt/AstrBot/data/...` | 运行时数据目录 (git pull 不覆盖) |
 
-> 完整配置见 `_conf_schema.json`：`sleep.*`（睡眠窗 02–07）、`diary.*`、`examples.*`、`vision.*`、`emotion.*`、`housekeeping.*`、`privileged_qq`、`llm.temperature`（温度分档）、`summary.*`（周/月摘要，G13）、`poke.*`、`topic_bank.*`、`dream.*`、`gate.*`（A7 GateLLM 决策层+conflict 安全阀，enabled=0 默认关 / temperature=0.2 / reasoning_effort=off）、`trace.*`（A7 全链路 trace，enabled=1 默认开）、`rag.enabled`（RAG 总开关，A7③）、`vision.cache_persist*`（识图持久缓存，A7③）、`llm.reasoning_effort`（RP 思考 off）、`emotion.temperature/reasoning_effort`（0.2/off）。
+> 完整配置见 `_conf_schema.json`：`sleep.*`（睡眠窗 02–07）、`diary.*`、`examples.*`、`vision.*`、`emotion.*`、`housekeeping.*`、`privileged_qq`、`llm.temperature`（温度分档）、`summary.*`（周/月摘要，G13）、`poke.*`、`topic_bank.*`、`dream.*`、`gate.*`（A7 GateLLM 决策层+conflict 安全阀，enabled=0 默认关 / temperature=0.2 / reasoning_effort=off）、`trace.*`（A7 全链路 trace，enabled=1 默认开）、`rag.enabled`（RAG 总开关，A7③）、`vision.cache_persist*`（识图持久缓存，A7③）、`llm.reasoning_effort`（RP 思考 off=不发送该参数；网关只认 low/medium/high/max）、`llm.max_tokens`（默认 512，需容纳 ~200 思考 token）、`emotion.temperature/reasoning_effort`（0.2/off）。
 
 ## 当前状态
 
-**v0.5.0（2026-09-08）** — **生产接管**（`test_mode=0`，目标群 `123456789`）。含：v3 按日会话+02:00轮换、睡眠窗 02–07、每日日记、识图（flash-vision-exp，持久哈希缓存）、情绪引擎 v1、示例注入（规则A/B）、离线 A/B 通道、**主动插话（`active_interjection=1`，阈值 0.65）**、**DreamJob（`dream.enabled=1`）**、**周/月摘要（`summary.*=1`）**、G11/G12 代码就绪。**A7（至 2026-09-08）**：GateLLM 决策层+conflict 安全阀（含 @/TOPIC 覆盖）、PersonaPipeline 共享主链路、全链路 trace（trace_view 查看）、群隔离、日志按群分目录、RAG 动态开关（rag.enabled）、Vision 持久 LRU 缓存、LLM 参数矩阵（RP off 思考/结构化 0.2+off）。`gate.enabled=0` 未开待手动验证。测试 155 例全绿。
+**v0.5.0（2026-09-08）** — **生产接管**（`test_mode=0`，目标群 `123456789`）。含：v3 按日会话+02:00轮换、睡眠窗 02–07、每日日记、识图（flash-vision-exp，持久哈希缓存）、情绪引擎 v1、示例注入（规则A/B）、离线 A/B 通道、**主动插话（`active_interjection=1`，阈值 0.65）**、**DreamJob（`dream.enabled=1`）**、**周/月摘要（`summary.*=1`）**、G11/G12 代码就绪。**A7（至 2026-09-10）**：GateLLM 决策层+conflict 安全阀（含 @/TOPIC 覆盖）、PersonaPipeline 共享主链路、全链路 trace（trace_view 查看）、群隔离、日志按群分目录、RAG 动态开关（rag.enabled）、Vision 持久 LRU 缓存、LLM 参数矩阵、**离线测试台 replay_scene（extract/run）**、**RAG 语料清洗 + 重建（4704 对）**、**hourly_budget 宽松化（daily 24→2400）**。关键修复（2026-09-10）：`reasoning_effort` 不再发 `none`（网关 400 → 空回复静默，A7 上线会全哑）+ `max_tokens` 256→512。`gate.enabled=0` 未开待手动验证。测试 **171 例全绿**。
 
 > A7 计划书：`docs/specs/chatbox-rp-tool-dual-channel.md`（工作区根）
 
@@ -108,7 +108,7 @@ astrbot_plugin_persona_agent/
 │   ├── kg_provider.py        # MultiSignalKGProvider (dense+BGE + BM25/FTS5 + entity)
 │   ├── emotion.py            # LLMEmotionProvider v1 (3 维: 意愿/情绪/表情, 30s 缓存, 3s 超时)
 │   ├── interjection.py       # 规则硬闸 (AT/RAG/COLD 三级; 用量按群隔离 + usages/<gid>.json)
-│   ├── llm_params.py         # A7④ reasoning_effort 容错映射 (off→none)
+│   ├── llm_params.py         # A7④ reasoning_effort 映射 (off→None=不发送该参数; 网关拒 none/off 会 400)
 │   ├── gate.py               # A7 GateLLM 决策层+安全阀 ({reply, conflict, reason}; @/TOPIC 全覆盖; 0.2+off; is_at 缓存键)
 │   ├── pipeline.py           # A7 共享主链路 (RAG→情绪→硬闸→Gate→KG→生成→SendIntent+trace)
 │   ├── style_profile.py      # 风格文件热加载 + alias 映射
@@ -134,7 +134,10 @@ astrbot_plugin_persona_agent/
 │   ├── ab_test_examples.py   # 离线 A/B 生成 harness (同源提示词/网关)
 │   ├── ab_judge_style.py     # 风格 judge (正反清单 1-5 分)
 │   ├── sync_config.py        # A2 配置-schema 同步 (只补缺省/保留现有值/BOM 兼容/备份)
-│   └── trace_view.py         # A7 trace 渲染工具 (层级可读报告, dsh 内查看)
+│   ├── trace_view.py         # A7 trace 渲染工具 (层级可读报告, dsh 内查看)
+│   ├── replay_scene.py       # A7④ 离线测试台 (extract 场景抽取 / run 真 services 重放 → dsh 日志)
+│   ├── find_style_windows.py # A7④ 滑动窗口找风格源最活跃时段 (O(n) + 优先队列 top-N)
+│   └── clean_pairs.py        # A7④ RAG 语料清洗 (去图片占位 reply / 标记化 ctx 图行)
 └── data_out/                 # (gitignored) 离线产物 + 风格文件
 
 运行时数据目录 (data_dir, git pull 不覆盖):
