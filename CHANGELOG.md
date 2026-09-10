@@ -11,6 +11,18 @@
 
 ## [Unreleased]
 
+### Fixed (2026-09-10, 协议端迁移准备：poke 死代码 + LLBot 出站通道)
+- **🔴 poke 处理器是死代码（G11 开启也不会生效）**：`on_other` 挂了 `EventMessageType.OTHER_MESSAGE` 过滤器，但 AstrBot **v4.27.4** 的 `_convert_handle_notice_event()` 会把**带 group_id 的通知**归为 `GROUP_MESSAGE`（`OTHER_MESSAGE` 在该路径上不可达）→ 群戳从未进入该处理器，且无任何报错。更隐蔽的是：群戳实际落到 `on_group_message`，`message_str` 为空 → 被媒体过滤器 `event.stop_event()` 吞掉；而 `StarRequestSubStage` 的派发循环是 `for handler in activated_handlers: if event.is_stopped(): break`、handler 顺序 = 装饰器注册顺序（`on_group_message` 在前）→ **单改过滤器也救不回来**。修复：① `on_group_message` 对 `post_type != "message"` 的通知**让路**（不 stop_event）；② 处理函数改名 `on_notice`，过滤器改 `EventMessageType.ALL`，判定下沉到插件侧。依据：AstrBot v4.27.4 源码实测（`_convert_handle_notice_event` / `get_message_type` / `EventMessageTypeFilter` / `StarRequestSubStage` / `PipelineScheduler._process_stages`）
+- **回戳通道修正（LLBot v8 上必定失效）**：原实现 `yield event.chain_result([Comp.Poke(id=poker)])` 走 `send_group_msg` + `{"type":"poke"}` 消息段，而 LLBot v8 的出站转换表（`src/onebot11/transform/message/outgoing.ts`）**没有 poke 分支也没有 default** → **静默丢弃**；NapCat 的 poke 段转换器同样是 `async () => undefined` 空实现桩。修复：改为 action 优先 `group_poke`（LLBot `action/llbot/group/GroupPoke.ts` / NapCat 同名），失败再回退消息段
+- **通知事件不再被内置 LLM 兜底作答**：认领「戳向本机器人」的通知后一律 `event.stop_event()`（私聊通知会置 `is_at_or_wake_command=True`，不拦会触发 AstrBot 内置 LLM 对空消息作答）；⚠️ 段通道**不能**先 stop_event 再 yield —— `PipelineScheduler` 在 `async for _ in agen` 里**先判 `is_stopped()` 再递归执行后续阶段**，先停会阻断发送。戳一戳撤回（`sub_type=poke_recall`）明确忽略
+
+### Added (2026-09-10, 协议端迁移准备)
+- **`services/protocol_compat.py`**：协议归一化层（纯 stdlib，无 astrbot 依赖）。① `normalize_poke(raw)` 吸收各实现形状变体（`notice_type=notify/poke`、缺 `notice_type`、`poke_recall`），拒绝非 poke 通知与无效/为 0 的 QQ 号（LLBot `target_id` 默认 0 = 未设置）；② `ProtocolCapabilities` + `poke_channels()` 把「走哪条通道」变成可测数据（LLBot/NapCat 均无 poke 段 → action 优先；未知协议端 action + 段回退）
+- **`tools/llbot_config.py`**：从 AstrBot `cmd_config.json` 推导 LLBot v8 的 OneBot11 反向 WS 配置（`ws://<host>:<port>/ws` + `messageFormat=array`），支持打印（token 掩码）/ `--out` 片段导出（0600）/ `--merge-into` 就地 upsert（备份 + 原子写 + 保留其它 connect 条目）/ `--check` 一致性校验。BOM 兼容读取；token 绝不回显
+- **`_conf_schema.json` 新增 `poke.protocol`**（默认空 = 自动）：适配器名恒为 `aiocqhttp`，无法自动识别协议端，需人工声明 llbot/napcat 以跳过注定被丢弃的段通道
+- 测试 171 → **225 全绿**（`test_protocol_compat.py` 23 例 + `test_llbot_config.py` 31 例）
+- 迁移计划书 `docs/specs/llbot-migration-plan.md`；调研报告 `data_out/llbot_onebot11_compat_research.md`、`data_out/llbot_plugin_platform_audit.md`
+
 ### Fixed (2026-09-10, A7④ 复盘：致命 reasoning bug + RAG 语料 + 预算)
 - **🔴 `reasoning_effort` 致命 bug（A7 上线会让 bot 全哑）**：旧实现 off→`"none"`，实测 commandcode 网关（OpenAI 兼容 `/chat/completions`）**拒绝任何非标准取值**（none/off/minimal/disabled/false 全部 HTTP 400）→ `_generate_reply` 的 try/except 吞掉 → 返回空 → 静默。修复：`reasoning_value()` 对 off/未知返回 **None（=不发送该参数）**，仅 low/medium/high/max 透传（佐证：dsh 自身配置 `reasoningEfforts: {False: None}` 即此语义）；main.py RP/Emotion/Gate 三处在 None 时跳过 kwarg；`tools/replay_scene._chat` 同步
 - **`max_tokens` 256 → 512**：v4-flash 下思考开销（实测 141-256 reasoning tokens）会吃光预算 → content 为空（重放实测 14 次 empty generation，修复后 **0 次**）；`_conf_schema` 默认值与 hint 同步

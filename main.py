@@ -55,6 +55,7 @@ from .services.gate import GateService, GATE_SYSTEM_PROMPT
 from .services.pipeline import PersonaPipeline, PipelineInput, SendIntent
 from .services.vision import VisionService, face_name
 from .services.poke import PokeService
+from .services import protocol_compat
 from .services.examples import load_examples_block, ExamplesState
 from .services.memory_store import MemoryStore, MemoryEvent
 from .services.dream_job import DreamJob
@@ -348,6 +349,21 @@ class PersonaAgent(Star):
             return str(gid) == self.test_group_id
         return str(gid) == self.target_group_id
 
+    @staticmethod
+    def _is_notice_event(event: AstrMessageEvent) -> bool:
+        """True 表示这是一条 notice/request 事件而非真正的消息。
+
+        AstrBot v4.27.4 的 aiocqhttp 适配器把带 group_id 的通知归为 GROUP_MESSAGE，
+        于是群戳等通知会同时匹配 on_group_message；此处用于让消息处理器**让路**
+        （不 stop_event，交给 on_notice），否则派发循环会因 is_stopped() 提前 break。
+        """
+        raw = getattr(event.message_obj, "raw_message", None)
+        getter = getattr(raw, "get", None)
+        if not callable(getter):
+            return False
+        post_type = getter("post_type")
+        return bool(post_type) and post_type != "message"
+
     def _is_at_bot(self, event: AstrMessageEvent) -> bool:
         self_id = str(event.get_self_id() or self.bot_qq)
         for seg in event.get_messages():
@@ -560,6 +576,16 @@ class PersonaAgent(Star):
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
+        # AstrBot v4.27.4 起 _convert_handle_notice_event() 把**带 group_id 的通知**
+        # 归为 GROUP_MESSAGE（不再走 OTHER_MESSAGE），于是群戳/群撤回等通知会落到这里；
+        # 它们的 message_str 为空，会撞上下面的媒体过滤器并被 stop_event() 吞掉。
+        # 而 StarRequestSubStage 的派发循环是 `for handler in activated_handlers:
+        # if event.is_stopped(): break`，且 handler 顺序 = 装饰器注册顺序（本方法定义在
+        # on_notice 之前）→ 一旦在这里 stop_event，on_notice 永远收不到 poke。
+        # 故：非 message 类事件（notice/request）一律**不拦不吞**，原样交给 on_notice。
+        if self._is_notice_event(event):
+            return
+
         if not self._is_target_group(event):
             return
 
@@ -791,9 +817,17 @@ class PersonaAgent(Star):
             )
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
-    @filter.event_message_type(filter.EventMessageType.OTHER_MESSAGE)
-    async def on_other(self, event: AstrMessageEvent):
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_notice(self, event: AstrMessageEvent):
         """G11: poke notice -> PokeService decision -> poke back.
+
+        （原名 on_other；改名以反映它处理通知事件而非「其它消息」。）
+
+        过滤器用 ALL 而非 OTHER_MESSAGE：AstrBot v4.27.4 起
+        `_convert_handle_notice_event()` 会把**带 group_id 的通知**归为
+        GROUP_MESSAGE，`OTHER_MESSAGE` 在该路径上不可达 —— 旧写法（OTHER_MESSAGE）
+        在群戳场景下**永不触发**（且无任何报错）。判定改为在插件侧做（见
+        services/protocol_compat.normalize_poke），不依赖宿主的事件类型映射。
 
         Group/production routing mirrors _is_target_group() on the raw
         group_id (notice events may not carry a resolved group context in
@@ -802,22 +836,40 @@ class PersonaAgent(Star):
         if self._poke is None:
             return
         raw = getattr(event.message_obj, "raw_message", None)
-        if not raw:
+        notice = protocol_compat.normalize_poke(raw)
+        if notice is None:
             return
-        if raw.get("notice_type") != "notify" or raw.get("sub_type") != "poke":
+        # 不是戳向本机器人的通知（例如戳别人）→ 不是本插件的事，不认领
+        if notice.target != self.bot_qq:
             return
-        poker = str(raw.get("user_id") or "")
-        target = str(raw.get("target_id") or "")
-        group_id = str(raw.get("group_id") or "")
-        if not poker or str(target) != self.bot_qq or not group_id:
+
+        # --- 以下均为「戳了机器人」→ 本插件认领该事件 ---------------------------
+        # 认领的含义：走完决策后必定 stop_event()，防 AstrBot 内置 LLM 对一条空消息
+        # 作答（私聊通知会置 is_at_or_wake_command=True，不拦就会触发内置 LLM）。
+        # ⚠️ 唯一的例外是段通道——它必须 yield 结果给 AstrBot 发送，而调度器在
+        # `async for _ in agen: if event.is_stopped(): break` 处**先判停止再跑后续阶段**，
+        # 因此「先 stop_event 再 yield」会导致消息发不出去（见 _poke_back）。
+
+        # 戳一戳撤回不是一次真戳（也不应触发任何回复）
+        if notice.is_recall:
+            event.stop_event()
             return
+        # 既定策略：只回群戳；私聊戳认领但不回
+        if not notice.is_group:
+            event.stop_event()
+            return
+
+        group_id = notice.group_id
         if self.test_mode == 1:
             if group_id != self.test_group_id:
                 return
         elif group_id != self.target_group_id:
             return
+
+        poker = notice.poker
         poke_cfg = self.config.get("poke", {}) or {}
         if int(poke_cfg.get("enabled", 0)) != 1:
+            event.stop_event()
             return
 
         self._poke.configure(cooldown_sec=float(poke_cfg.get("cooldown_sec", 300)))
@@ -849,12 +901,69 @@ class PersonaAgent(Star):
         )
         if not respond:
             logger.info(f"[persona_agent] poke ignored: poker={poker} reason={reason}")
+            event.stop_event()
             return
-        try:
-            yield event.chain_result([Comp.Poke(id=poker)])
-            logger.info(f"[persona_agent] poke back to {poker} (alias={alias or '?'})")
-        except Exception as ex:
-            logger.warning(f"[persona_agent] poke reply failed: {ex}")
+        # _poke_back 是异步生成器（段通道需要 yield 结果给 AstrBot 发送）
+        async for result in self._poke_back(event, notice, alias):
+            yield result
+
+    async def _poke_back(
+        self, event: AstrMessageEvent, notice: protocol_compat.PokeNotice, alias: str
+    ):
+        """按协议端能力回戳（action 优先，消息段兜底）。
+
+        为什么不能只用 `Comp.Poke`：LLBot v8 的出站消息段转换表
+        （src/onebot11/transform/message/outgoing.ts）**没有 poke 分支也没有
+        default** → `{"type":"poke",...}` 被**静默丢弃**（无日志、无报错）；
+        NapCat 的 poke 段转换器同样是空实现桩。→ 正确通道是 action
+        `group_poke`（LLBot src/onebot11/action/llbot/group/GroupPoke.ts / NapCat 同名），
+        它直接把戳发给协议端，不经过消息段转换。
+
+        调度器语义（决定了这里的结构）：handler yield 结果后，调度器**先**检查
+        `event.is_stopped()`，**再**递归执行后续阶段（ResultDecorate → Respond 发送）。
+        因此段通道**不能先 stop_event 再 yield**，否则消息根本不会发出；而 action
+        通道不经过 pipeline，成功后才 stop_event() 以阻止内置 LLM 兜底。
+
+        任何失败都只记 warning，不抛出：poke 失败绝不影响后续消息处理。
+        """
+        caps = protocol_compat.capabilities_for(
+            str((self.config.get("poke", {}) or {}).get("protocol", "") or "")
+        )
+        call = protocol_compat.poke_action_call(notice)
+        bot = getattr(event, "bot", None)  # AiocqhttpMessageEvent.bot（非该适配器则无）
+        for channel in protocol_compat.poke_channels(caps):
+            if channel == protocol_compat.CHANNEL_ACTION:
+                if call is None or bot is None or not hasattr(bot, "call_action"):
+                    continue
+                action, payload = call
+                try:
+                    await bot.call_action(action, **payload)
+                except Exception as ex:
+                    logger.warning(f"[persona_agent] poke action {action} failed: {ex}")
+                    continue
+                logger.info(
+                    f"[persona_agent] poke back to {notice.poker} via {action} "
+                    f"(alias={alias or '?'})"
+                )
+                event.stop_event()  # 已由 action 直发，无需 pipeline 发送
+                return
+            if channel == protocol_compat.CHANNEL_SEGMENT:
+                # 先 yield 让调度器送出；不可在此前 stop_event（会阻断发送）
+                try:
+                    yield event.chain_result([Comp.Poke(id=notice.poker)])
+                except Exception as ex:
+                    logger.warning(f"[persona_agent] poke segment failed: {ex}")
+                    continue
+                logger.info(
+                    f"[persona_agent] poke back to {notice.poker} via poke segment "
+                    f"(alias={alias or '?'})"
+                )
+                event.stop_event()
+                return
+        logger.warning(
+            f"[persona_agent] poke back to {notice.poker} exhausted all channels"
+        )
+        event.stop_event()
 
     async def _send_topic(
         self,
