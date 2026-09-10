@@ -1,6 +1,6 @@
 # astrbot_plugin_persona_agent
 
-AstrBot 插件 — 在 QQ 群内模仿指定用户（QQ `234567`）的发言风格。
+AstrBot 插件 — 在 QQ 群内模仿指定用户（配置项 `style_source_qq`）的发言风格。
 
 基于三层 AI 记忆架构：检索层（KGProvider：dense/BGE + BM25/FTS5 + 实体融合）→ 存储层（MemoryStore：SQLite ADD-only 实体关系图 + FTS5 BM25）→ 进化层（DreamJob：周 cron 漂移检测）。
 
@@ -67,6 +67,8 @@ python -c "from sentence_transformers import SentenceTransformer; SentenceTransf
 
 WebUI: `http://<IP>:6185` → Astr 插件 → astrbot_plugin_persona_agent
 
+> 上表中的群号/QQ 号均为**示例占位值**，首次部署时请替换为你自己的号码。
+
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | `reply_on_at` | 1 | @ 回复开关 |
@@ -74,7 +76,7 @@ WebUI: `http://<IP>:6185` → Astr 插件 → astrbot_plugin_persona_agent
 | `test_mode` | 0 | 测试模式 (1=只在 test_group_id 生效) |
 | `test_group_id` | 123456788 | 测试群号 |
 | `target_group_id` | 123456789 | 生产群号 |
-| `data_dir` | `/opt/AstrBot/data/...` | 运行时数据目录 (git pull 不覆盖) |
+| `data_dir` | `<AstrBot 数据目录>/...` | 运行时数据目录 (仅文档用途；git pull 不覆盖) |
 
 > 完整配置见 `_conf_schema.json`：`sleep.*`（睡眠窗 02–07）、`diary.*`、`examples.*`、`vision.*`、`emotion.*`、`housekeeping.*`、`privileged_qq`、`llm.temperature`（温度分档）、`summary.*`（周/月摘要，G13）、`poke.*`、`topic_bank.*`、`dream.*`、`gate.*`（A7 GateLLM 决策层+conflict 安全阀，enabled=0 默认关 / temperature=0.2 / reasoning_effort=off）、`trace.*`（A7 全链路 trace，enabled=1 默认开）、`rag.enabled`（RAG 总开关，A7③）、`vision.cache_persist*`（识图持久缓存，A7③）、`llm.reasoning_effort`（RP 思考 off=不发送该参数；网关只认 low/medium/high/max）、`llm.max_tokens`（默认 512，需容纳 ~200 思考 token）、`emotion.temperature/reasoning_effort`（0.2/off）。
 

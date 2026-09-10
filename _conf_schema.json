@@ -2,13 +2,13 @@
   "data_dir": {
     "type": "string",
     "description": "运行时数据目录",
-    "hint": "存放风格文件、chromadb、决策日志等。git pull 不会覆盖此目录。",
-    "default": "/opt/AstrBot/data/plugin_data/astrbot_plugin_persona_agent"
+    "hint": "存放风格文件、chromadb、决策日志等。git pull 不会覆盖此目录。（该键仅作文档说明；插件运行时实际由 AstrBot 的 StarTools.get_data_dir() 决定）",
+    "default": "<AstrBot 数据目录>/plugin_data/astrbot_plugin_persona_agent"
   },
   "target_group_id": {
     "type": "string",
     "description": "目标 QQ 群号",
-    "hint": "机器人只在此群内工作。其他群一律沉默。",
+    "hint": "机器人只在此群内工作。其他群一律沉默。（示例占位值，请替换为你自己的号码）",
     "default": "123456789"
   },
   "test_mode": {
@@ -20,28 +20,27 @@
   "test_group_id": {
     "type": "string",
     "description": "测试群号",
-    "hint": "仅在 test_mode=1 时生效。测试群 123456788，测试员 234567 + 345678。",
+    "hint": "仅在 test_mode=1 时生效。测试群 123456788，测试员 234567 + 345678。（示例占位值，请替换为你自己的号码）",
     "default": "123456788"
   },
   "bot_qq": {
     "type": "string",
     "description": "机器人 QQ 号",
-    "hint": "用于判断是否被 @、是否被戳。",
+    "hint": "用于判断是否被 @、是否被戳。（示例占位值，请替换为你自己的号码）",
     "default": "123456"
   },
   "style_source_qq": {
     "type": "string",
     "description": "风格源 QQ 号",
-    "hint": "机器人模仿这个 QQ 的发言风格。离线数据已按此号生成。",
+    "hint": "机器人模仿这个 QQ 的发言风格。离线数据已按此号生成。（示例占位值，请替换为你自己的号码）",
     "default": "234567"
   },
   "privileged_qq": {
     "type": "string",
     "description": "特权 QQ（G8：风格源/管理员命令豁免）",
-    "hint": "该 QQ 可跳过 dream.enabled 等开关执行命令",
+    "hint": "该 QQ 可跳过 dream.enabled 等开关执行命令（示例占位值，请替换为你自己的号码）",
     "default": "234567"
   },
-
   "reply_on_at": {
     "type": "int",
     "description": "被 @ 时是否回复（0 关闭 / 1 开启）",
@@ -54,7 +53,6 @@
     "hint": "整数 0/1。0 时机器人除被 @ 外完全沉默。建议验证期保持 0。",
     "default": 0
   },
-
   "rag": {
     "type": "object",
     "description": "RAG 检索参数",
@@ -88,7 +86,6 @@
       }
     }
   },
-
   "interjection": {
     "type": "object",
     "description": "插话节奏控制",
@@ -123,7 +120,6 @@
       }
     }
   },
-
   "topic_bank": {
     "type": "object",
     "description": "主动话题（冷场救场）",
@@ -135,7 +131,6 @@
       }
     }
   },
-
   "poke": {
     "type": "object",
     "description": "戳一戳响应",
@@ -157,7 +152,6 @@
       }
     }
   },
-
   "dream": {
     "type": "object",
     "description": "做梦（每周私聊推送）",
@@ -179,12 +173,11 @@
       },
       "target_qq": {
         "type": "string",
-        "description": "梦境推送的目标 QQ（需先在私聊执行 /bind_dream）",
+        "description": "梦境推送的目标 QQ（需先在私聊执行 /bind_dream）（示例占位值，请替换为你自己的号码）",
         "default": "234567"
       }
     }
   },
-
   "context_buffer": {
     "type": "object",
     "description": "运行时上下文缓冲",
@@ -206,7 +199,6 @@
       }
     }
   },
-
   "examples": {
     "type": "object",
     "description": "典型对话静态注入（G14；改文件名即可热切换，A/B 用）",
@@ -223,7 +215,6 @@
       }
     }
   },
-
   "housekeeping": {
     "type": "object",
     "description": "数据保留策略（G3）",
@@ -240,7 +231,6 @@
       }
     }
   },
-
   "sleep": {
     "type": "object",
     "description": "睡眠窗（模拟真人作息，02:00–07:00 默认）",
@@ -262,7 +252,6 @@
       }
     }
   },
-
   "diary": {
     "type": "object",
     "description": "每日日记（02:05 轮换 cron 生成，复用当日会话上下文以命中前缀缓存）",
@@ -274,7 +263,6 @@
       }
     }
   },
-
   "vision": {
     "type": "object",
     "description": "识图（G15：图片/gif 表情 → 视觉模型 → 文本进会话；QQ Face 走本地映射）",
@@ -328,7 +316,6 @@
       }
     }
   },
-
   "emotion": {
     "type": "object",
     "description": "情绪引擎（G10 v1：willingness/mood/sticker 三维 + 30s 缓存 + 3s 超时）",
@@ -361,7 +348,6 @@
       }
     }
   },
-
   "summary": {
     "type": "object",
     "description": "周/月摘要（G13：日日记之上的金字塔汇总；周一 02:10 / 月首 02:15 cron，输出 jsonl 并可推 bind_dream 私聊）",
@@ -388,7 +374,6 @@
       }
     }
   },
-
   "gate": {
     "type": "object",
     "description": "决策层 GateLLM（A7：独立判断要不要回的中性 LLM；双层 LLM 上层闸）",
@@ -432,7 +417,6 @@
       }
     }
   },
-
   "trace": {
     "type": "object",
     "description": "全链路 trace 日志（A7：每次处理记录决策/检索/情绪/生成全过程，供评估 RAG 价值）",
@@ -445,7 +429,6 @@
       }
     }
   },
-
   "llm": {
     "type": "object",
     "description": "LLM provider 选择",
