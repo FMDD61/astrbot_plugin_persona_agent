@@ -155,3 +155,7 @@ astrbot_plugin_persona_agent/
 - `IMPLEMENTATION_PLAN.md` — 18 节详细实施计划（位于工作区根）
 - `CHANGELOG.md` — 版本历史
 - `docs/archive/` — 历史设计/装机/GPU 文档归档（位于工作区根）
+
+## 许可
+
+[MIT](LICENSE) © 2026 FMDD61
