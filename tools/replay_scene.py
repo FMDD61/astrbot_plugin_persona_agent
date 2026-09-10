@@ -619,17 +619,22 @@ class ReplayRuntime:
             self._cred = _cmd_config(self.args)
         return self._cred
 
-    def _chat(self, messages: list, temperature: Optional[float], reasoning: str,
-              max_tokens: int = 256, timeout: float = 120.0) -> str:
-        """OpenAI 兼容直连网关。key 仅内存，绝不落盘/打印。"""
+    def _chat(self, messages: list, temperature: Optional[float], reasoning: Optional[str],
+              max_tokens: int = 512, timeout: float = 120.0) -> str:
+        """OpenAI 兼容直连网关。key 仅内存，绝不落盘/打印。
+
+        reasoning 为 None 时**不发送** reasoning_effort（网关只认 low/medium/
+        high/max；"none"/"off"/false 全部 HTTP 400 —— 2026-09-10 实测，
+        详见 services/llm_params.py 的说明）。
+        """
         cred = self._creds()
         model = getattr(self.args, "model", "") or os.environ.get("PERSONA_TEST_MODEL", "")
         if not model:
-            model = "deepseek-v4-flash"  # fallback；一般由 cmd_config / CLI 覆盖
+            model = "deepseek/deepseek-v4.1-flash"  # fallback；一般由 CLI/cmd_config 覆盖
         payload: dict = {"model": model, "messages": messages, "max_tokens": max_tokens}
         if temperature is not None:
             payload["temperature"] = temperature
-        if reasoning and reasoning != "none":
+        if reasoning:
             payload["reasoning_effort"] = reasoning
         url = cred["api_base"].rstrip("/") + "/chat/completions"
         req = urllib.request.Request(
@@ -660,7 +665,7 @@ class ReplayRuntime:
             [{"role": "system", "content": emotion_mod.EMOTION_SYSTEM_PROMPT},
              {"role": "user", "content": prompt}],
             float(ecfg.get("temperature", 0.2)),
-            str(ecfg.get("reasoning_effort", "off")),
+            _import("llm_params").reasoning_value(ecfg.get("reasoning_effort", "off")),
             120,
             20.0,
         )
@@ -673,7 +678,7 @@ class ReplayRuntime:
             [{"role": "system", "content": gate_mod.GATE_SYSTEM_PROMPT},
              {"role": "user", "content": prompt}],
             float(gcfg.get("temperature", 0.2)),
-            str(gcfg.get("reasoning_effort", "off")),
+            _import("llm_params").reasoning_value(gcfg.get("reasoning_effort", "off")),
             80,
             20.0,
         )
@@ -707,7 +712,7 @@ class ReplayRuntime:
             messages,
             temperature,
             llm_params.reasoning_value(lcfg.get("reasoning_effort", "off")),
-            int(lcfg.get("max_tokens", 256)),
+            int(lcfg.get("max_tokens", 512)),
             120.0,
         )
 
