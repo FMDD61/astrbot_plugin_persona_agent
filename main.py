@@ -193,8 +193,14 @@ class PersonaAgent(Star):
                 decide_cooldown_sec=float(gate_cfg.get("decide_cooldown_sec", 8.0)),
                 recent_n=int(gate_cfg.get("recent_n", 15)),
                 max_rag_hits=int(gate_cfg.get("max_rag_hits", 3)),
+                # S4：共享上下文模式的 system prompt = RP 的人格提示词
+                # （**含 163 人别名关系块**）。这样 Gate 与 RP 看到逐字节
+                # 相同的前缀 → 判断依据同级 + 网关前缀缓存被两次调用复用。
+                shared_system_prompt=(
+                    self.style.system_prompt() if self.style is not None else ""
+                ),
             )
-            logger.info("[persona_agent] GateLLM decision layer enabled (A7)")
+            logger.info("[persona_agent] GateLLM decision layer enabled (A7/S4 共享上下文)")
         else:
             logger.info("[persona_agent] GateLLM decision layer disabled (gate.enabled=0)")
 
@@ -1571,25 +1577,36 @@ class PersonaAgent(Star):
         )
         return (getattr(resp, "completion_text", "") or "").strip()
 
-    async def _gate_llm(self, prompt: str) -> str:
-        """A7: GateLLM decision call (independent of RP provider context).
+    async def _gate_llm(
+        self, prompt: Optional[str] = None, *, messages=None, system_prompt: Optional[str] = None
+    ) -> str:
+        """A7/S4: GateLLM 调用。两种形态：
 
-        Shares the provider resolution pattern of _emotion_llm but uses the
-        gate-specific system prompt. Failures surface as exceptions to
-        GateService, which converts them to conservative silence.
-        A7④: 结构化判断/未来工具选择 → 低温(0.2) + 思考 off（配置可调）。
+          - 旧（单条）：``_gate_llm(prompt)`` → system=GATE_SYSTEM_PROMPT
+          - S4（共享上下文）：``_gate_llm(None, messages=[...], system_prompt=人格提示词)``
+            → 与 RP 走**同一份 system prompt 与上下文前缀**，让网关前缀缓存
+            被两次调用复用，同时让 Gate 拥有与 RP 同级的判断依据。
+
+        失败以异常上抛给 GateService，由其转为保守静默。
         """
         provider = await self._resolve_provider_id()
         if not provider:
             raise RuntimeError("no LLM provider available for gate")
         gcfg = self.config.get("gate", {}) or {}
         _grv = reasoning_value(gcfg.get("reasoning_effort", "low"))
+        sys_p = system_prompt if system_prompt else GATE_SYSTEM_PROMPT
+        kwargs = {}
+        if messages is not None:
+            kwargs["contexts"] = messages
+            kwargs["prompt"] = None
+        else:
+            kwargs["prompt"] = prompt
         resp = await self.context.llm_generate(
             chat_provider_id=provider,
-            prompt=prompt,
-            system_prompt=GATE_SYSTEM_PROMPT,
+            system_prompt=sys_p,
             temperature=float(gcfg.get("temperature", 0.2)),
             **({"reasoning_effort": _grv} if _grv else {}),
+            **kwargs,
         )
         return (getattr(resp, "completion_text", "") or "").strip()
 

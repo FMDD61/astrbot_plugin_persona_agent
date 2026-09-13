@@ -153,6 +153,54 @@ class PersonaPipeline:
         """
         self._pending_append[str(group_id)] = (text, name, message_id, sender_uin)
 
+    def _assemble_base(self, group_id: str, kg_content: str = "") -> list[dict]:
+        """装配**共享前缀**（RP 与 Gate 逐字节相同）。
+
+        顺序（2026-09-13 S4 定稿，恒定在前、易变在尾）：
+
+            [system] 固定示例块（G14）        ← 恒定
+            [user/assistant] session 全量历史  ← 只追加
+            [system] KG 尾注                   ← 每轮变（RP 用；Gate 也带）
+
+        **为什么抽出来**：Gate 此前只看 740 字符的小 prompt + 15 条窗口 ——
+        它看不到人格、看不到别名块（而 system_prompt 里**已含全部 163 人的
+        别名关系**，实测 157/163 命中），所以判断依据远弱于 RP。
+        让两者共享同一份前缀，既提升 Gate 质量，又让网关前缀缓存被两次调用复用。
+        """
+        contexts = (
+            self.session_mgr.get_contexts(group_id)
+            if self.session_mgr is not None
+            else []
+        )
+        ex_block = self._examples_block() if self._examples_block is not None else ""
+        if ex_block:
+            contexts.insert(0, {"role": "system", "content": ex_block})
+        if kg_content:
+            contexts.append({"role": "system", "content": kg_content})
+        return contexts
+
+    @staticmethod
+    def _finalize(base: list[dict], tail: str = "") -> list[dict]:
+        """把「本轮」块接在共享前缀之后（易变量集中在此，缓存序不变）。
+
+        KG 尾注已在 base 末尾 → 本轮块插到它**前面**（保持"稳定在上、易变在下"）。
+        """
+        out = list(base)
+        if tail:
+            if out and isinstance(out[-1], dict) and out[-1].get("role") == "system":
+                out.insert(-1, {"role": "system", "content": tail})
+            else:
+                out.append({"role": "system", "content": tail})
+        return out
+
+    def shared_context(self, group_id: str) -> list[dict]:
+        """给 Gate 用的共享上下文（不含本轮块）。
+
+        Gate 判定的是"这一条该不该接"，所以它看到的应该是**本条之前**的
+        世界 —— 与 RP 的 base 完全一致。
+        """
+        return self._assemble_base(group_id)
+
     def _ensure_session_append(self, group_id: str, trace: dict) -> bool:
         """幂等落盘：每轮最多写一次。早退路径用它兜底。"""
         if getattr(self, "_run_appended", False):
@@ -353,6 +401,10 @@ class PersonaPipeline:
                     text,
                     rag_hits=hits if hits else None,
                     is_at=inp.is_at,
+                    # S4：共享上下文 —— Gate 与 RP 看到逐字节相同的前缀
+                    # （人格 + 示例 + session + KG）。此前 Gate 只有 740 字符
+                    # 小 prompt + 15 条窗口，看不到人格与别名块。
+                    contexts=self.shared_context(group_id),
                 )
             except Exception as e:
                 trace["gate_error"] = f"{type(e).__name__}: {e}"
@@ -416,21 +468,8 @@ class PersonaPipeline:
                 trace["kg_error"] = f"{type(e).__name__}: {e}"
         trace["kg_tail"] = kg_content[:400]
 
-        # ---- contexts assembly (session + examples + KG + speaker) ----
-        contexts = (
-            self.session_mgr.get_contexts(group_id)
-            if self.session_mgr is not None
-            else []
-        )
-        # 恒定示例块：放在 **session 之前**。
-        # 2026-09-13 修正：它原先拼在 session 之后，而 session 每轮都在变长
-        # （实测一天 1482 条）—— 排在增长段之后的任何内容都永远落在缓存失效区，
-        # 等于每轮白付它的 token。放到 session 前面即进入稳定前缀，一次付清。
-        ex_block = self._examples_block() if self._examples_block is not None else ""
-        if ex_block:
-            contexts.insert(0, {"role": "system", "content": ex_block})
-        if kg_content:
-            contexts.append({"role": "system", "content": kg_content})
+        # ---- 上下文装配（S4：RP 与 Gate **共用同一份**）----
+        base_contexts = self._assemble_base(group_id, kg_content)
 
         # ---- S2 输入打包重划：把「该回哪句」显式标注出来 ----
         # 实测依据：决策窗口（96 条/1h）的文本有 **59% 已在 session 里**，
@@ -471,11 +510,7 @@ class PersonaPipeline:
                 })
             except Exception as e:
                 trace["turn_block_error"] = f"{type(e).__name__}: {e}"
-        if ctx_tail:
-            if contexts and isinstance(contexts[-1], dict) and contexts[-1].get("role") == "system":
-                contexts.insert(-1, {"role": "system", "content": ctx_tail})
-            else:
-                contexts.append({"role": "system", "content": ctx_tail})
+        contexts = self._finalize(base_contexts, ctx_tail)
 
         trace["session"] = {
             "size": len(contexts),
