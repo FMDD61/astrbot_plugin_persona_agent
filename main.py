@@ -105,6 +105,8 @@ class PersonaAgent(Star):
         # S2: 「现在要回应的」块所需的逐轮状态
         self._pipeline_has_turn_block: bool = False
         self._turn_block_emotion = None
+        # S3: 贴纸服务（懒建；复用 RagService 已加载的 BGE）
+        self._sticker = None
 
         self._decision_log_path = self.data_dir / "decision_log.jsonl"
 
@@ -319,6 +321,10 @@ class PersonaAgent(Star):
         self._build_pipeline()
         logger.info("[persona_agent] pipeline ready (shared decision/generation path)")
 
+        # S5: 启动自检 —— 专门拦"配额类参数静默失效"（本轮 hourly_budget 时区
+        # 错位就是这么藏了两周：预算恒为 0.34，行为看起来只是"它不主动说话"）。
+        self._startup_selfcheck()
+
         logger.info(
             f"[persona_agent] ready: target_group={self.target_group_id} "
             f"test_mode={self.test_mode} test_group={self.test_group_id} "
@@ -369,6 +375,7 @@ class PersonaAgent(Star):
             buffer=self.buffer,
             generate=self._pipeline_generate,
             examples_block=self._examples_block,
+            tool_syntax_block=self._tool_syntax_block,
             postprocess=self._postprocess_plain,
             temperature_for=self._temperature_for,
             turn_block=self._build_turn_block,
@@ -858,7 +865,18 @@ class PersonaAgent(Star):
         else:
             yield event.plain_result(reply_text)
 
+        # ---- 动作链路（S3③）：[emote:意图] → 贴纸库选图 → 随正文同发 ----
+        # 设计取舍（docs/specs/s3-action-channel.md §4.3）：
+        #   · 与正文**同一条消息**发出（"一句话 + 一张表情"），不额外多一条消息
+        #   · 选不中/库为空/文件缺失/**超配额** → 静默跳过，正文照发（绝不兜底文生图）
+        #   · 每次尝试都落 sticker_log.jsonl（S0 教训：降级必须可见）
+        if send_intent.emote:
+            # 异步生成器 → async for（每个 yield 是一条独立出站消息）
+            async for _sticker_result in self._send_sticker(event, group_id, send_intent):
+                yield _sticker_result
+
         if send_intent.sticker_prompt:
+            # 旧的 emotion.sticker → 文生图通道：保留但不再是贴纸主路径
             try:
                 yield event.chain_result([Comp.Image.fromText(send_intent.sticker_prompt)])
             except Exception:
@@ -1126,6 +1144,89 @@ class PersonaAgent(Star):
             message_id=message_id or "", sender_uin=sender_uin or "",
         )
 
+    # ---- S3: 工具语法（恒定块，进缓存前缀）----
+
+    def _startup_selfcheck(self) -> None:
+        """启动自检：把"静默失效"变成启动日志里的一行。
+
+        本轮实测的教训（hourly_budget 时区错位）：**配额类参数失效时不会报错**，
+        只会让功能"看起来像没触发"。这里对最容易出问题的地方逐项体检：
+
+          1. 当前小时的可用预算 —— < 1.0 即"结构性静音"（每条消耗 1.0）
+          2. 预算表是否整体异常（全天都 < 1.0 = 表错了，如时区错位）
+          3. 贴纸库/索引就绪度（开关开了但库空 = 静默不发表情）
+          4. 关系图谱与人格块体积（暴涨会拖垮缓存前缀）
+        **只告警、不改行为**（自检绝不动配置）。
+        """
+        try:
+            hour = self._local_hour()
+            budget = float(self.style.hourly_budget(hour)) if self.style else 0.0
+            logger.info(f"[selfcheck] 本地 {hour:02d} 时：本小时预算 {budget:.2f} 条")
+            if budget < 1.0:
+                logger.warning(
+                    f"[selfcheck] ⚠️ 本小时预算 {budget:.2f} < 1.0 → 主动插话**结构性静音**"
+                    f"（每条消耗 1.0）。检查 my_hourly_distribution.json 是否为本地时索引"
+                    f"（历史文件可能是 UTC，见 StyleProfile._hourly_local）"
+                )
+            if self.style is not None:
+                low = [h for h in range(24) if float(self.style.hourly_budget(h)) < 1.0]
+                if len(low) >= 20:
+                    logger.warning(
+                        f"[selfcheck] ⚠️ 全天 {len(low)}/24 小时预算 < 1.0 → 预算表整体异常"
+                        f"（多半是时区/量纲错位），主动插话几乎不可能触发"
+                    )
+            # 贴纸
+            scfg = self.config.get("sticker", {}) or {}
+            if int(scfg.get("enabled", 0)) == 1:
+                self._ensure_sticker()
+                if self._sticker is None:
+                    logger.warning("[selfcheck] ⚠️ sticker.enabled=1 但服务不可用 → 表情永远发不出")
+                else:
+                    snap = self._sticker.snapshot()
+                    logger.info(f"[selfcheck] 贴纸库 {snap['size']} 条 min_score={snap['min_score']}")
+                    if snap["size"] == 0:
+                        logger.warning(
+                            f"[selfcheck] ⚠️ sticker.enabled=1 但库为空"
+                            f"（{snap.get('load_error') or '索引未建'}）→ 静默不发表情"
+                        )
+                    if int(scfg.get("teach", 0)) == 1 and snap["size"] == 0:
+                        logger.warning("[selfcheck] ⚠️ 已教 [emote:] 语法但库为空 → 白教")
+            # 人格块体积（缓存前缀的核心成本）
+            if self.style is not None:
+                sp_len = len(self.style.system_prompt())
+                logger.info(f"[selfcheck] 人格提示词 {sp_len} 字符（含别名关系块，进缓存前缀）")
+                if sp_len > 20000:
+                    logger.warning(
+                        f"[selfcheck] ⚠️ 人格提示词 {sp_len} 字符偏大 → "
+                        f"每轮都要进前缀，检查 system_prompt_fragments/别名块是否失控"
+                    )
+        except Exception as e:
+            logger.warning(f"[selfcheck] 自检本身失败（不影响运行）: {e}")
+
+    def _tool_syntax_block(self) -> str:
+        """声明可用的动作语法。**内容恒定**（按开关拼一次），进缓存前缀。
+
+        为什么单独一条常量消息：标记语法必须**在提示词里教**模型才会用，
+        但内容恒定 → 放在前缀里"一次付清"，不逐轮付费。
+        两个开关各自控制（库空时不该教 `[emote:]` —— 写出来也没图可发）。
+        """
+        lines: list[str] = []
+        if int((self.config.get("sticker", {}) or {}).get("teach", 0)) == 1:
+            lines.append(
+                "如果你想在回复后配一张表情包，就在回复**末尾**写："
+                "`[emote:意图短语]`（如 `[emote:无奈地摇头]`、`[emote:害羞比心]`）。"
+                "短语描述你想表达的情绪或动作；选不中就不发，正文照常。"
+                "没有合适的表情时**不要**硬写这个标记。"
+            )
+        if int((self.config.get("poke", {}) or {}).get("teach", 0)) == 1:
+            lines.append(
+                "如果你想戳一下某人（QQ 的拍一拍），在回复里写 `[poke:对方的QQ号]`。"
+                "只在确实想引起对方注意时用，且必须是群里真实成员。"
+            )
+        if not lines:
+            return ""
+        return "［可用的表达标记］\n" + "\n".join(f"- {l}" for l in lines)
+
     def _build_turn_block(self, turn_lines: list[str], ctx: dict) -> str:
         """S2：构造「现在要回应的」块（pipeline 的 turn_block 回调）。
 
@@ -1278,6 +1379,92 @@ class PersonaAgent(Star):
             logger.warning(f"[persona_agent] llm returned error response, suppressed ({len(text)} chars)")
             return ""
         return text
+
+    # ---------------------------------------------------------- S3 动作链路
+
+    def _sticker_enabled(self) -> bool:
+        return int((self.config.get("sticker", {}) or {}).get("enabled", 0)) == 1
+
+    def _ensure_sticker(self) -> None:
+        """懒建 StickerService（复用已加载的 BGE，不新增模型）。"""
+        if self._sticker is not None:
+            return
+        scfg = self.config.get("sticker", {}) or {}
+        data_dir = str(self.data_dir)
+        index_path = str(scfg.get("index_path") or f"{data_dir}/sticker_index.json")
+        lib_dir = str(scfg.get("library_dir") or f"{data_dir}/sticker_library")
+        try:
+            from .services.sticker import StickerService, embed_via_rag
+            self._sticker = StickerService(
+                index_path,
+                embed_via_rag(self.rag),
+                library_dir=lib_dir,
+                top_k=int(scfg.get("top_k", 5)),
+                min_score=float(scfg.get("min_score", 0.68)),
+                margin=float(scfg.get("margin", 0.02)),
+            )
+            logger.info(
+                f"[persona_agent] sticker service ready: {self._sticker.size} 条"
+                f" | min_score={self._sticker.snapshot()['min_score']}"
+                f" load_error={self._sticker.snapshot().get('load_error') or 'none'}"
+            )
+        except Exception as e:
+            logger.warning(f"[persona_agent] sticker init failed: {e}")
+            self._sticker = None
+
+    async def _send_sticker(self, event: AstrMessageEvent, group_id: str, intent):
+        """执行 [emote:意图]：选图并**作为一条独立消息**发出。**绝不抛出**。
+
+        为什么用独立消息而非 chain_result：调用方（`on_group_message`）已经
+        `yield event.plain_result(...)` 发过正文了 —— 同一个 handler 里再 yield
+        一条即"正文一句 + 表情一张"的形态（spec §4.3 的"一句话 + 一张表情"）。
+        失败语义：选不中/库空/文件缺失/开关关 → **静默跳过，正文照发**。
+        """
+        result: dict = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "intent": intent.emote,
+            "sent": False,
+            "reason": "",
+        }
+        try:
+            if not self._sticker_enabled():
+                result["reason"] = "sticker.enabled=0"
+            else:
+                self._ensure_sticker()
+                if self._sticker is None:
+                    result["reason"] = "service_unavailable"
+                else:
+                    pick = await self._sticker.pick(intent.emote)
+                    result["top_k"] = pick.top_k[:5]
+                    result["via"] = pick.via
+                    if pick.hit is None:
+                        result["reason"] = pick.reason or "no_hit"
+                    else:
+                        result["id"] = pick.hit.id
+                        result["score"] = pick.hit.score
+                        path = pick.hit.path
+                        if not os.path.exists(path):
+                            result["reason"] = "file_missing"
+                        else:
+                            # ✅ 宿主源码确认（astrbot/core/message/components.py）：
+                            #    fromFileSystem 内部 `Path(path).resolve().as_uri()`
+                            #    并带 path= 字段 —— 原生支持本地文件，无需 base64 兜底。
+                            result["sent"] = True
+                            yield event.chain_result([Comp.Image.fromFileSystem(path)])
+        except Exception as e:
+            result["reason"] = f"{type(e).__name__}: {e}"
+        finally:
+            try:
+                self.store.append_jsonl(f"logs/{group_id}/sticker_log.jsonl", result)
+            except Exception:
+                pass
+            # 降级必须可见（S0 教训）：只在真的尝试过且没发成时告警，
+            # 开关关闭属正常静默、不刷日志。
+            if (not result["sent"]) and result["reason"] not in ("sticker.enabled=0", ""):
+                logger.info(
+                    f"[persona_agent] sticker skipped: {result['reason']}"
+                    f" intent={(result.get('intent') or '')[:20]!r}"
+                )
 
     async def _pipeline_generate(
         self,

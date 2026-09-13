@@ -90,6 +90,8 @@ class PersonaPipeline:
         buffer: Optional[ContextBuffer] = None,
         generate: Optional[GenerateFn] = None,
         examples_block: Optional[Callable[[], str]] = None,
+        # S3: 工具语法块（恒定；库空/未教学时为空串 → 不进上下文）
+        tool_syntax_block: Optional[Callable[[], str]] = None,
         # S2: 「现在要回应的」块构造器。pipeline 负责拆出正文/图片/表情，
         # main 负责加说话人/时间/心情等上下文（它才知道这些）。
         turn_block: Optional[Callable[[list[str], dict], str]] = None,
@@ -120,6 +122,7 @@ class PersonaPipeline:
         self.buffer = buffer
         self._generate = generate
         self._examples_block = examples_block
+        self._tool_syntax_block = tool_syntax_block
         # S2: 「现在要回应的」块构造器（可选；未接线时退回旧行为）
         self._turn_block = turn_block
         self._session_append = session_append
@@ -172,9 +175,17 @@ class PersonaPipeline:
             if self.session_mgr is not None
             else []
         )
+        # 恒定块（都进缓存前缀）：工具语法 → 示例块 → session
+        # 工具语法在前：_tool_syntax_block()
+        ts_block = (
+            self._tool_syntax_block() if self._tool_syntax_block is not None else ""
+        )
+        if ts_block:
+            contexts.insert(0, {"role": "system", "content": ts_block})
         ex_block = self._examples_block() if self._examples_block is not None else ""
         if ex_block:
-            contexts.insert(0, {"role": "system", "content": ex_block})
+            # 插在工具语法之后（保持"越靠前越恒定"）
+            contexts.insert(1 if ts_block else 0, {"role": "system", "content": ex_block})
         if kg_content:
             contexts.append({"role": "system", "content": kg_content})
         return contexts

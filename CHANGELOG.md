@@ -25,6 +25,28 @@
 - **日记 `day` 偏移一天**：归档 09-12 的会话，`day` 却取轮换后的 `day_key()`（09-13）。改为按同一口径回推 24h
 - **provider id 写错会静默哑掉（新增加固）**：`_resolve_provider_id()` 现在**先校验配置值存在性** —— 写成不存在的 id 时 `llm_generate` 抛 `ProviderNotFoundError`、被 except 吞成空回复（又一条"看起来正常其实全哑"）。校验失败 → 告警 + 回退到会话 provider；拿不到 `provider_manager` 时返回"未知"照用配置值（不让校验本身成为故障源）。三级回退逻辑抽为纯函数 `llm_params.resolve_provider_id()`，可离线单测（+8 例）
 
+### Added (2026-09-13, S3③ 出站发贴纸 + 提示词教学 + 开关 + 启动自检)
+- **出站发贴纸接通**：`main._send_sticker()` —— `SendIntent.emote` → `StickerService.pick()`
+  → `Comp.Image.fromFileSystem(path)`（✅ 读宿主源码确认原生支持本地文件通路，
+  不需 base64 兜底）。**与正文分两条消息**发出（"一句话 + 一张表情"形态）。
+- **失败一律静默跳过、正文照发**：开关关/库空/service 不可用/低于阈值/候选并列/
+  文件缺失/发送异常 —— 每次尝试都落 `logs/<gid>/sticker_log.jsonl`
+  （含 `intent`/`top_k` 分数/`via`/`sent`/`reason`），降级必须可见。
+- **提示词教学（`tool_syntax_block`）**：把 `[emote:…]`/`[poke:…]` 语法作为
+  **恒定 system 消息**注入（内容固定 → 进缓存前缀，一次付清）。
+  两个开关各自控制（`sticker.teach` / `poke.teach`，默认 0）——
+  **库为空时不该教**（写出来也没图可发，白占 token）。
+- **`_conf_schema.json`**：新增 `sticker` 块（enabled/index_path/library_dir/top_k/
+  min_score/margin/picker_*/teach）与 `poke` 的 `hourly_cap`（原硬编码 4）、
+  `proactive_*`、`teach`。
+- **启动自检 `_startup_selfcheck()`** —— 专门拦"配额类参数静默失效"（本轮
+  hourly_budget 时区错位就是这么藏了两周）：
+  ① 当前小时预算（<1.0 即"结构性静音"，因为每条消耗 1.0）
+  ② 全天 ≥20 小时预算 <1.0 → 预算表整体异常（时区/量纲错位）
+  ③ 贴纸开关开了但库空 → 静默不发表情；已教语法但库空 → 白教
+  ④ 人格提示词体积（>20000 字符告警，它每轮都进缓存前缀）
+  **只告警、不改行为**。
+
 ### Fixed (2026-09-13, S3② 贴纸阈值标定 —— 拍脑袋的初值会让"任何意图都匹配上")
 - **🔴 `min_score=0.45` 比所有负样本都低**：真实库（878 张）标定结果 ——
   正样本（该选的，同主题 tags 组合查询）top1 **p05=0.737 / p50=0.846**；
