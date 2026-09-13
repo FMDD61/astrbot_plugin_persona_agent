@@ -253,6 +253,87 @@ class TestTraceAndQuote(unittest.TestCase):
         self.assertIsNone(si.poke)
 
 
+class TestQuoteSnapshotIsolation(unittest.TestCase):
+    """B-001 回归：``[r:-N]`` 必须对**生成前冻结**的编号基求值。
+
+    线上事故（2026-09-13 11:45，群 100000001）：LLM 看到的是「@我的那条」，
+    但生成窗口内又进了 1 条，解析时对实时 buffer 求值 → 引用了后来那条。
+    本组测试用「生成期间往 session 塞新消息」精确复现该窗口。
+    """
+
+    def _pipeline_with_session(self, gen, session_mgr):
+        return _pipeline(generate=gen, session=session_mgr)
+
+    def test_numbering_basis_is_frozen_at_generation_time(self):
+        from services.session_manager import SessionManager
+
+        sm = SessionManager(data_dir=None, max_messages=None)
+        sm.append("g1", "user", "被 @ 的那条", name="成员丙",
+                  message_id="MID-AT", sender_uin="100000002")
+
+        async def gen_with_new_message(t, c, e, temp, su, umo):
+            # 生成窗口内，群里又来了消息（正是线上事故的时间窗）
+            sm.append("g1", "user", "生成期间新到的", name="成员甲",
+                      message_id="MID-LATE", sender_uin="100000003")
+            return "[r:-1] 才没有啦"
+
+        p = self._pipeline_with_session(gen_with_new_message, sm)
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+
+        # 旧实现对实时 buffer 求值 → 会引用 MID-LATE（错）
+        self.assertEqual(si.quote_id, "MID-AT")
+        self.assertEqual(si.text, "才没有啦")
+        self.assertEqual(si.trace["quote_n"], 1)
+        self.assertTrue(si.trace["quote_resolved"])
+        self.assertEqual(si.trace["quote_target_uin"], "100000002")
+        self.assertEqual(si.trace["quote_target_alias"], "成员丙")
+        self.assertEqual(si.trace["quote_basis"], 1)  # 冻结基长度 = 1
+
+    def test_bot_reply_occupies_a_slot_but_is_not_quotable(self):
+        from services.session_manager import SessionManager
+
+        sm = SessionManager(data_dir=None, max_messages=None)
+        sm.append("g1", "user", "一", name="甲", message_id="m1", sender_uin="u1")
+        sm.append("g1", "assistant", "机器人上一句")          # 占位、无 id
+        sm.append("g1", "user", "二", name="乙", message_id="m2", sender_uin="u2")
+
+        gen = lambda t, c, e, temp, su, umo: _async("[r:-2] 嗯")
+        p = self._pipeline_with_session(gen, sm)
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+        # [r:-2] 指向机器人的回复 → 不可引用：剥标记、发纯文本、trace 留痕
+        self.assertIsNone(si.quote_id)
+        self.assertEqual(si.text, "嗯")
+        self.assertTrue(si.trace.get("quote_target_missing"))
+        self.assertEqual(si.trace["quote_n"], 2)
+
+    def test_empty_entries_do_not_shift_numbering(self):
+        """B-002 × B-001 交叉：空 content 被丢弃后编号基必须同步丢弃。"""
+        from services.session_manager import SessionManager
+
+        sm = SessionManager(data_dir=None, max_messages=None)
+        sm.append("g1", "user", "旧", name="甲", message_id="m-old", sender_uin="u1")
+        sm.append("g1", "user", "", name="脏", message_id="m-dirty", sender_uin="u9")
+        sm.append("g1", "user", "新", name="乙", message_id="m-new", sender_uin="u2")
+
+        gen = lambda t, c, e, temp, su, umo: _async("[r:-2] 早的")
+        p = self._pipeline_with_session(gen, sm)
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+        self.assertEqual(si.quote_id, "m-old")
+        self.assertNotEqual(si.quote_id, "m-dirty")
+
+    def test_trace_records_unresolvable_quote(self):
+        from services.session_manager import SessionManager
+
+        sm = SessionManager(data_dir=None, max_messages=None)
+        sm.append("g1", "user", "只有一条", name="甲", message_id="m1", sender_uin="u1")
+        gen = lambda t, c, e, temp, su, umo: _async("[r:-9] 越界")
+        p = self._pipeline_with_session(gen, sm)
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+        self.assertIsNone(si.quote_id)
+        self.assertFalse(si.trace["quote_resolved"])
+        self.assertEqual(si.text, "越界")
+
+
 
 class TestRagEnabled(unittest.TestCase):
     """A7③: rag.enabled=0 \u4e0d\u67e5 RAG + trace \u8bb0 disabled; \u5355\u6b21\u68c0\u7d22\u590d\u7528 (pipeline+KG \u4e00\u8f6e\u53ea 1 \u6b21)."""

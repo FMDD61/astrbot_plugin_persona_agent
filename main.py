@@ -183,6 +183,14 @@ class PersonaAgent(Star):
         else:
             logger.info("[persona_agent] GateLLM decision layer disabled (gate.enabled=0)")
 
+        # S0: 启动即解析一次 provider —— 让 02:05 的日记/摘要 cron 不再依赖
+        # 「当天先有人触发过一轮回复」。异步、失败仅告警，不阻塞加载。
+        # 放在 initialize 末尾：确保 _last_provider_id 等实例属性已就绪。
+        try:
+            asyncio.get_running_loop().create_task(self._warm_provider_id())
+        except RuntimeError:
+            pass
+
         self._dream_job = DreamJob(self._memory_store, str(self.data_dir))
 
         dream_cfg = self.config.get("dream", {}) or {}
@@ -225,6 +233,8 @@ class PersonaAgent(Star):
         diary_cfg = self.config.get("diary", {}) or {}
         self._diary_enabled = int(diary_cfg.get("enabled", 1)) == 1
         self._last_provider_id: Optional[str] = None
+        # S0: pipeline 主链路（无 event）落 cache probe 用的群号
+        self._probe_group_id: str = ""
         # Test-time sleep override: "awake" / "sleep" / None(window applies);
         # in-memory only, resets on restart.
         self._sleep_override: Optional[str] = None
@@ -623,7 +633,17 @@ class PersonaAgent(Star):
             # G9: unknown caller -> append a 'new' member entry (async, safe)
             sender_name = str(event.get_sender_name() or "")
             asyncio.create_task(asyncio.to_thread(self._auto_add_member, str(sender_uin), sender_name))
-        self.session_mgr.append(group_id, "user", text, name=alias)
+        # B-001: message_id 随条目入 session —— 使 ``[r:-N]`` 的编号基与
+        # 「真正进 session 的消息」逐条对齐（此前 session 无 id，解析只能对
+        # 实时 buffer 求值，而 buffer 含被媒体过滤掉的纯图消息 → 双错位）。
+        self.session_mgr.append(
+            group_id,
+            "user",
+            text,
+            name=alias,
+            message_id=str(getattr(event.message_obj, "message_id", "") or ""),
+            sender_uin=str(sender_uin or ""),
+        )
 
         # v3: sleep window — bot stays silent (mimics human rest) but the
         # message has already joined the session/memory for the new day.
@@ -1063,9 +1083,7 @@ class PersonaAgent(Star):
         where no event object exists). When omitted, falls back to event.
         """
         local_hour = self._local_hour()
-        sys_prompt = self.style.system_prompt(local_hour=local_hour) if self.style else ""
-        if emotion and emotion.current_mood:
-            sys_prompt = f"{sys_prompt}\n\n{emotion.current_mood}"
+        sys_prompt = self.style.system_prompt() if self.style else ""
 
         # Dynamic current-speaker hint (2026-08-23 fix): inserted BEFORE the
         # KG tail (KG stays the last message -> cache prefix untouched; line is
@@ -1091,19 +1109,25 @@ class PersonaAgent(Star):
         else:
             contexts.append({"role": "system", "content": speaker_line})
 
-        provider_id = (self.config.get("llm") or {}).get("provider_id", "") or None
-        if not provider_id:
-            try:
-                provider_id = await self.context.get_current_chat_provider_id(
-                    umo if umo is not None else event.unified_msg_origin
-                )
-            except Exception:
-                provider_id = None
+        # 逐轮易变信息（时间 + 心情）—— 放在**上下文末尾**，不再拼进 system
+        # prompt。system prompt 是请求的第一个 token 位置，它一变后面整段会话
+        # 前缀全部 miss（原设计每小时废一次全量缓存；心情有值时 30s 一次）。
+        # 位置：speaker_line 之后、KG 尾注之前 —— 与既有「稳定在上、易变在下」
+        # 的顺序一致，且 KG 尾注仍是最后一条。
+        mood = emotion.current_mood if emotion else ""
+        vol = self.style.volatile_line(local_hour=local_hour, mood=mood) if self.style else ""
+        if vol:
+            if contexts and isinstance(contexts[-1], dict) and contexts[-1].get("role") == "system":
+                contexts.insert(-1, {"role": "system", "content": vol})
+            else:
+                contexts.append({"role": "system", "content": vol})
 
+        provider_id = await self._resolve_provider_id(
+            umo if umo is not None else event.unified_msg_origin
+        )
         if not provider_id:
             logger.warning("[persona_agent] no LLM provider available")
             return ""
-        self._last_provider_id = provider_id
 
         gen_kwargs = {}
         if temperature is not None:
@@ -1112,10 +1136,16 @@ class PersonaAgent(Star):
         # "off"/"none" 会 HTTP 400 → reasoning_value 返回 None 表示不发送该参数
         # （2026-09-10 实测：旧映射 off→"none" 导致每次调用 400 → 空回复静默）。
         _rv = reasoning_value(
-            (self.config.get("llm") or {}).get("reasoning_effort", "off")
+            (self.config.get("llm") or {}).get("reasoning_effort", "low")
         )
         if _rv:
             gen_kwargs["reasoning_effort"] = _rv
+        # S0 修复：``llm.max_tokens`` 此前只在 schema 里存在，**生成路径从未读取**
+        # 它（只有离线测试台用）—— 配置项与实际行为不符。这里接上，使
+        # 「512 才能容纳思考开销」这条实测结论真正生效。
+        _mt = int((self.config.get("llm") or {}).get("max_tokens", 512) or 0)
+        if _mt > 0:
+            gen_kwargs["max_tokens"] = _mt
         try:
             resp = await self.context.llm_generate(
                 chat_provider_id=provider_id,
@@ -1129,9 +1159,17 @@ class PersonaAgent(Star):
             return ""
 
         if int((self.config.get("llm") or {}).get("cache_probe_enabled", 1)) == 1:
-            # probe needs a real event (group_id); skip in standalone mode
-            if event is not None:
-                self._log_llm_probe(event, contexts, sys_prompt, provider_id, resp, local_hour)
+            # S0 修复：探针此前要求 event 对象，而 pipeline 主链路走的是
+            # standalone（event=None）→ **线上回复从未落过探针**（实测 105 行
+            # 全停在 2026-08-27，且只有 topic 路径写入），缓存命中率长期无数据。
+            # 这里同时接受显式 group_id，使主链路也能观测。
+            gid = (
+                str(event.get_group_id() or "")
+                if event is not None
+                else str(self._probe_group_id or "")
+            )
+            if gid:
+                self._log_llm_probe(event, contexts, sys_prompt, provider_id, resp, local_hour, group_id=gid)
 
         text = (getattr(resp, "completion_text", "") or "").strip()
         if self._is_error_response(text):
@@ -1151,10 +1189,13 @@ class PersonaAgent(Star):
         """Pipeline generate callback: standalone LLM call (no event object).
 
         Reuses _generate_reply in standalone mode (event=None + explicit
-        speaker_uin/umo); probe is skipped because there is no event.
+        speaker_uin/umo).
+        S0: 同时把 group_id 从 umo 解出来，供 cache probe 落盘 —— 此前
+        standalone 模式直接跳过探针，导致线上主回复链路的缓存命中率无数据。
         """
         if self.style is None:
             return ""
+        self._probe_group_id = self._group_id_from_umo(umo)
         try:
             return await self._generate_reply(
                 None,  # type: ignore[arg-type]  # standalone mode
@@ -1168,6 +1209,18 @@ class PersonaAgent(Star):
         except Exception as e:
             logger.exception(f"[persona_agent] pipeline generate failed: {e}")
             return ""
+
+    @staticmethod
+    def _group_id_from_umo(umo: Optional[str]) -> str:
+        """从 unified_msg_origin 里取群号：'aiocqhttp:GroupMessage:100000001'。
+
+        PrivateMessage 形如 'aiocqhttp:FriendMessage:100000002' → 返回空字符串
+        （私聊不属目标群，不落探针）。
+        """
+        parts = str(umo or "").split(":")
+        if len(parts) >= 3 and parts[1] == "GroupMessage":
+            return parts[2]
+        return ""
 
     @staticmethod
     def _postprocess_plain(text: str) -> str:
@@ -1220,12 +1273,7 @@ class PersonaAgent(Star):
             return
         self._vision_resolving = True
         try:
-            provider_id = (self.config.get("llm") or {}).get("provider_id", "") or self._last_provider_id
-            if not provider_id:
-                try:
-                    provider_id = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
-                except Exception:
-                    provider_id = None
+            provider_id = await self._resolve_provider_id(event.unified_msg_origin)
             if not provider_id:
                 logger.warning("[persona_agent] vision init skipped: no provider id")
                 return
@@ -1295,16 +1343,53 @@ class PersonaAgent(Star):
         except Exception as e:
             logger.warning(f"[persona_agent] auto-add member failed: {e}")
 
+    async def _warm_provider_id(self) -> None:
+        """S0: 启动时预热 provider 解析（cron 任务不再依赖「先有人 @ 过」）。"""
+        try:
+            pid = await self._resolve_provider_id()
+            if pid:
+                logger.info(f"[persona_agent] provider resolved at startup: {pid}")
+            else:
+                logger.warning("[persona_agent] provider unresolved at startup")
+        except Exception as e:
+            logger.warning(f"[persona_agent] provider warmup failed: {e}")
+
+    async def _resolve_provider_id(self, umo: Optional[str] = None) -> Optional[str]:
+        """单一 provider 解析收口（S0）。
+
+        此前四处各自读 ``llm.provider_id or self._last_provider_id``，而后者
+        **只在真的生成过回复后**才被赋值 → 02:05 的日记 cron 若当天无人 @ 过
+        就永远拿不到 provider（实测日志 ``diary skipped: no provider id known
+        yet``）。这里统一为：配置值 → 本进程已知值 → AstrBot 当前会话 provider。
+
+        成功解析后缓存到 ``_last_provider_id``，使 cron/异步任务不再依赖
+        「先有人触发过一轮回复」。
+        """
+        cfg_pid = (self.config.get("llm") or {}).get("provider_id", "") or ""
+        if cfg_pid:
+            self._last_provider_id = cfg_pid
+            return cfg_pid
+        if self._last_provider_id:
+            return self._last_provider_id
+        try:
+            pid = await self.context.get_current_chat_provider_id(umo or "")
+        except Exception as e:
+            logger.debug(f"[persona_agent] provider resolve failed: {e}")
+            pid = None
+        if pid:
+            self._last_provider_id = pid
+        return pid or None
+
     async def _emotion_llm(self, prompt: str) -> str:
         """G10: emotion analysis call (3s timeout enforced by the provider).
 
         A7④: 结构化 JSON 任务 → 低温(0.2) + 思考 off（配置可调），输出稳定。
         """
-        provider = (self.config.get("llm") or {}).get("provider_id", "") or self._last_provider_id
+        provider = await self._resolve_provider_id()
         if not provider:
             raise RuntimeError("no LLM provider available for emotion")
         ecfg = self.config.get("emotion", {}) or {}
-        _erv = reasoning_value(ecfg.get("reasoning_effort", "off"))
+        _erv = reasoning_value(ecfg.get("reasoning_effort", "low"))
         resp = await self.context.llm_generate(
             chat_provider_id=provider,
             prompt=prompt,
@@ -1322,11 +1407,11 @@ class PersonaAgent(Star):
         GateService, which converts them to conservative silence.
         A7④: 结构化判断/未来工具选择 → 低温(0.2) + 思考 off（配置可调）。
         """
-        provider = (self.config.get("llm") or {}).get("provider_id", "") or self._last_provider_id
+        provider = await self._resolve_provider_id()
         if not provider:
             raise RuntimeError("no LLM provider available for gate")
         gcfg = self.config.get("gate", {}) or {}
-        _grv = reasoning_value(gcfg.get("reasoning_effort", "off"))
+        _grv = reasoning_value(gcfg.get("reasoning_effort", "low"))
         resp = await self.context.llm_generate(
             chat_provider_id=provider,
             prompt=prompt,
@@ -1338,20 +1423,23 @@ class PersonaAgent(Star):
 
     def _log_llm_probe(
         self,
-        event: AstrMessageEvent,
+        event: Optional[AstrMessageEvent],
         contexts: list[dict],
         sys_prompt: str,
         provider_id: str,
         resp: object,
         local_hour: int,
+        group_id: str = "",
     ) -> None:
         """Observability probe: session continuity + provider KV/prefix-cache usage.
 
         Appends one record to llm_cache_probe.jsonl per generation. Never
         raises; failures only warn. Exists for the 2026-08 evaluation round.
+
+        S0: ``group_id`` 显式传入，使无 event 的 pipeline 主链路也能落探针。
         """
         try:
-            gid = str(event.get_group_id() or "")
+            gid = group_id or (str(event.get_group_id() or "") if event is not None else "")
             session_size = self.session_mgr.size(gid) if self.session_mgr else -1
             kg_tail_chars = 0
             if contexts and isinstance(contexts[-1], dict) and contexts[-1].get("role") == "system":
@@ -1492,11 +1580,17 @@ class PersonaAgent(Star):
         if not msgs:
             return
         try:
-            if not self._last_provider_id:
+            provider = await self._resolve_provider_id()
+            if not provider:
                 logger.info("[persona_agent] diary skipped: no provider id known yet")
                 return
-            sys_prompt = self.style.system_prompt(local_hour=self._local_hour()) if self.style else ""
+            sys_prompt = self.style.system_prompt() if self.style else ""
             contexts = [dict(m) for m in msgs]
+            # 逐轮易变量（时间）同样挪到上下文末尾 —— 保持 system prompt 恒定，
+            # 让「归档日会话」这段前缀可被网关缓存复用（v3 设计意图）。
+            vol = self.style.volatile_line(local_hour=self._local_hour()) if self.style else ""
+            if vol:
+                contexts.append({"role": "system", "content": vol})
             contexts.append({
                 "role": "user",
                 "content": (
@@ -1505,7 +1599,7 @@ class PersonaAgent(Star):
                 ),
             })
             resp = await self.context.llm_generate(
-                chat_provider_id=self._last_provider_id,
+                chat_provider_id=provider,
                 prompt=None,
                 system_prompt=sys_prompt,
                 contexts=contexts,
@@ -1514,8 +1608,11 @@ class PersonaAgent(Star):
             if not summary or self._is_error_response(summary):
                 logger.warning("[persona_agent] diary skipped: empty/error response")
                 return
+            # 复盘修正（2026-09-13）：day 此前取 ``day_key()``（**轮换后**的新日期），
+            # 而 msgs 是**刚被归档的那一天** → 日记日期整体偏移一天。
+            # 归档日 = 新日期的前一天（用同一个 day_key 口径回推 24h）。
             record = {
-                "day": self.session_mgr.day_key(),
+                "day": self.session_mgr.day_key(time.time() - 86400.0),
                 "group_id": group_id,
                 "summary": summary,
                 "n_messages": len(msgs),
@@ -1557,14 +1654,14 @@ class PersonaAgent(Star):
             if not collected["diaries"] and not collected["samples"]:
                 logger.info(f"[persona_agent] {kind} summary: no data for {gid}, skipped")
                 continue
-            provider = (self.config.get("llm") or {}).get("provider_id", "") or self._last_provider_id
+            provider = await self._resolve_provider_id()
             if not provider:
                 logger.warning(f"[persona_agent] {kind} summary skipped: no provider id")
                 continue
             prompt = build_prompt(
                 kind, gid, collected["label"], collected["diaries"], collected["samples"],
             )
-            sys_prompt = self.style.system_prompt(local_hour=self._local_hour())
+            sys_prompt = self.style.system_prompt()
             try:
                 resp = await self.context.llm_generate(
                     chat_provider_id=provider,

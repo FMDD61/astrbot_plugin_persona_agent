@@ -224,6 +224,14 @@ class PersonaPipeline:
             "mood": emotion_state.current_mood,
             "sticker": emotion_state.sticker_prompt,
         }
+        # S0 观测：情绪 provider **内部**吞掉的失败（超时/解析/网络）。
+        # 这些失败会静默回退成中性值，且与「模型正常输出中性值」在 trace 上
+        # 完全无法区分 —— 2026-09-13 实测 2262 条 trace 全部 willingness=1.0/
+        # mood="" 就是这个盲区藏了十几天的（真因：3s 超时 < 模型 4-8s 耗时）。
+        # 故把内部失败原因显式带出来，成为可统计的降级率。
+        _einfo = getattr(self.emotion, "last_error", None) if self.emotion is not None else None
+        if _einfo:
+            trace["emotion_degraded"] = str(_einfo)
 
         # ---- interjection hard gate ----
         last_msg_ts = self.buffer.last_ts() if self.buffer is not None else self._now()
@@ -280,6 +288,12 @@ class PersonaPipeline:
             except Exception as e:
                 trace["gate_error"] = f"{type(e).__name__}: {e}"
             trace["gate"] = gate_d.to_log(group_id, inp.sender_uin)
+            # S0 观测：gate 内部降级原因（超时/坏 JSON → 保守静默）。
+            # gate_log 里 fallback=true 只能说明「降级了」，看不出是超时还是模型
+            # 真的判不该回 —— 这里把原因补全，成为可统计的降级率。
+            _ginfo = getattr(self.gate, "last_error", None)
+            if _ginfo:
+                trace["gate_degraded"] = str(_ginfo)
             # 安全阀：conflict=true 强制不发言（无论 reply/action，含 @ 与 topic）
             if gate_d.conflict or not gate_d.reply:
                 reason = gate_d.reason
@@ -349,6 +363,24 @@ class PersonaPipeline:
             "size": len(contexts),
             "chars": sum(len(c.get("content", "")) for c in contexts),
         }
+        # B-002 观测：本会话被丢弃的空 content 条目（>0 = 数据曾损坏，已自愈）
+        if self.session_mgr is not None and hasattr(self.session_mgr, "dropped_empty"):
+            try:
+                _de = self.session_mgr.dropped_empty(group_id)
+                if _de:
+                    trace["session_empty_dropped"] = int(_de)
+            except Exception:
+                pass
+
+        # B-001: 冻结 ``[r:-N]`` 的编号基 —— 必须在建上下文之后、生成之前。
+        # 生成窗口内新到的消息从此与本轮引用解析无关（旧实现对实时 buffer
+        # 求值，窗口内每进 1 条就整体偏移 1 位，实测错位率 1/3–1/2）。
+        quote_index = None
+        if self.session_mgr is not None and hasattr(self.session_mgr, "quote_snapshot"):
+            try:
+                quote_index = self.session_mgr.quote_snapshot(group_id)
+            except Exception as e:
+                trace["quote_snapshot_error"] = f"{type(e).__name__}: {e}"
 
         # ---- debounce + generate ----
         await asyncio.sleep(self._debounce_sec)
@@ -374,18 +406,49 @@ class PersonaPipeline:
         trace["raw_generation"] = reply_text[:500]
 
         # ---- quote extract (BEFORE postprocess: postprocess strips [r:-N]) ----
+        # B-001: 对**生成前冻结的** QuoteIndex 求值（编号基 = LLM 当时所见），
+        # 而不是对实时 buffer —— 后者会因生成窗口内新到的消息整体偏移。
         quote_n: Optional[int] = None
         quote_id: Optional[str] = None
+        quote_alias = ""
+        quote_uin = ""
+        quote_basis: Optional[int] = None
         body_text = reply_text
         try:
             body_text_no_q, qn = text_style.extract_quote(reply_text)
             quote_n = qn
-            if qn is not None and self.buffer is not None:
-                quote_id = self.buffer.quote_target(qn)
-            if quote_id:
+            if qn is not None:
+                if quote_index is not None:
+                    quote_basis = len(quote_index)
+                    hit = quote_index.resolve(qn)
+                    if hit is not None:
+                        quote_id = hit.message_id
+                        quote_alias = hit.alias
+                        quote_uin = hit.sender_uin
+                elif self.buffer is not None:
+                    # 退化：session 未接线（离线单测 / 无 session 场景）
+                    quote_id = self.buffer.quote_target(qn)
+            # ★ 无论是否解析出目标，标记都必须剥离 —— 泄漏到群里就是乱码。
+            #   （此前只在 quote_id 非空时剥离，解析失败会把 [r:-N] 原样发出；
+            #   实测线上真的发生过，见 data_out/snowluma_quote_chain_verified_with_bug.md）
+            if quote_n is not None:
                 body_text = body_text_no_q
-        except Exception:
-            pass  # quote parse failure -> send plain text (no marker leak)
+        except Exception as e:
+            trace["quote_error"] = f"{type(e).__name__}: {e}"
+
+        # B-001 审计字段：此前 trace 没有 quote 字段，导致 2026-09-13 那次错位
+        # 排查只能靠人工比对 SnowLuma 日志。有了这几列即可直读 + 统计错位率。
+        if quote_n is not None:
+            trace["quote_n"] = quote_n
+            trace["quote_id"] = quote_id
+            trace["quote_resolved"] = bool(quote_id)
+            trace["quote_basis"] = quote_basis
+            if quote_id:
+                trace["quote_target_alias"] = quote_alias
+                trace["quote_target_uin"] = quote_uin
+            else:
+                # 解不出目标 → 标记为未解析（标记被剥离、正文照发）
+                trace["quote_target_missing"] = True
 
         # ---- postprocess on the body (after quote marker removed) ----
         clean_text = body_text

@@ -33,17 +33,51 @@ class Session:
     """Session day key (rotation window), empty until first use."""
     messages: deque[dict] = field(default_factory=lambda: deque(maxlen=600))
 
-    def append(self, role: str, content: str, name: Optional[str] = None) -> None:
+    def append(
+        self,
+        role: str,
+        content: str,
+        name: Optional[str] = None,
+        *,
+        message_id: str = "",
+        sender_uin: str = "",
+    ) -> None:
         msg: dict = {"role": role, "content": content}
         if name and role == "user":
             msg["name"] = name
+        # B-001: 内部元数据。仅用于 ``[r:-N]`` 引用目标解析（编号基与 LLM 所见
+        # 一致），**绝不进 LLM 请求** —— 所有对外出口都经 ``_public`` 剥离。
+        if message_id:
+            msg["_mid"] = str(message_id)
+        if sender_uin and role == "user":
+            msg["_uin"] = str(sender_uin)
         self.messages.append(msg)
 
     def get_messages(self) -> list[dict]:
-        return list(self.messages)
+        """公开条目（剥离内部键 + 丢弃空 content）。
+
+        B-002: 历史脏数据里出现过 ``content=""`` 的条目，原样送进 LLM 会让
+        网关返回 HTTP 400 ``user message must have content``，插件的 try/except
+        把异常吞掉 → 表现为「收到消息但永远不回复」的永久静默。
+        这里在唯一收口点过滤：正常会话无空条目 → **零行为变化**。
+        """
+        return [_public(m) for m in self.messages if _has_content(m)]
+
+    def quote_entries(self) -> list[tuple[str, str, str]]:
+        """引用编号基的原始三元组（与 ``get_messages()`` 逐条对齐）。
+
+        ``get_messages()`` 会丢弃空 content 条目，这里必须用**同一过滤**，
+        否则编号基又会与 LLM 所见错位 —— 那正是 B-001 的次要成因。
+        """
+        return [
+            (str(m.get("_mid") or ""), str(m.get("_uin") or ""), str(m.get("name") or ""))
+            for m in self.messages
+            if _has_content(m)
+        ]
 
     def recent(self, n: int = 20) -> list[dict]:
-        items = list(self.messages)
+        # 与 get_messages 同过滤，保证调用方看到的内容一致（B-002）
+        items = [_public(m) for m in self.messages if _has_content(m)]
         return items[-n:] if len(items) > n else items
 
     def size(self) -> int:
@@ -51,6 +85,26 @@ class Session:
 
     def clear(self) -> None:
         self.messages.clear()
+
+
+# 内部元数据键前缀：绝不进 LLM 请求/对外 API
+_INTERNAL_PREFIX = "_"
+
+
+def _public(msg: dict) -> dict:
+    """抹掉内部元数据键（``_mid``/``_uin``）。无元数据时原样返回。"""
+    if not any(k.startswith(_INTERNAL_PREFIX) for k in msg):
+        return msg
+    return {k: v for k, v in msg.items() if not k.startswith(_INTERNAL_PREFIX)}
+
+
+def _has_content(msg) -> bool:
+    """B-002 判据：content 非空白。非 dict / 非 str 一律视为无内容。"""
+    if not isinstance(msg, dict):
+        return False
+    c = msg.get("content")
+    return isinstance(c, str) and bool(c.strip())
+
 
 
 class SessionManager:
@@ -71,6 +125,8 @@ class SessionManager:
         self._sessions: dict[str, Session] = {}
         self._last_save: dict[str, float] = {}
         self._saved_at_count: dict[str, int] = {}
+        # B-002 观测：恢复期丢弃的空 content 条目（>0 说明数据曾损坏）
+        self._empty_dropped: dict[str, int] = {}
         self._lock = threading.Lock()
 
     def _get_or_create(self, group_id: str) -> Session:
@@ -89,16 +145,39 @@ class SessionManager:
             dt = dt - datetime.timedelta(days=1)
         return dt.strftime("%Y-%m-%d")
 
-    def append(self, group_id: str, role: str, content: str, name: Optional[str] = None) -> None:
+    def append(
+        self,
+        group_id: str,
+        role: str,
+        content: str,
+        name: Optional[str] = None,
+        *,
+        message_id: str = "",
+        sender_uin: str = "",
+    ) -> None:
         with self._lock:
             sess = self._get_or_create(group_id)
-        sess.append(role, content, name=name)
+        sess.append(
+            role, content, name=name, message_id=message_id, sender_uin=sender_uin
+        )
         self._maybe_save(group_id)
 
     def get_contexts(self, group_id: str) -> list[dict]:
         with self._lock:
             sess = self._get_or_create(group_id)
         return sess.get_messages()
+
+    def quote_snapshot(self, group_id: str):
+        """B-001: 冻结当前编号基，供 ``[r:-N]`` 在生成结束后求值。
+
+        必须在**构建上下文之后、发起生成之前**调用。返回 ``QuoteIndex``
+        （不可变），生成窗口内新到的消息不会影响它。
+        """
+        from .context_buffer import QuoteIndex
+
+        with self._lock:
+            sess = self._get_or_create(group_id)
+        return QuoteIndex.from_entries(sess.quote_entries())
 
     def recent(self, group_id: str, n: int = 20) -> list[dict]:
         with self._lock:
@@ -109,6 +188,19 @@ class SessionManager:
         with self._lock:
             sess = self._get_or_create(group_id)
         return sess.size()
+
+    def dropped_empty(self, group_id: str) -> int:
+        """B-002 观测：本会话被丢弃的空 content 条目数（自愈计数）。"""
+        with self._lock:
+            sess = self._sessions.get(group_id)
+            if sess is None:
+                return 0
+            return sum(1 for m in sess.messages if not _has_content(m))
+
+    def empty_dropped_on_load(self) -> dict[str, int]:
+        """B-002 观测：启动恢复期丢弃的空 content 条目数（按群）。"""
+        with self._lock:
+            return dict(self._empty_dropped)
 
     def clear(self, group_id: str) -> None:
         with self._lock:
@@ -264,13 +356,24 @@ class SessionManager:
                 skipped += 1
         for gid, (day, payload) in best.items():
             msgs = payload.get("messages") or []
+            # B-002: 恢复时同样过滤空 content（脏数据可能来自旧版本插件）。
+            # B-001: 保留 _mid/_uin 元数据（deque 整体迁移，不重建条目）。
             cleaned = [
-                m for m in msgs
+                _public(m) | {
+                    k: m[k] for k in ("_mid", "_uin") if m.get(k)
+                }
+                for m in msgs
+                if _has_content(m) and m.get("role") in ("user", "assistant")
+            ]
+            dropped = sum(
+                1 for m in msgs
                 if isinstance(m, dict)
                 and m.get("role") in ("user", "assistant")
-                and isinstance(m.get("content"), str)
-            ]
+                and not _has_content(m)
+            )
             with self._lock:
+                if dropped:
+                    self._empty_dropped[gid] = self._empty_dropped.get(gid, 0) + dropped
                 if gid not in self._sessions:
                     sess = Session(group_id=gid)
                     sess.messages = deque(maxlen=self._max_messages)
