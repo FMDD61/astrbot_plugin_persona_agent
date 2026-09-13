@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from . import kg_stopwords
+
 
 @dataclass
 class MemoryEvent:
@@ -96,11 +98,26 @@ END;
 class MemoryStore:
     """SQLite-backed ADD-only entity + relation graph."""
 
-    def __init__(self, data_dir: str) -> None:
+    def __init__(
+        self,
+        data_dir: str,
+        *,
+        topic_min_occurrences: int = 2,
+        keyword_fn=None,
+    ) -> None:
         self._dir = Path(data_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
         self._db_path = str(self._dir / "memory_store.db")
         self._lock = threading.Lock()
+        # B-014 门槛②：topic 至少出现 N 次才建 talks_about 边（1 = 关闭门槛，
+        # 退回旧行为）。实测 66.3% 的 topic 只出现一次 —— 那是一次性噪声。
+        self._topic_min_occurrences = max(1, int(topic_min_occurrences))
+        # 观测计数（进程生命周期）
+        self._topics_deferred = 0    # 因门槛②未建边的 topic
+        self._image_desc_skipped = 0  # 因门槛①跳过 topic 抽取的消息数
+        # 取词函数可注入：生产用 jieba，测试可注入确定性桩 —— 否则"门槛"逻辑
+        # 的测试会因环境缺 jieba 而空转（2026-09-13 实测本机即如此）。
+        self._keyword_fn = keyword_fn
         self._init_schema()
 
     def _get_conn(self) -> sqlite3.Connection:
@@ -116,7 +133,19 @@ class MemoryStore:
     # ---- ingest ----
 
     def ingest(self, event: MemoryEvent) -> None:
-        """抽取实体/关系, 写入图。同步 (< 5ms), 调用方包 asyncio.to_thread()."""
+        """抽取实体/关系, 写入图。同步 (< 5ms), 调用方包 asyncio.to_thread().
+
+        B-014（2026-09-13）两道质量门 —— 对齐 RAG 语料的第二轮清洗思路：
+
+        ① **图片描述不入 topic**：含 ``（配图：`` 的消息跳过关键词抽取。
+           描述是"眼前信息"（给 RP 看这一轮发生了什么），不是"值得长期记住的
+           话题"；且几百字描述进 jieba 必然持续产出噪声实体。
+        ② **只出现一次不入图**：topic 首次出现只记实体行（待观察），
+           **第二次出现才建 `talks_about` 边** → 一次性噪声不进图结构。
+           实测 66.3% 的 topic 实体只出现过一次。
+
+        两道门都不影响 member 实体与 `mentions` 边（@ 关系照常记录）。
+        """
         entities = self._extract_entities(event)
         with self._lock, self._get_conn() as conn:
             for e in entities:
@@ -136,6 +165,15 @@ class MemoryStore:
                                 (speaker.alias, other.alias, "mentions", event.ts, "{}"),
                             )
                     for topic in topic_entities:
+                        # 门槛②：本条之前是否已见过该 topic（含本次刚插的行）
+                        if self._topic_min_occurrences > 1:
+                            seen = conn.execute(
+                                "SELECT COUNT(*) FROM entities WHERE type='topic' AND alias=?",
+                                (topic.alias,),
+                            ).fetchone()
+                            if not seen or seen[0] < self._topic_min_occurrences:
+                                self._topics_deferred += 1
+                                continue
                         conn.execute(
                             "INSERT INTO edges(from_alias, to_alias, type, ts, properties_json) VALUES (?,?,?,?,?)",
                             (speaker.alias, topic.alias, "talks_about", event.ts, "{}"),
@@ -152,7 +190,16 @@ class MemoryStore:
         for name in at_pattern:
             alias = name
             entities.append(EntityLink(alias=alias, type="member", text=name))
-        keywords = self._extract_keywords(event.text)
+        # 门槛①：图片描述（含失败占位）整条不抽 topic —— 描述是眼前信息，
+        # 不是长期话题；且长描述进 jieba 会持续产出噪声实体。
+        if kg_stopwords.carries_image_description(event.text):
+            self._image_desc_skipped += 1
+            return entities
+        keywords = (
+            self._keyword_fn(event.text)
+            if self._keyword_fn is not None
+            else self._extract_keywords(event.text)
+        )
         for kw in keywords:
             entities.append(EntityLink(
                 alias=kw, type="topic", text=kw,
@@ -166,7 +213,8 @@ class MemoryStore:
         except ImportError:
             return []
         tags = jieba.analyse.extract_tags(text, topK=topk, withWeight=False)
-        return [t for t in tags if len(t) >= 2]
+        # B-014：停用词/结构词过滤（系统占位符切出的词 + 无信息量通用词）
+        return kg_stopwords.filter_keywords(t for t in tags if len(t) >= 2)
 
     # ---- query: entities ----
 
@@ -285,4 +333,18 @@ class MemoryStore:
         with self._lock, self._get_conn() as conn:
             entities = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
             edges = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
-        return {"entities": entities, "edges": edges}
+            try:
+                topics = conn.execute(
+                    "SELECT COUNT(DISTINCT alias) FROM entities WHERE type='topic'"
+                ).fetchone()[0]
+            except sqlite3.Error:
+                topics = -1
+        return {
+            "entities": entities,
+            "edges": edges,
+            "distinct_topics": topics,
+            # B-014 观测：两道质量门各自拦下多少（判断门槛松紧的数据依据）
+            "topic_min_occurrences": self._topic_min_occurrences,
+            "topics_deferred": self._topics_deferred,
+            "image_desc_skipped": self._image_desc_skipped,
+        }

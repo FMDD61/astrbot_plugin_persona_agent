@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import threading
 import time
 from typing import Awaitable, Callable, Optional
@@ -134,6 +135,8 @@ class VisionService:
         http_post: Optional[PostFn] = None,
         persist_path: Optional[str] = None,
         persist_max: int = 2000,
+        flush_every: int = 5,
+        flush_interval: float = 30.0,
     ) -> None:
         self._url = api_base.rstrip("/") + "/chat/completions"
         self._key = api_key
@@ -151,6 +154,14 @@ class VisionService:
         self._persist: dict[str, dict] = {}   # sha256 -> {desc,last_ts,hits}
         self._persist_dirty = False           # 内存有未落盘变更
         self._evicted = 0                     # 淘汰计数（观测上限是否够）
+        # ---- 流式落盘（2026-09-13，B-014 同批）：原实现只在 terminate 落盘，
+        #      实测 7 次成功识图后文件仍不存在 → 跨重启复用完全没生效。
+        self._flush_every = max(1, int(flush_every))
+        self._flush_interval = max(1.0, float(flush_interval))
+        self._dirty_since_flush = 0
+        self._last_flush_ts = time.time()
+        self._flush_count = 0
+        self._flushed_entries = 0
         # S0 观测：最近一次失败原因 + 分类计数（与 emotion/gate 同一套）。
         # 「无法识别」在调用方看来是单一结果，但底层至少有 4 种成因
         # （取不到图 / 模型空返回 / 异常 / 超时）—— 不分开就只能猜。
@@ -180,25 +191,20 @@ class VisionService:
         except Exception:
             self._persist = {}
 
-    def _flush_persist(self) -> None:
-        """落盘（原子写 tmp→rename）。仅在有脏数据时写；失败静默。"""
-        if not self._persist_path or not self._persist_dirty:
-            return
-        import json as _json
-        import os
-        try:
-            tmp = self._persist_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-                _json.dump(self._persist, f, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self._persist_path)
-            self._persist_dirty = False
-        except OSError:
-            pass  # 落盘失败不 crash
-
     def _touch_persist(self, h: str, desc: str) -> None:
-        """命中/新增：更新 last_ts/hits + 标脏 + 超限 LRU 淘汰最久未用。"""
+        """命中/新增：更新 last_ts/hits + 标脏 + 超限 LRU 淘汰最久未用。
+
+        **流式落盘（2026-09-13 修）**：原实现只标脏，而 `_flush_persist` 的
+        唯一调用点是 `main.terminate()` —— 一旦进程被 SIGKILL/强退，所有描述
+        全部丢失。实测跑了 7 次成功识图，`image_desc_cache.json` 至今不存在
+        （"惰性 flush"那一半从未实现，跨重启复用完全没生效）。
+
+        现在按**计数 + 时间双阈值**流式落盘（先到者触发）：
+          - 新增/命中累计 `_flush_every`（默认 5）条 → 立即落盘
+          - 距上次落盘超过 `_flush_interval`（默认 30s）→ 立即落盘
+        I/O 在锁**外**执行（`_flush_persist` 内部自带锁），避免阻塞其它协程。
+        最坏情况（崩溃）只丢最后几条描述。
+        """
         now = time.time()
         entry = self._persist.get(h)
         if entry:
@@ -207,16 +213,56 @@ class VisionService:
         else:
             self._persist[h] = {"desc": desc, "last_ts": now, "hits": 1}
         self._persist_dirty = True
+        self._dirty_since_flush += 1
         # LRU 淘汰：超上限时移除 last_ts 最旧（最久未使用）的条目
         while len(self._persist) > self._persist_max and self._persist:
             oldest_k = min(self._persist, key=lambda k: self._persist[k]["last_ts"])
             del self._persist[oldest_k]
             self._evicted += 1
+        # 双阈值判断（只读，快速）→ 需要落盘时执行
+        due = (
+            self._dirty_since_flush >= self._flush_every
+            or (now - self._last_flush_ts) >= self._flush_interval
+        )
+        if due:
+            # ⚠️ 必须调**无锁**版本：本方法可能在 `with self._lock` 内被调用
+            # （describe_bytes 的新增分支就是），再取同一把非重入锁会死锁
+            # —— 2026-09-13 实测把整个测试套件挂死（600s 超时）。
+            self._flush_persist_locked()
+
+    def _flush_persist_locked(self) -> None:
+        """落盘（原子写 tmp→rename）。**要求调用方已持有 `self._lock`。**
+
+        状态快照与写盘都在锁内完成：文件只有几百条 × 每条几十字节，
+        写盘微秒级，为它拆"锁外写 + 回写状态"会引入竞态（两个协程各写一半
+        状态），得不偿失。
+        """
+        if not self._persist_path or not self._persist_dirty:
+            return
+        import os
+        try:
+            tmp = self._persist_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps(self._persist, ensure_ascii=False))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._persist_path)
+        except OSError:
+            return  # 落盘失败不 crash，下次再试
+        self._persist_dirty = False
+        self._flushed_entries += self._dirty_since_flush
+        self._dirty_since_flush = 0
+        self._last_flush_ts = time.time()
+        self._flush_count += 1
+
+    def _flush_persist(self) -> None:
+        """取锁后落盘（terminate / 手动 flush 路径）。"""
+        with self._lock:
+            self._flush_persist_locked()
 
     def flush(self) -> None:
-        """显式落盘（terminate/定时调用）。"""
-        with self._lock:
-            self._flush_persist()
+        """显式落盘（terminate / 手动）。"""
+        self._flush_persist()
 
     def snapshot(self) -> dict:
         """观测：缓存大小/上限/淘汰数/命中分布（判断 persist_max 是否够）。"""
@@ -226,6 +272,8 @@ class VisionService:
                 "persist_size": len(self._persist),
                 "persist_max": self._persist_max,
                 "persist_evicted": self._evicted,
+                "persist_flush_count": self._flush_count,
+                "persist_flushed_entries": self._flushed_entries,
                 "hits_top": sorted(
                     (v.get("hits", 0) for v in self._persist.values()),
                     reverse=True,

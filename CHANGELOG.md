@@ -25,6 +25,40 @@
 - **日记 `day` 偏移一天**：归档 09-12 的会话，`day` 却取轮换后的 `day_key()`（09-13）。改为按同一口径回推 24h
 - **provider id 写错会静默哑掉（新增加固）**：`_resolve_provider_id()` 现在**先校验配置值存在性** —— 写成不存在的 id 时 `llm_generate` 抛 `ProviderNotFoundError`、被 except 吞成空回复（又一条"看起来正常其实全哑"）。校验失败 → 告警 + 回退到会话 provider；拿不到 `provider_manager` 时返回"未知"照用配置值（不让校验本身成为故障源）。三级回退逻辑抽为纯函数 `llm_params.resolve_provider_id()`，可离线单测（+8 例）
 
+### Fixed (2026-09-13, B-014 KG 入库质量门 + B-015 识图诊断 + 流式缓存)
+> 用户指出：**原 RAG 就是因为质量问题做了第二轮清洗（7075 → 4704 对）**，而 KG 入库
+> 从来没有等价的一道。实测确认，并补上。
+
+- **🔴 B-014 KG 入库质量门（对齐 RAG 二轮清洗思路）**：`memory_store.db` 实测
+  **distinct topic 实体 3194 个**、**66.3% 只出现过一次**，其中
+  `配图`(1511)/`识别`(1289)/`无法`(1210) 占实体行 **31.9%** —— 那是**我们自己的
+  识图占位符** `（配图：无法识别）` 被 jieba 切出来的，**系统产物污染了自己的长期记忆**。
+  两道门 + 一个清洗工具：
+  - **门槛① 图片描述不入 topic**：含 `（配图：` 的消息跳过关键词抽取（描述是"眼前信息"，
+    不是长期话题；且长描述进 jieba 必然持续产噪）。speaker/@ 实体照常记录
+  - **门槛② 只出现一次不入图**：topic 首次出现只记实体行（待观察），第二次才建
+    `talks_about` 边 → 一次性噪声不进图结构。`memory.topic_min_occurrences` 可配（1 = 关闭）
+  - **`services/kg_stopwords.py`**：结构词（系统占位符产物）+ 无信息量通用词过滤。
+    **刻意保留** `晚安/早睡/签到/戒色/老婆` 这类群内真实行为/文化词 —— 原则是
+    **宁可漏删，不可误删**，真正的噪声交给门槛②
+  - **`tools/clean_kg.py`**：历史清洗（默认 dry-run，`--apply` 自动备份 + 单事务）。
+    三类目标：结构词 topic / 通用词 topic / 一次性 topic。**只删 `talks_about`，
+    绝不碰 `mentions`（@ 关系）与 member 实体**
+- **🔴 图片描述持久缓存从未落盘（流式化）**：`_touch_persist` 只标脏，而 `_flush_persist`
+  的唯一调用点是 `main.terminate()` —— "惰性 flush"那一半**从未实现**。实测跑了 7 次
+  成功识图，`image_desc_cache.json` 至今不存在，A7③ 的"跨重启复用"完全没生效。
+  改为**计数 + 时间双阈值流式落盘**（默认每 5 条或 30s，先到者触发）。
+  ⚠️ 实现时踩到一个**自伤死锁**：`describe_bytes` 在 `with self._lock` 内调
+  `_touch_persist`，而新的 flush 又取同一把非重入锁 → **整个测试套件挂死 600s**。
+  修法：拆出 `_flush_persist_locked()`（要求调用方已持锁）供锁内路径复用
+- **B-015 识图失败诊断**：`无法识别` 是**一个结果、四种成因**（取不到图 / 模型空返回 /
+  异常 / 超时）。`resolve_image_bytes(..., diag)` 逐级记录失败原因；
+  `describe_bytes/describe_image` 加 `last_error` + `stats{ok,cache_hit,empty,timeout,error}`；
+  全部失败时 WARNING 打出诊断 JSON（hash/mime/bytes/失败层）
+- `MemoryStore` 取词函数**可注入**（`keyword_fn`）—— 门槛逻辑的测试不再依赖环境装没装 jieba
+  （本机就没有，原测试会空转）
+- 测试 257 → **287 全绿**（新增 `test_memory_quality.py` 23 例）
+
 ### Fixed (2026-09-13, R2 重构 S1：B-001 引用错位 + B-002 空条目静默)
 - **🔴 B-001 `[r:-N]` 引用目标错位（线上事故 11:45，群 881438753）**：LLM 按**它当时看到的上下文**编号，旧实现 `ContextBuffer.quote_target()` 却在生成结束后对**实时** buffer 求值 —— 生成窗口（5–8s）内每进 1 条消息编号整体偏移 1 位（该群 100–400 条/时 → 错位概率约 1/3–1/2）。修复：新增 `QuoteIndex`（**不可变引用快照**）+ `SessionManager.quote_snapshot()`，在**建上下文之后、发起生成之前**冻结编号基，生成结束后对它求值；`message_id`/`sender_uin` 随条目入 session（内部键 `_mid`/`_uin`，所有对外出口剥离，**绝不进 LLM 请求**）。附带消除次要错位：编号基与 `get_contexts()` **同源同过滤**（旧实现 session 含 assistant 条目而 buffer 不含，且 buffer 含被媒体过滤掉的纯图消息）。新增审计字段 `trace.quote_n/quote_id/quote_resolved/quote_basis/quote_target_alias/quote_target_uin/quote_target_missing` —— 此前 trace **没有** quote 字段，11:45 那次只能靠人工比对 SnowLuma 日志
 - **⚠️ 顺带修掉一个标记泄漏**：旧代码只在 `quote_id` 非空时剥离 `[r:-N]`，解析失败时会把标记**原样发进群**（线上实际发生过）。现在无论是否解析出目标都剥离

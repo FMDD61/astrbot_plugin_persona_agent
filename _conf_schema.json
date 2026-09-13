@@ -378,6 +378,18 @@
       }
     }
   },
+  "memory": {
+    "type": "object",
+    "description": "KG 入库质量门（B-014：RAG 语料有过第二轮清洗，KG 此前没有）",
+    "items": {
+      "topic_min_occurrences": {
+        "type": "int",
+        "description": "话题至少出现 N 次才建关系边（1 = 关闭门槛，退回旧行为）",
+        "hint": "🔴 2026-09-13 实测：distinct topic 实体 3194 个，其中 66.3% 只出现过一次 —— 一次性噪声不该进图结构。设为 2 时，话题首次出现只记实体行（待观察），第二次才建 talks_about 边。@ 关系（mentions）不受影响。",
+        "default": 2
+      }
+    }
+  },
   "gate": {
     "type": "object",
     "description": "决策层 GateLLM（A7：独立判断要不要回的中性 LLM；双层 LLM 上层闸）",
