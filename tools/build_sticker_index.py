@@ -297,6 +297,45 @@ def review_table(items: list[dict]) -> None:
         print(f"\n⚠️ {missing_emb} 条缺 embedding → 无法参与选择（检查 sentence-transformers）")
 
 
+def retry_missing(items: list[dict], *, library_dir: Path, api_base: str, api_key: str,
+                  model: str, rounds: int = 2, pause: float = 3.0) -> int:
+    """对描述为空的条目**重试**（429 限流 / 空返回是主要成因）。
+
+    实测（2026-09-13，959 张）：并发 2 时失败率约 46%，其中大部分是
+    `429 Too Many Requests`（**并发不是主因，是网关侧限流**）与模型空返回。
+    这些多数是瞬时的 —— 放慢节奏重试即可救回大半。
+
+    策略：逐张串行 + 每张之间 sleep `pause`，共 `rounds` 轮；只补空的，
+    已有描述的条目不动（增量语义）。
+    """
+    import time as _t
+    total_ok = 0
+    for r in range(rounds):
+        todo = [it for it in items if not (it.get("desc") or "").strip()]
+        if not todo:
+            break
+        print(f"  重试第 {r + 1}/{rounds} 轮：待补 {len(todo)} 张（串行 + {pause}s 间隔）",
+              flush=True)
+        ok = 0
+        for i, it in enumerate(todo, 1):
+            try:
+                d = _describe_one(str(library_dir / it["file"]),
+                                  api_base, api_key, model, 90.0)
+                if d:
+                    it["desc"] = d
+                    ok += 1
+            except Exception as e:
+                print(f"    ! {it['file'][:36]}: {type(e).__name__}", flush=True)
+            if i % 20 == 0:
+                print(f"    {i}/{len(todo)}（本轮成功 {ok}）", flush=True)
+            _t.sleep(pause)
+        total_ok += ok
+        print(f"    本轮救回 {ok} 张", flush=True)
+        if ok == 0:
+            break
+    return total_ok
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="贴纸库离线入库（S3②）")
     ap.add_argument("--dir", required=True, help="贴纸原图目录（人工投喂）")
@@ -308,6 +347,9 @@ def main(argv=None) -> int:
     ap.add_argument("--force", action="store_true", help="重算全部（会丢弃人工修正！）")
     ap.add_argument("--review", action="store_true", help="只打印审核表，不写文件")
     ap.add_argument("--workers", type=int, default=2, help="视觉并发（默认 2，别打满 4 核）")
+    ap.add_argument("--retry-rounds", type=int, default=0,
+                    help="描述为空时补跑轮数（串行 + 间隔；429 限流场景很有用）")
+    ap.add_argument("--retry-pause", type=float, default=3.0, help="重试轮内每张间隔秒数")
     args = ap.parse_args(argv)
 
     lib = Path(args.dir).expanduser().resolve()
@@ -342,6 +384,10 @@ def main(argv=None) -> int:
             if api_base:
                 describe_all(items, library_dir=lib, api_base=api_base, api_key=api_key,
                              model=args.model, workers=args.workers)
+                if args.retry_rounds > 0:
+                    retry_missing(items, library_dir=lib, api_base=api_base,
+                                  api_key=api_key, model=args.model,
+                                  rounds=args.retry_rounds, pause=args.retry_pause)
 
     dim = embed_all(items, model_name=args.embed_model)
 
