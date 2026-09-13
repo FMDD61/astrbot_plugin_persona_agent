@@ -650,6 +650,12 @@ class PersonaAgent(Star):
             return
 
         # v3: daily rotation fallback (primary trigger is the 02:05 cron).
+        # S2: 同样先落盘挂起条目（否则会写进新一天的会话）
+        if self._pipeline is not None:
+            try:
+                self._pipeline.flush_all_pending_appends()
+            except Exception:
+                pass
         old_msgs = self.session_mgr.rotate_if_day_changed(group_id)
         if old_msgs and self._diary_enabled:
             asyncio.create_task(self._generate_diary(group_id, old_msgs))
@@ -1729,6 +1735,15 @@ class PersonaAgent(Star):
         if self.session_mgr is None:
             return
         self._housekeeping()
+        # S2: 轮转前先落盘所有挂起条目 —— 否则上一轮挂起的消息会被写进
+        # **新一天**的会话，出现在错误的日期归档里。
+        if self._pipeline is not None:
+            try:
+                n = self._pipeline.flush_all_pending_appends()
+                if n:
+                    logger.info(f"[persona_agent] flushed {n} pending session append(s) before rotation")
+            except Exception as e:
+                logger.warning(f"[persona_agent] pre-rotation flush failed: {e}")
         for gid in list(self.session_mgr.snapshot().keys()):
             old_msgs = self.session_mgr.rotate_if_day_changed(gid)
             if old_msgs:

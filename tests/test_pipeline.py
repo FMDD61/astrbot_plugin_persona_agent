@@ -683,3 +683,15 @@ class TestDeferredSessionAppend(unittest.TestCase):
         p.defer_session_append("g1", "第二条", name="乙", message_id="m2", sender_uin="u2")
         _run(p.run(PipelineInput("g1", "第二条", False, "u2", "乙")))
         self.assertEqual([a[1] for a in appends], ["第一条", "第二条"])
+
+    def test_flush_all_before_rotation(self):
+        """S2：日界轮转前必须落盘所有挂起条目，否则会写进新一天的会话。"""
+        from services.session_manager import SessionManager
+        sm = SessionManager(data_dir=None, max_messages=None)
+        cb, appends = self._mk(sm)
+        p, _ = self._pipeline_with(cb, sm)
+        p.defer_session_append("gA", "群A的", name="甲", message_id="m1", sender_uin="u1")
+        p.defer_session_append("gB", "群B的", name="乙", message_id="m2", sender_uin="u2")
+        self.assertEqual(p.flush_all_pending_appends(), 2)
+        self.assertEqual(p.flush_all_pending_appends(), 0)      # 幂等
+        self.assertEqual(sorted(a[1] for a in appends), ["群A的", "群B的"])

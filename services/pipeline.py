@@ -163,6 +163,18 @@ class PersonaPipeline:
             return True
         return False
 
+    def flush_all_pending_appends(self) -> int:
+        """落盘**所有**群的挂起条目，返回条数。
+
+        用途：日界轮转（02:05 cron）前必须先落盘 —— 否则上一轮挂起的条目
+        会被写进**新一天**的会话，导致它出现在错误的日期归档里。
+        """
+        n = 0
+        for gid in list(self._pending_append.keys()):
+            if self.flush_session_append(gid):
+                n += 1
+        return n
+
     def flush_session_append(self, group_id: str) -> bool:
         """立即落盘挂起条目（terminate / 异常兜底）。幂等。"""
         item = self._pending_append.pop(str(group_id), None)
