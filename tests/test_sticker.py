@@ -151,7 +151,7 @@ class TestStickerPick(unittest.TestCase):
         """
         svc = self._svc(mk_items([("a", "无奈"), ("b", "无奈")]),
                         min_score=0.01, margin=0.5, high_confidence=0.99)
-        r = asyncio.run(svc.pick("无奈 开心 害羞 生气"))
+        r = asyncio.run(svc.pick("无奈 开心 害羞 生气"))  # 均匀分 ≈0.5 < 0.99
         self.assertIsNone(r.hit)          # 分差 0 < margin 0.5 → 仍模糊
         self.assertIn("ambiguous", r.reason)
 

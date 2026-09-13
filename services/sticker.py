@@ -96,9 +96,12 @@ class StickerService:
         # p50=0.056）—— 同一个表情往往有多张近似图，top2 天然接近。
         # **只在"分数勉强过线"时才有判别意义**；绝对分够高时直接选 top1（见 pick ①）。
         margin: float = 0.02,
-        # 高置信线：≥ 此分直接选 top1、不看分差。取"正样本 p25≈0.796"略降 →
-        # 0.78（实测 0.80+ 的命中被 margin 误拒过）。
-        high_confidence: float = 0.78,
+        # 高置信线：≥ 此分直接选 top1、**不看分差**。
+        # 标定依据（932 张真实库）：负样本 top1 max=0.618（不该选的最高分）、
+        # 正样本 top1 p05=0.737 —— 取 **0.70** 落于两者之间：过了它就"明确该选"，
+        # 不该再被 margin 干扰（实测 0.713 的 `无奈地摇头` 曾被误拒）。
+        # margin 从此只服务 `min_score`(0.68) ~ `high_confidence`(0.70) 那条窄带。
+        high_confidence: float = 0.70,
         picker: Optional[Callable[[str, list[StickerHit]], Any]] = None,
     ) -> None:
         self._index_path = Path(index_path)
