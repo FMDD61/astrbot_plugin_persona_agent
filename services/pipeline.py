@@ -577,6 +577,18 @@ class PersonaPipeline:
                 # 解不出目标 → 标记为未解析（标记被剥离、正文照发）
                 trace["quote_target_missing"] = True
 
+        # ---- 工具意图（S3：表情 / 戳人）----
+        # 必须与 [r:-N] 同理，在 **postprocess 之前** 提取 —— postprocess 会把
+        # 工具标记一并剥离（S0 预置的防泄漏规则），之后再取就没了。
+        emote_intent: Optional[str] = None
+        poke_target: Optional[str] = None
+        try:
+            body_text, emote_intent, poke_target = text_style.extract_tool_intents(body_text)
+        except Exception as e:
+            trace["tool_intent_error"] = f"{type(e).__name__}: {e}"
+        if emote_intent or poke_target:
+            trace["tool_intents"] = {"emote": emote_intent, "poke": poke_target}
+
         # ---- postprocess on the body (after quote marker removed) ----
         clean_text = body_text
         if self._postprocess is not None:
@@ -588,5 +600,8 @@ class PersonaPipeline:
             text=clean_text,
             quote_id=quote_id,
             sticker_prompt=emotion_state.sticker_prompt,
+            # S3：动作意图交给 main 旁路执行（pipeline 不做发送）
+            emote=emote_intent,
+            poke=poke_target,
             trace=trace,
         )

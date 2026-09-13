@@ -39,6 +39,9 @@ RE_QUOTE_MARK = re.compile(r"^\s*\[r:\s*(-?\d+)\]\s*")
 # 模型学会 [emote:...] 的那一天，标记会被原样发进群里。S3 实现执行器前
 # 这里就先兜住（当前提示词还没教，属预防性收口）。
 RE_TOOL_INTENT_MARK = re.compile(r"\[(?:emote|poke)\s*:[^\]]*\]")
+# 工具意图的**抓取**正则（S3）：与上面的剥离正则共用同一语法
+RE_EMOTE_MARK = re.compile(r"\[\s*emote\s*:\s*([^\]]*?)\s*\]")
+RE_POKE_MARK = re.compile(r"\[\s*poke\s*:\s*([^\]]*?)\s*\]")
 # 识图注入块：`（配图：<描述>）` / `（配图：1:…；2:…）`（main._augment_with_vision 产出）
 RE_IMAGE_DESC_BLOCK = re.compile(r"（配图：([^）]*)）")
 # 表情（QQ Face）注入块：`（表情：呲牙）`
@@ -93,6 +96,44 @@ def clean_message_text(text: str) -> str:
     t = RE_AT_MARKER.sub("", t)
     t = RE_ASTRBOT_MARKER.sub("", t)
     return t.strip()
+
+
+MAX_EMOTE_INTENT_CHARS = 40
+
+
+def extract_tool_intents(text: str) -> tuple[str, Optional[str], Optional[str]]:
+    """提取并剥离工具意图标记（S3，spec §4.3）。
+
+    返回 ``(正文, emote 意图短语, poke QQ 号)``。**无论是否解析成功，标记一律剥离**
+    —— 泄漏到群里就是乱码（B-012 的教训）。
+
+    - ``[emote:无奈地摇头]`` → 正文去掉标记，emote="无奈地摇头"
+    - ``[poke:337934842]``   → 正文去掉标记，poke="337934842"
+    - 多个同类标记：取**第一个**（一条回复最多一个动作，多余的直接丢弃）
+    - 空内容/超长/非法 QQ 号 → 视为无效，返回 None（但仍剥离标记）
+
+    位置约定（写进提示词的规则）：``[emote:]`` 期望在行尾、``[poke:]`` 任意位置；
+    但**解析不依赖位置** —— 模型不守规矩时也不该把标记漏进群。
+    """
+    if not text:
+        return text, None, None
+    emote: Optional[str] = None
+    poke: Optional[str] = None
+    m = RE_EMOTE_MARK.search(text)
+    if m:
+        cand = (m.group(1) or "").strip()
+        if cand and len(cand) <= MAX_EMOTE_INTENT_CHARS:
+            emote = cand
+    m = RE_POKE_MARK.search(text)
+    if m:
+        cand = (m.group(1) or "").strip()
+        # QQ 号：5–12 位纯数字（容忍模型写成 @123 或 "123 "）
+        cand = cand.lstrip("@").strip()
+        if cand.isdigit() and 5 <= len(cand) <= 12:
+            poke = cand
+    body = RE_TOOL_INTENT_MARK.sub("", text)
+    body = re.sub(r"[ \t]{2,}", " ", body).strip()
+    return body, emote, poke
 
 
 def extract_quote(text: str) -> tuple[str, Optional[int]]:
