@@ -178,7 +178,39 @@ def _describe_one(path: str, api_base: str, api_key: str, model: str, timeout: f
                    headers={"Authorization": f"Bearer {_clean_env(api_key)}"}, json=payload)
         r.raise_for_status()
         d = r.json()
-    return (((d.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+    return extract_text(d)
+
+
+def extract_text(resp: dict) -> str:
+    """从网关响应里取描述文本，**兼容 content 为空、答案落在 reasoning 里的情况**。
+
+    🔴 2026-09-13 实测抓到（81 张失败样本的根因）：部分图片模型会把最终答案
+    写进 **`reasoning`** 字段，而 `content` 是空串 —— 例如：
+
+        {"content": "", "reasoning": "1. 分析用户请求… 5. 最后输出：五个Q版角色站于草地…"}
+
+    只读 `content` 就会拿到空串，表现为"模型没返回"（且**静默**）。
+    这里按优先级取：`content` → `reasoning` 里"最后输出/最终"段落 → 整段 reasoning。
+    """
+    msg = ((resp.get("choices") or [{}])[0].get("message") or {})
+    text = str(msg.get("content") or "").strip()
+    if text:
+        return text
+    # 有些适配层叫 reasoning_content，网关这里叫 reasoning —— 都试
+    reasoning = str(msg.get("reasoning") or msg.get("reasoning_content") or "").strip()
+    if not reasoning:
+        return ""
+    # 优先取"最终输出/润色/结论"之后的内容
+    import re as _re
+    m = None
+    for pat in (r"(?:最后输出|最终输出|最终润色|最终答案|结论)[：:]?\s*([^\n]{2,})",
+                r"(?:输出|答案)[：:]?\s*([^\n]{4,})$"):
+        m = _re.search(pat, reasoning)
+        if m:
+            return m.group(1).strip()
+    # 兜底：reasoning 的最后一段非空行
+    tail = [l.strip() for l in reasoning.splitlines() if l.strip()]
+    return tail[-1] if tail else ""
 
 
 def describe_all(items: list[dict], *, library_dir: Path, api_base: str, api_key: str,

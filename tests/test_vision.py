@@ -340,3 +340,63 @@ class TestVisionPersistLRU(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExtractCompletionText(unittest.TestCase):
+    """🔴 2026-09-13 实测修复的解析漏洞（识图间歇失败的根因）。
+
+    部分图片模型把最终答案写进 `reasoning` 字段而 `content` 留空 ——
+    只读 content 会拿到空串，被渲染成「（配图：无法识别）」，
+    **看起来像"识别不了"，实为解析漏了一个字段**（与 B-005 同形）。
+    """
+
+    def _e(self, resp):
+        from services.vision import extract_completion_text
+        return extract_completion_text(resp)
+
+    def test_content_wins(self):
+        self.assertEqual(self._e({"choices": [{"message": {"content": "一只猫",
+                                                          "reasoning": "思考"}}]}), "一只猫")
+
+    def test_falls_back_to_reasoning_final_answer(self):
+        r = {"choices": [{"message": {
+            "content": "",
+            "reasoning": "1. 分析请求：…\n4. 草拟描述：…\n5. 最后输出：五个Q版角色站于草地。",
+        }}]}
+        self.assertEqual(self._e(r), "五个Q版角色站于草地。")
+
+    def test_falls_back_to_reasoning_content_alias(self):
+        r = {"choices": [{"message": {"content": "",
+                                      "reasoning_content": "结论：一只狗在跑"}}]}
+        self.assertEqual(self._e(r), "一只狗在跑")
+
+    def test_last_line_fallback(self):
+        r = {"choices": [{"message": {"content": "",
+                                      "reasoning": "思考第一行\n最后一行内容"}}]}
+        self.assertEqual(self._e(r), "最后一行内容")
+
+    def test_whitespace_content_treated_as_empty(self):
+        r = {"choices": [{"message": {"content": "   ", "reasoning": "最后输出：有内容"}}]}
+        self.assertEqual(self._e(r), "有内容")
+
+    def test_separator_not_swallowed_by_backtracking(self):
+        """回归：捕获组最小长度若设得比实际内容长，正则**会回溯把分隔符吃进去**。
+
+        实测：`[^\n]{4,}` 遇到「最后输出：有内容」（冒号后仅 3 字）时回溯吞掉
+        全角冒号 → 返回 `'：有内容'`（带前导冒号）。降到 `{2,}` 后正确。
+        """
+        for reasoning, want in (
+            ("最后输出：有内容", "有内容"),          # 冒号后 3 字
+            ("最后输出：OK", "OK"),                # 冒号后 2 字
+            ("结论: 一只狗", "一只狗"),             # 半角冒号
+            ("最后输出 五个角色", "五个角色"),         # 空格分隔
+        ):
+            r = {"choices": [{"message": {"content": "", "reasoning": reasoning}}]}
+            got = self._e(r)
+            self.assertEqual(got, want, f"reasoning={reasoning!r}")
+            self.assertFalse(got.startswith(("：", ":")))
+
+    def test_all_empty_returns_empty(self):
+        self.assertEqual(self._e({"choices": [{"message": {}}]}), "")
+        self.assertEqual(self._e({"choices": []}), "")
+        self.assertEqual(self._e({}), "")
