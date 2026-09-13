@@ -30,7 +30,7 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -182,9 +182,14 @@ def analyze_messages(my_msgs: list[dict]):
         for ng in char_ngrams(text, 2, 5):
             ngram_counter[ng] += 1
 
-        # Hourly (UTC; downstream can shift to local).
+        # Hourly —— **按本地时统计**（2026-09-13 修）。
+        # 原来直接用 dt.hour（UTC），文件里还写着 "downstream can shift to local"
+        # 但**下游从来没做这个转换** → 插件在本地 20:33 读到的是 UTC 20 点
+        # 的预算 0.34（实为本地凌晨 4 点）→ 主动插话在本地 10:00–24:00 被完全压制。
+        # 现在生成端就落到本地时，下游按本地时读即正确。
         try:
             dt = datetime.fromisoformat(m["ts"].replace("Z", "+00:00"))
+            dt = dt.astimezone(timezone(timedelta(hours=args.tz_offset_hours)))
             hour_counter[dt.hour] += 1
         except (KeyError, ValueError):
             pass
@@ -363,6 +368,10 @@ def main() -> int:
               "小时预算 <1 条/时结构性静音（2026-09-09 复盘：0.51/0.16/0.0）。"
               "真实发言节奏由决策门槛(rag.score_threshold 等)控制，预算仅防失控。"),
     )
+    parser.add_argument(
+        "--tz-offset-hours", type=int, default=8,
+        help="本地时区偏移（小时，默认 +8）。hourly 分布**按本地时**统计与落盘。",
+    )
     args = parser.parse_args()
 
     data = Path(args.data)
@@ -459,7 +468,11 @@ def main() -> int:
         share = hour_counts[str(h)] / total_h
         budget[str(h)] = round(share * daily_budget, 2)
     hourly = {
-        "tz_note": "Counts are UTC. The plugin should shift to its local TZ on load.",
+        # 2026-09-13：改为本地时落盘并显式标记。旧文件只有 tz_note（UTC）——
+        # 插件的 `StyleProfile._hourly_local()` 会识别并平移，不会静默错位。
+        "tz": "local",
+        "tz_offset_hours": args.tz_offset_hours,
+        "tz_note": "Counts are LOCAL time (UTC+offset). Do not shift again.",
         "hourly_message_count": hour_counts,
         "hourly_share": {h: round(hour_counts[h] / total_h, 4) for h in hour_counts},
         "default_daily_budget": daily_budget,
