@@ -123,6 +123,126 @@ class TestVisionService(unittest.TestCase):
         self.assertIsNone(asyncio.run(go()))
 
 
+class TestVisionDiagnostics(unittest.TestCase):
+    """S0：`无法识别` 是**一个结果、四种成因**，必须分得开。
+
+    2026-09-13 实测部署后仍有 5/14 次失败，而旧代码四条路径全是
+    `return None` → 调用方只看到「无法识别」，查不出是哪一层。
+    """
+
+    def test_timeout_reason_recorded(self):
+        async def post(url, payload):
+            await asyncio.sleep(1.0)
+            return {"choices": [{"message": {"content": "x"}}]}
+
+        async def go():
+            v = VisionService("https://x/v1", "k", "m",
+                              timeout=0.05, cache_ttl=30.0, http_post=post)
+            d = {}
+            out = await v.describe_bytes(PNG, diag=d)
+            return v, d, out
+
+        v, diag, out = asyncio.run(go())
+        self.assertIsNone(out)
+        self.assertIn("TimeoutError", v.last_error or "")
+        self.assertEqual(v.stats["timeout"], 1)
+        self.assertIn("TimeoutError", diag.get("vision_fail", ""))
+
+    def test_empty_completion_reason_recorded(self):
+        async def post(url, payload):
+            return {"choices": [{"message": {"content": ""}}]}
+
+        async def go():
+            v = self._mk(post) if hasattr(self, "_mk") else VisionService(
+                "https://x/v1", "k", "m", http_post=post)
+            d = {}
+            out = await v.describe_bytes(PNG, diag=d)
+            return v, d, out
+
+        v, diag, out = asyncio.run(go())
+        self.assertIsNone(out)
+        self.assertIn("empty completion", v.last_error or "")
+        self.assertEqual(v.stats["empty"], 1)
+
+    def test_api_error_reason_recorded(self):
+        async def post(url, payload):
+            raise RuntimeError("HTTP 400 unsupported_model")
+
+        async def go():
+            v = VisionService("https://x/v1", "k", "bad-model", http_post=post)
+            d = {}
+            out = await v.describe_bytes(PNG, diag=d)
+            return v, d, out
+
+        v, diag, out = asyncio.run(go())
+        self.assertIsNone(out)
+        self.assertIn("unsupported_model", v.last_error or "")
+        self.assertEqual(v.stats["error"], 1)
+
+    def test_empty_bytes_reason_recorded(self):
+        async def go():
+            v = VisionService("https://x/v1", "k", "m")
+            d = {}
+            out = await v.describe_bytes(b"", diag=d)
+            return v, d, out
+
+        v, diag, out = asyncio.run(go())
+        self.assertIsNone(out)
+        self.assertEqual(v.last_error, "empty bytes")
+
+    def test_resolve_failure_is_distinct_from_model_failure(self):
+        """取字节失败 vs 模型失败 —— 两条完全不同的路，成因必须可辨识。"""
+        class NoFileImg:
+            file = ""
+            async def convert_to_file_path(self):
+                raise RuntimeError("media resolver exploded")
+
+        async def go():
+            v = VisionService("https://x/v1", "k", "m")
+            d = {}
+            out = await v.describe_image(NoFileImg(), diag=d)
+            return v, d, out
+
+        v, diag, out = asyncio.run(go())
+        self.assertIsNone(out)
+        self.assertIn("convert_to_file_path", v.last_error or "")
+        self.assertTrue(diag.get("resolve_fail"))
+        self.assertNotIn("vision_fail", diag)   # 压根没走到模型那一步
+
+    def test_success_records_ok_and_diag(self):
+        async def post(url, payload):
+            return {"choices": [{"message": {"content": "一张猫猫图"}}]}
+
+        async def go():
+            v = VisionService("https://x/v1", "k", "m", http_post=post)
+            d = {}
+            out = await v.describe_bytes(PNG, diag=d)
+            return v, d, out
+
+        v, diag, out = asyncio.run(go())
+        self.assertEqual(out, "一张猫猫图")
+        self.assertEqual(v.stats["ok"], 1)
+        self.assertIsNone(v.last_error)
+        self.assertEqual(diag.get("cache"), "miss")
+        self.assertIn("hash", diag)
+
+    def test_cache_hit_recorded(self):
+        async def post(url, payload):
+            return {"choices": [{"message": {"content": "图"}}]}
+
+        async def go():
+            v = VisionService("https://x/v1", "k", "m", http_post=post)
+            await v.describe_bytes(PNG)
+            d = {}
+            out = await v.describe_bytes(PNG, diag=d)
+            return v, d, out
+
+        v, diag, out = asyncio.run(go())
+        self.assertEqual(out, "图")
+        self.assertEqual(v.stats["cache_hit"], 1)
+        self.assertEqual(diag.get("cache"), "memory")
+
+
     def test_persist_disabled_no_file(self):
         """不传 persist_path → 无持久文件、snapshot 标记 disabled。"""
         import tempfile
