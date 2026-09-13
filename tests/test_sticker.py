@@ -82,9 +82,9 @@ class TestStickerPick(unittest.TestCase):
         self.assertEqual(r.hit.path, os.path.join(self.td.name, "a.jpg"))
 
     def test_below_threshold_skips(self):
-        # 注意：假嵌入下"无奈"↔"无奈"余弦恰为 1.0，所以要用 >1 的阈值
-        # 才能构造出 below_threshold（真实 BGE 上不会出现 1.0）
-        svc = self._svc(mk_items([("a", "无奈")]), min_score=1.01)
+        # 假嵌入下"无奈"↔"无奈"余弦恰为 1.0，用 >1 的 min_score 构造 below_threshold
+        # （真实 BGE 上不会出现 1.0）。high_confidence 也要抬到不可能达到。
+        svc = self._svc(mk_items([("a", "无奈")]), min_score=1.01, high_confidence=2.0)
         r = asyncio.run(svc.pick("无奈"))
         self.assertIsNone(r.hit)
         self.assertIn("below_threshold", r.reason)
@@ -92,8 +92,10 @@ class TestStickerPick(unittest.TestCase):
         self.assertTrue(r.top_k)          # 失败也要能看到候选分数（事后调阈）
 
     def test_ambiguous_without_picker_skips_conservatively(self):
-        # "无奈 开心" 与两条候选等距 → margin 判定为 ambiguous → 宁可不发
-        svc = self._svc(mk_items([("a", "无奈"), ("b", "开心")]), min_score=0.1, margin=0.5)
+        # "无奈 开心" 与两条候选等距 → 分差 < margin → ambiguous → 宁可不发
+        # 注意 high_confidence 要抬高，否则会被①高置信分支短路
+        svc = self._svc(mk_items([("a", "无奈"), ("b", "开心")]),
+                        min_score=0.1, margin=0.5, high_confidence=2.0)
         r = asyncio.run(svc.pick("无奈 开心"))
         self.assertIsNone(r.hit)
         self.assertIn("ambiguous", r.reason)
@@ -102,7 +104,7 @@ class TestStickerPick(unittest.TestCase):
         async def picker(intent, cands):
             return cands[1].id
         svc = self._svc(mk_items([("a", "无奈"), ("b", "开心")]),
-                        min_score=0.1, margin=0.5, picker=picker)
+                        min_score=0.1, margin=0.5, high_confidence=2.0, picker=picker)
         r = asyncio.run(svc.pick("无奈 开心"))
         self.assertIsNotNone(r.hit)
         self.assertEqual(r.hit.id, "b")
@@ -113,7 +115,7 @@ class TestStickerPick(unittest.TestCase):
         async def picker(intent, cands):
             return None
         svc = self._svc(mk_items([("a", "无奈"), ("b", "开心")]),
-                        min_score=0.1, margin=0.5, picker=picker)
+                        min_score=0.1, margin=0.5, high_confidence=2.0, picker=picker)
         r = asyncio.run(svc.pick("无奈 开心"))
         self.assertIsNone(r.hit)
         self.assertEqual(r.reason, "picker_no_choice")
@@ -122,10 +124,36 @@ class TestStickerPick(unittest.TestCase):
         async def picker(intent, cands):
             raise RuntimeError("llm boom")
         svc = self._svc(mk_items([("a", "无奈"), ("b", "开心")]),
-                        min_score=0.1, margin=0.5, picker=picker)
+                        min_score=0.1, margin=0.5, high_confidence=2.0, picker=picker)
         r = asyncio.run(svc.pick("无奈 开心"))
         self.assertIsNone(r.hit)
         self.assertIn("llm boom", svc.last_error or "")
+
+    def test_high_confidence_ignores_margin(self):
+        """高绝对分 → 直接选 top1，**不看分差**。
+
+        实测教训：`害羞地脸红`(0.80+) 因 top1-top2 只差 0.016 被判 ambiguous
+        而拒发 —— 但高绝对分说明匹配得很好，只是库里有同义近邻图，
+        **近邻选哪张都合理**，不该因此不发。
+        """
+        svc = self._svc(mk_items([("a", "无奈"), ("b", "无奈")]),
+                        min_score=0.1, margin=0.5, high_confidence=0.5)
+        r = asyncio.run(svc.pick("无奈"))
+        self.assertIsNotNone(r.hit)
+        self.assertEqual(r.via, "bge")
+
+    def test_low_score_still_needs_margin(self):
+        """分数勉强过线时才用分差判别（此时两个候选都不确定）。
+
+        构造：假嵌入是"关键词计数归一化"，故查询 `"无奈 开心 害羞 生气"` 对所有
+        单关键词条目得分相同（≈0.5）→ 落在 high_confidence(0.99) 之下、min_score
+        之上，正好检验分差分支。
+        """
+        svc = self._svc(mk_items([("a", "无奈"), ("b", "无奈")]),
+                        min_score=0.01, margin=0.5, high_confidence=0.99)
+        r = asyncio.run(svc.pick("无奈 开心 害羞 生气"))
+        self.assertIsNone(r.hit)          # 分差 0 < margin 0.5 → 仍模糊
+        self.assertIn("ambiguous", r.reason)
 
     def test_empty_library_reason(self):
         svc = self._svc([], min_score=0.5)

@@ -581,6 +581,12 @@
         "description": "是否把 [emote:…] 语法教给模型（0/1）",
         "hint": "库为空时不该教（写出来也没图可发，白占 token）。",
         "default": 0
+      },
+      "high_confidence": {
+        "type": "float",
+        "description": "高置信线：≥此分直接选 top1、不看分差",
+        "hint": "实测教训：`害羞地脸红`(0.80+) 因 top1-top2 只差 0.016 被判 ambiguous 而拒发 —— 高绝对分说明匹配得好，只是库里有同义近邻图，选哪张都合理。取正样本 p25≈0.796 略降 → 0.78。",
+        "default": 0.78
       }
     }
   }
