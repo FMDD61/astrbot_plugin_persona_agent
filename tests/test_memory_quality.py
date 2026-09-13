@@ -292,3 +292,63 @@ class TestCleanKgTool(unittest.TestCase):
             cwd=os.path.join(os.path.dirname(__file__), ".."),
         )
         self.assertEqual(r.returncode, 2)
+
+
+class TestStopwordNeverEdges(unittest.TestCase):
+    """门①补漏：停用词**永不建边**，即使历史实体行残留。
+
+    2026-09-13 实测发现：清洗只删了边、没删实体行，而门槛②看的是实体行计数
+    —— 残留的 `配图`(1526 行) 一出现就 ≥2 → 立刻重新建边（实测确实又冒出 2 条）。
+    """
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.td.name, "memory_store.db")
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _real_keywords(self, text):
+        """**绕过**停用词过滤的取词（模拟 jieba 产出停用词的真实路径）。"""
+        toks = [t for t in str(text or "").split() if t]
+        return toks or [str(text or "").strip()]
+
+    def test_stopword_blocked_even_with_historical_entities(self):
+        # 用"不过滤的取词"喂进停用词 —— 模拟 jieba 真会切出 `配图`/`识别`/`无法`
+        s = MemoryStore(self.td.name, topic_min_occurrences=2, keyword_fn=self._real_keywords)
+        con = sqlite3.connect(self.db)
+        for i in range(100):   # 历史残留：旧版遗留 100 行 `配图` 实体
+            con.execute("INSERT INTO entities(alias,type,text,ts) VALUES (?,?,?,?)",
+                        ("配图", "topic", "配图", 1.0))
+        con.commit(); con.close()
+        s.ingest(MemoryEvent(speaker_alias="甲", text="配图", group_id="g"))
+        con = sqlite3.connect(self.db)
+        n = con.execute("SELECT COUNT(*) FROM edges WHERE type='talks_about' AND to_alias='配图'").fetchone()[0]
+        con.close()
+        self.assertEqual(n, 0, "停用词永不建边（即使实体行残留 100 行）")
+        self.assertGreaterEqual(s.stats()["stopword_blocked"], 1)
+
+    def test_stopword_guard_covers_all_three_legacy_pollutants(self):
+        s = MemoryStore(self.td.name, topic_min_occurrences=2, keyword_fn=self._real_keywords)
+        con = sqlite3.connect(self.db)
+        for a in ("配图", "识别", "无法", "图片", "表情"):
+            for _ in range(50):
+                con.execute("INSERT INTO entities(alias,type,text,ts) VALUES (?,?,?,?)",
+                            (a, "topic", a, 1.0))
+        con.commit(); con.close()
+        for a in ("配图", "识别", "无法", "图片", "表情"):
+            s.ingest(MemoryEvent(speaker_alias="甲", text=a, group_id="g"))
+        con = sqlite3.connect(self.db)
+        n = con.execute("SELECT COUNT(*) FROM edges WHERE type='talks_about' "
+                        "AND to_alias IN ('配图','识别','无法','图片','表情')").fetchone()[0]
+        con.close()
+        self.assertEqual(n, 0)
+
+    def test_real_topic_still_works(self):
+        s = MemoryStore(self.td.name, topic_min_occurrences=2, keyword_fn=_stub_keywords)
+        for _ in range(2):
+            s.ingest(MemoryEvent(speaker_alias="甲", text="提科 真不错", group_id="g"))
+        con = sqlite3.connect(self.db)
+        n = con.execute("SELECT COUNT(*) FROM edges WHERE type='talks_about' AND to_alias='提科'").fetchone()[0]
+        con.close()
+        self.assertEqual(n, 1)   # 真实话题照常（第二次建边）

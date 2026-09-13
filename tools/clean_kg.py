@@ -183,6 +183,10 @@ def main(argv=None) -> int:
     ap.add_argument("--apply", action="store_true", help="真正执行（默认 dry-run）")
     ap.add_argument("--prune-entities", action="store_true",
                     help="连实体行一起删（默认只删边，保留实体行无害）")
+    ap.add_argument("--prune-stopword-entities", action="store_true",
+                    help="删除停用词（结构词/通用词）的 topic 实体行。"
+                         "⚠️ 必须做：门槛②看的是实体行计数，残留的 `配图`(1500+ 行) "
+                         "一出现就 ≥2 → 立刻重新建边（实测确实又冒出 2 条）")
     ap.add_argument("--json", action="store_true", help="机器可读输出")
     args = ap.parse_args(argv)
 
@@ -241,6 +245,26 @@ def main(argv=None) -> int:
         bak = _backup(db)
         print(f"\n备份: {bak}")
         res = apply_cleanup(conn, plan, args.prune_entities, args.keep_threshold)
+        if args.prune_stopword_entities:
+            cur = conn.cursor()
+            bad = sorted(kg_stopwords.STOPWORDS)
+            removed = 0
+            try:
+                cur.execute("BEGIN")
+                for i in range(0, len(bad), 400):
+                    chunk = bad[i : i + 400]
+                    q = ",".join("?" * len(chunk))
+                    cur.execute(
+                        f"DELETE FROM entities WHERE type='topic' AND alias IN ({q})", chunk
+                    )
+                    removed += cur.rowcount
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            print(f"已删除停用词 topic 实体行: {removed}"
+                  f"（门槛②据此计数，清掉后结构词不再复活）")
+            res["removed_entities"] += removed
         after_entities = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
         after_edges = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
         print(f"已清理: 删除边 {res['removed_edges']} 条 / 实体 {res['removed_entities']} 行")

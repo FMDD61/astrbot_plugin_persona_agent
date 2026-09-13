@@ -115,6 +115,7 @@ class MemoryStore:
         # 观测计数（进程生命周期）
         self._topics_deferred = 0    # 因门槛②未建边的 topic
         self._image_desc_skipped = 0  # 因门槛①跳过 topic 抽取的消息数
+        self._stopword_blocked = 0    # 因停用词被拦下建边的 topic 次数
         # 取词函数可注入：生产用 jieba，测试可注入确定性桩 —— 否则"门槛"逻辑
         # 的测试会因环境缺 jieba 而空转（2026-09-13 实测本机即如此）。
         self._keyword_fn = keyword_fn
@@ -165,6 +166,13 @@ class MemoryStore:
                                 (speaker.alias, other.alias, "mentions", event.ts, "{}"),
                             )
                     for topic in topic_entities:
+                        # 门①补漏（2026-09-13 实测发现）：停用词**永不建边**。
+                        # 历史清洗只删了边、没删实体行，而门槛②看的是实体行计数
+                        # —— 残留的 `配图`(1526 行) 一出现就 ≥2 → 立刻重新建边。
+                        # 故判据必须包含"不是停用词"，而不只是"见过两次"。
+                        if kg_stopwords.is_stopword(topic.alias):
+                            self._stopword_blocked += 1
+                            continue
                         # 门槛②：本条之前是否已见过该 topic（含本次刚插的行）
                         if self._topic_min_occurrences > 1:
                             seen = conn.execute(
@@ -347,4 +355,5 @@ class MemoryStore:
             "topic_min_occurrences": self._topic_min_occurrences,
             "topics_deferred": self._topics_deferred,
             "image_desc_skipped": self._image_desc_skipped,
+            "stopword_blocked": self._stopword_blocked,
         }
