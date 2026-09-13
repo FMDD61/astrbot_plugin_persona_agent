@@ -90,6 +90,9 @@ class PersonaPipeline:
         buffer: Optional[ContextBuffer] = None,
         generate: Optional[GenerateFn] = None,
         examples_block: Optional[Callable[[], str]] = None,
+        # S2: 「现在要回应的」块构造器。pipeline 负责拆出正文/图片/表情，
+        # main 负责加说话人/时间/心情等上下文（它才知道这些）。
+        turn_block: Optional[Callable[[list[str], dict], str]] = None,
         postprocess: Optional[Callable[[str], str]] = None,
         temperature_for: Optional[Callable[[str], Optional[float]]] = None,
         topic_handler: Optional[Callable[[Decision, str], Awaitable[None]]] = None,
@@ -100,6 +103,12 @@ class PersonaPipeline:
         max_generation_tries: int = 1,
         rag_enabled: bool = True,
         now_utc_fn: Optional[Callable[[], float]] = None,
+        # S2: 推迟的会话追加。main 在收到消息时调用 `defer_session_append()`
+        # 把本条挂起，pipeline 在**决策完成后、生成前**真正写入 session。
+        # 为什么不在 main 里直接写：LLM 的上下文与引用编号基都必须在
+        # 「本条尚未入会话」的状态下构建，否则当前消息会被说两遍
+        # （session 里一次 + 「现在要回应的」块一次）。
+        session_append: Optional[Callable[[str, str, str, str, str], None]] = None,
     ) -> None:
         self.style = style
         self.rag = rag
@@ -111,6 +120,11 @@ class PersonaPipeline:
         self.buffer = buffer
         self._generate = generate
         self._examples_block = examples_block
+        # S2: 「现在要回应的」块构造器（可选；未接线时退回旧行为）
+        self._turn_block = turn_block
+        self._session_append = session_append
+        # {group_id: (text, name, message_id, sender_uin)}
+        self._pending_append: dict[str, tuple[str, str, str, str]] = {}
         self._postprocess = postprocess
         self._temperature_for = temperature_for
         self._topic_handler = topic_handler
@@ -127,6 +141,40 @@ class PersonaPipeline:
     def _now(self) -> float:
         return float(self._now_utc())
 
+    # ---- S2: 推迟的会话追加 ----
+
+    def defer_session_append(
+        self, group_id: str, text: str, name: str = "",
+        message_id: str = "", sender_uin: str = "",
+    ) -> None:
+        """挂起本条的会话写入（下一个 run() 在决策后落盘）。
+
+        同一群同时只处理一条（main 的 `_generating` 锁），所以覆盖式单槽足够。
+        """
+        self._pending_append[str(group_id)] = (text, name, message_id, sender_uin)
+
+    def _ensure_session_append(self, group_id: str, trace: dict) -> bool:
+        """幂等落盘：每轮最多写一次。早退路径用它兜底。"""
+        if getattr(self, "_run_appended", False):
+            return False
+        if self.flush_session_append(group_id):
+            self._run_appended = True
+            trace["session_appended"] = True
+            return True
+        return False
+
+    def flush_session_append(self, group_id: str) -> bool:
+        """立即落盘挂起条目（terminate / 异常兜底）。幂等。"""
+        item = self._pending_append.pop(str(group_id), None)
+        if item is None or self._session_append is None:
+            return False
+        text, name, mid, uin = item
+        try:
+            self._session_append(str(group_id), text, name, mid, uin)
+            return True
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------ run
 
     async def run(self, inp: PipelineInput) -> SendIntent:
@@ -135,6 +183,8 @@ class PersonaPipeline:
         import asyncio
 
         _now_utc = self._now()
+        # 每轮重置"本条已落盘"标记 —— 使 early return 处的兜底调用不会重复落盘
+        self._run_appended = False
         trace: dict = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now_utc)),
             "ts_epoch": round(_now_utc, 3),
@@ -151,6 +201,8 @@ class PersonaPipeline:
             return await self._run_inner(inp, trace)
         except Exception as e:
             trace["error"] = f"{type(e).__name__}: {e}"
+            # 异常也不能丢消息：把挂起条目落盘
+            self.flush_session_append(inp.group_id)
             return SendIntent(action="silent", silent_reason="pipeline error", trace=trace)
 
     async def _run_inner(self, inp: PipelineInput, trace: dict) -> SendIntent:
@@ -262,7 +314,12 @@ class PersonaPipeline:
             "cooldown_left_sec": decision.cooldown_left_sec,
         }
 
+        # S2: 本条入会话 —— 位置是**两段式**，见下方 `_ensure_session_append`：
+        #   这里的调用只覆盖"硬闸判静默"等**建上下文之前**的早退；
+        #   真正的主落盘点在上下文构建之后（否则当前消息会被说两遍：
+        #   session 里一次 + 「现在要回应的」块一次）。
         if decision.action == ACTION_SILENT:
+            self._ensure_session_append(group_id, trace)
             return SendIntent(action="silent", silent_reason=decision.reason, trace=trace)
 
         # ---- GateLLM (A7; A7④ 安全阀化) ----
@@ -353,16 +410,74 @@ class PersonaPipeline:
             if self.session_mgr is not None
             else []
         )
+        # 恒定示例块：放在 **session 之前**。
+        # 2026-09-13 修正：它原先拼在 session 之后，而 session 每轮都在变长
+        # （实测一天 1482 条）—— 排在增长段之后的任何内容都永远落在缓存失效区，
+        # 等于每轮白付它的 token。放到 session 前面即进入稳定前缀，一次付清。
         ex_block = self._examples_block() if self._examples_block is not None else ""
         if ex_block:
-            contexts.append({"role": "system", "content": ex_block})
+            contexts.insert(0, {"role": "system", "content": ex_block})
         if kg_content:
             contexts.append({"role": "system", "content": kg_content})
+
+        # ---- S2 输入打包重划：把「该回哪句」显式标注出来 ----
+        # 实测依据：决策窗口（96 条/1h）的文本有 **59% 已在 session 里**，
+        # 按 spec §4.2 再注入一遍是重复付费。所以**不加输入**，改为给已有
+        # 内容划界 + 把当前轮单独抬出来：
+        #
+        #   【现在要回应的】当前说话人 + 本条消息 + 图片/表情（直投式）
+        #   【当下】      时间 + 心情（volatile_line，逐轮变）
+        #   【可参考旧话】RAG/KG 命中（风格锚定，不是"要回的内容"）
+        #
+        # KG 尾注本来就在 contexts 末尾（每轮变），这里把"当下"和"当前轮"
+        # 都排在它**前面**，保持「稳定在上、易变在下」的缓存序不变。
+        body_text, img_descs, faces = text_style.split_media_annotations(text)
+        turn_lines: list[str] = []
+        # 内容行直接用别名（不带 QQ 号）：块头已有「发话人：X」，
+        # 再带一次号码是重复且对"怎么回这句话"没有帮助。
+        turn_lines.append(f"{alias}：{body_text}" if body_text.strip()
+                          else f"{alias}：（只发了媒体，没有说话）")
+        if faces:
+            turn_lines.append(f"［表情］{'、'.join(faces)}")
+        for d in img_descs:
+            turn_lines.append(
+                "［图片］看不清内容（识图失败）" if "无法识别" in d else f"［图片］{d}"
+            )
+        trace["turn_block"] = {
+            "body_chars": len(body_text),
+            "images": len(img_descs),
+            "faces": len(faces),
+        }
+        ctx_tail = None
+        if self._turn_block is not None:
+            try:
+                ctx_tail = self._turn_block(turn_lines, {
+                    "sender_uin": inp.sender_uin,
+                    "sender_alias": alias,
+                    "is_at": inp.is_at,
+                    "body_text": body_text,
+                })
+            except Exception as e:
+                trace["turn_block_error"] = f"{type(e).__name__}: {e}"
+        if ctx_tail:
+            if contexts and isinstance(contexts[-1], dict) and contexts[-1].get("role") == "system":
+                contexts.insert(-1, {"role": "system", "content": ctx_tail})
+            else:
+                contexts.append({"role": "system", "content": ctx_tail})
 
         trace["session"] = {
             "size": len(contexts),
             "chars": sum(len(c.get("content", "")) for c in contexts),
         }
+        # ★ S2 主落盘点：上下文已按"本条尚未入会话"构建完毕，现在把本条写进
+        #   session。位置受三条约束：
+        #     ① 在**上下文构建之后** —— 否则当前消息会被说两遍
+        #        （session 里一次 + 「现在要回应的」块一次）；
+        #     ② 在**引用快照之前** —— 编号基必须与 LLM 所见严格一致（B-001）；
+        #     ③ 在**所有 early return 之前** —— sleep/静默/冲突的消息也要记录
+        #        （v3 意图："静默但照常记录"）。
+        #   建上下文之前的早退由上方 `_ensure_session_append` 兜底；此处幂等。
+        self._ensure_session_append(group_id, trace)
         # B-002 观测：本会话被丢弃的空 content 条目（>0 = 数据曾损坏，已自愈）
         if self.session_mgr is not None and hasattr(self.session_mgr, "dropped_empty"):
             try:

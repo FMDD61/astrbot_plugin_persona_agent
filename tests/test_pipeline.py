@@ -114,9 +114,11 @@ def _pipeline(**over):
         kg_provider=over.get("kg", None),
         buffer=over.get("buffer", None),
         generate=over.get("generate", lambda t, c, e, temp, su, umo: _async("好的~")),
-        examples_block=lambda: "",
+        examples_block=over.get("examples_block", lambda: ""),
         postprocess=lambda s: s.strip(),
         temperature_for=lambda trig: 0.8,
+        turn_block=over.get("turn_block", None),
+        session_append=over.get("session_append", None),
         debounce_sec=0.0,
         rag_enabled=over.get("rag_enabled", True),
     )
@@ -402,3 +404,282 @@ class TestRagEnabled(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTurnBlockS2(unittest.TestCase):
+    """S2 输入打包重划：「现在要回应的」块。
+
+    依据（实测）：决策窗口 96 条的文本 **59% 已在 session 里**，按 spec §4.2
+    再注入一遍是重复付费。故**不加输入**，改为把"当前这一轮"显式抬出来，
+    并把图片/表情描述从正文里拆出来（直投式，而不是拼在用户话里）。
+    """
+
+    def _capture(self):
+        seen = {}
+
+        def tb(turn_lines, ctx):
+            seen["lines"] = list(turn_lines)
+            seen["ctx"] = dict(ctx)
+            return "【现在要回应的】\n" + "\n".join(turn_lines)
+
+        return tb, seen
+
+    def test_turn_block_receives_body_without_image_markup(self):
+        tb, seen = self._capture()
+        gen = lambda t, c, e, temp, su, umo: _async("好")
+        p = _pipeline(turn_block=tb, generate=gen)
+        # 注意：PipelineInput.text 是 main 清洗+识图后的文本
+        _run(p.run(PipelineInput("g1", "你好！ （配图：一只橘猫）", True, "100000002", "成员丙")))
+        self.assertIn("lines", seen)
+        joined = "\n".join(seen["lines"])
+        self.assertIn("你好！", joined)          # 正文保留
+        self.assertNotIn("（配图：", joined)          # 原始占位格式已拆
+        self.assertIn("［图片］一只橘猫", joined)      # 直投式标注
+        self.assertNotIn("一只橘猫）", joined)
+
+    def test_image_failure_is_labeled_not_dropped(self):
+        tb, seen = self._capture()
+        p = _pipeline(turn_block=tb)
+        _run(p.run(PipelineInput("g1", "（配图：无法识别）", False, "1", "甲")))
+        joined = "\n".join(seen["lines"])
+        self.assertIn("看不清内容", joined)   # 失败要明说，RP 不该脑补
+
+    def test_face_annotation_split_out(self):
+        tb, seen = self._capture()
+        p = _pipeline(turn_block=tb)
+        _run(p.run(PipelineInput("g1", "哈哈（表情：呲牙）", False, "1", "甲")))
+        joined = "\n".join(seen["lines"])
+        self.assertIn("哈哈", joined)
+        self.assertIn("［表情］呲牙", joined)
+
+    def test_media_only_message_marked(self):
+        tb, seen = self._capture()
+        p = _pipeline(turn_block=tb)
+        _run(p.run(PipelineInput("g1", "（配图：一只狗）", False, "1", "甲")))
+        joined = "\n".join(seen["lines"])
+        self.assertIn("只发了媒体", joined)
+
+    def test_ctx_carries_speaker_and_is_at(self):
+        tb, seen = self._capture()
+        p = _pipeline(turn_block=tb)
+        _run(p.run(PipelineInput("g1", "在吗", True, "999", "小明")))
+        self.assertEqual(seen["ctx"]["sender_uin"], "999")
+        self.assertEqual(seen["ctx"]["sender_alias"], "小明")
+        self.assertTrue(seen["ctx"]["is_at"])
+
+    def test_trace_records_turn_block_shape(self):
+        tb, _ = self._capture()
+        p = _pipeline(turn_block=tb)
+        si = _run(p.run(PipelineInput("g1", "嗨（配图：猫）（表情：呲牙）", False, "1", "甲")))
+        tb_trace = si.trace.get("turn_block") or {}
+        self.assertEqual(tb_trace.get("images"), 1)
+        self.assertEqual(tb_trace.get("faces"), 1)
+        self.assertEqual(tb_trace.get("body_chars"), len("嗨"))
+
+    def test_block_inserted_before_kg_tail(self):
+        """缓存序不变：稳定在上、易变在下，KG 尾注仍是最后一条。"""
+        tb, _ = self._capture()
+
+        class _Kg:
+            async def query(self, ctx, external_dense_hits=None):
+                class R: content = "KG尾注内容"
+                return R()
+
+        p = _pipeline(turn_block=tb, kg=_Kg())
+        captured = {}
+
+        def gen(t, c, e, temp, su, umo):
+            captured["ctx"] = list(c)
+            return _async("好")
+
+        p = _pipeline(turn_block=tb, kg=_Kg(), generate=gen)
+        _run(p.run(PipelineInput("g1", "你好", False, "1", "甲")))
+        ctx = captured["ctx"]
+        self.assertEqual(ctx[-1]["content"], "KG尾注内容")          # KG 仍最后
+        self.assertIn("【现在要回应的】", ctx[-2]["content"])        # turn block 在其前
+
+    def test_no_turn_block_keeps_legacy_context(self):
+        """未接线回调时行为不变（离线测试台/旧路径）。"""
+        captured = {}
+
+        def gen(t, c, e, temp, su, umo):
+            captured["ctx"] = list(c)
+            return _async("好")
+
+        p = _pipeline(generate=gen)
+        si = _run(p.run(PipelineInput("g1", "你好", False, "1", "甲")))
+        self.assertEqual(si.action, "reply")
+        self.assertFalse(any("【现在要回应的】" in str(m.get("content")) for m in captured["ctx"]))
+
+    def test_examples_block_sits_before_session(self):
+        """恒定示例块必须在 session **之前**（否则永远落在缓存失效区）。
+
+        2026-09-13 修正：它原先拼在 session 之后，而 session 每轮增长
+        （实测一天 1482 条）→ 排在增长段之后的恒定内容等于每轮白付 token。
+        """
+        from services.session_manager import SessionManager
+        sm = SessionManager(data_dir=None, max_messages=None)
+        sm.append("g1", "user", "历史一", name="甲")
+        sm.append("g1", "assistant", "历史二")
+
+        def sa(gid, t, n, mid, uin):
+            sm.append(gid, "user", t, name=n or None, message_id=mid or "", sender_uin=uin or "")
+
+        captured = {}
+
+        def gen(t, c, e, temp, su, umo):
+            captured["ctx"] = [dict(m) for m in c]
+            return _async("好")
+
+        p = _pipeline(session=sm, session_append=sa, generate=gen,
+                      examples_block=lambda: "【示例块】",
+                      turn_block=lambda lines, ctx: "【现在要回应的】\n" + "\n".join(lines))
+        _run(p.run(PipelineInput("g1", "当前", False, "u1", "甲")))
+        contents = [str(m.get("content")) for m in captured["ctx"]]
+        self.assertEqual(contents[0], "【示例块】", "示例块必须是第一条（缓存前缀起点）")
+        i_ex = contents.index("【示例块】")
+        i_hist = contents.index("历史一")
+        i_turn = next(i for i, c in enumerate(contents) if "【现在要回应的】" in c)
+        self.assertLess(i_ex, i_hist, "示例块要在 session 之前")
+        self.assertLess(i_hist, i_turn, "当前轮要在 session 之后（易变量集中尾部）")
+
+    def test_turn_block_exception_does_not_break_reply(self):
+        """回调抛异常 → 记 trace 但照常生成（不因打包失败而哑掉）。"""
+        def bad_tb(lines, ctx):
+            raise RuntimeError("boom")
+
+        p = _pipeline(turn_block=bad_tb)
+        si = _run(p.run(PipelineInput("g1", "你好", False, "1", "甲")))
+        self.assertEqual(si.action, "reply")
+        self.assertIn("boom", si.trace.get("turn_block_error", ""))
+
+
+class TestDeferredSessionAppend(unittest.TestCase):
+    """S2：本条**推迟**入会话，避免「当前消息说两遍」。
+
+    不变式：
+      - LLM 看到的 context 里**不含**当前这条（它在「现在要回应的」块里）
+      - 落盘发生在硬闸之后、任何 early return 之前
+      - 静默 / 睡眠 / 异常路径都不丢消息
+    """
+
+    def _mk(self, session):
+        appends = []
+
+        def sa(group_id, text, name, message_id, sender_uin):
+            appends.append((group_id, text, name, message_id, sender_uin))
+            session.append(group_id, "user", text, name=name,
+                           message_id=message_id, sender_uin=sender_uin)
+
+        return sa, appends
+
+    def _pipeline_with(self, appends_cb, session, **over):
+        """注意：不变式测试必须传真实 SessionManager（_FakeSession 的
+        get_contexts 是静态列表，append 不会反映到 context 里）。"""
+        captured = {}
+
+        def gen(t, c, e, temp, su, umo):
+            captured["ctx"] = list(c)
+            return _async("好")
+
+        p = _pipeline(session=session, session_append=appends_cb, generate=gen, **over)
+        return p, captured
+
+    def test_current_message_not_in_context_but_is_in_turn_block(self):
+        # 必须用**真实 SessionManager**：_FakeSession 的 contexts 是静态的，
+        # 测不出"落盘前后 context 的差异"这个不变式。
+        from services.session_manager import SessionManager
+        sm = SessionManager(data_dir=None, max_messages=None)
+        sm.append("g1", "user", "之前的消息", name="甲", message_id="m0")
+        cb, appends = self._mk(sm)
+        tb_calls = []
+
+        def tb(lines, ctx):
+            tb_calls.append(list(lines))
+            return "【现在要回应的】\n" + "\n".join(lines)
+
+        p, captured = self._pipeline_with(cb, sm, turn_block=tb)
+        p.defer_session_append("g1", "当前这条", name="乙", message_id="m1", sender_uin="u2")
+        si = _run(p.run(PipelineInput("g1", "当前这条", False, "u2", "乙")))
+
+        self.assertEqual(si.action, "reply")
+        # ① 落盘了，且元数据完整
+        self.assertEqual(len(appends), 1)
+        self.assertEqual(appends[0][1], "当前这条")
+        self.assertEqual(appends[0][3], "m1")
+        # ② session 段必须**在落盘前**构建 —— 即 context 里不出现"当前这条"
+        #    作为独立条目（会话历史条目），它只应出现在「现在要回应的」块里。
+        #    注意不能只看 user 角色：turn block 是 system 消息、内容里也含本条。
+        self.assertIn("之前的消息", [m.get("content") for m in captured["ctx"]])
+        hist_entries = [m.get("content") for m in captured["ctx"]
+                        if m.get("content") == "当前这条"]
+        self.assertEqual(hist_entries, [], "当前这条不应作为会话条目出现在 context 里")
+        # ③ 当前这条出现在 turn block
+        self.assertTrue(tb_calls)
+        self.assertIn("当前这条", "\n".join(tb_calls[0]))
+
+    def test_silent_path_still_records(self):
+        """v3 设计意图：静默但照常记录。"""
+        from services.session_manager import SessionManager
+
+        class _Silent:
+            def decide(self, **kw):
+                from services.interjection import Decision, ACTION_SILENT, TRIGGER_SILENT
+                return Decision(action=ACTION_SILENT, trigger=TRIGGER_SILENT,
+                                reason="test silent")
+
+        sm = SessionManager(data_dir=None, max_messages=None)
+        cb, appends = self._mk(sm)
+        p, _ = self._pipeline_with(cb, sm, interjection=_Silent())
+        p.defer_session_append("g1", "静默也要记", name="甲", message_id="m1", sender_uin="u1")
+        si = _run(p.run(PipelineInput("g1", "静默也要记", False, "u1", "甲")))
+        self.assertEqual(si.action, "silent")
+        self.assertEqual(len(appends), 1)
+        self.assertIn("静默也要记", [m["content"] for m in sm.get_contexts("g1")])
+        self.assertTrue(si.trace.get("session_appended"))
+
+    def test_exception_path_flushes(self):
+        """生成回调抛异常 → 消息不得丢失。"""
+        from services.session_manager import SessionManager
+
+        def boom(t, c, e, temp, su, umo):
+            raise RuntimeError("gen boom")
+
+        sm = SessionManager(data_dir=None, max_messages=None)
+        cb, appends = self._mk(sm)
+        p = _pipeline(session=sm, session_append=cb, generate=boom)
+        p.defer_session_append("g1", "异常也要记", name="甲", message_id="m9", sender_uin="u1")
+        si = _run(p.run(PipelineInput("g1", "异常也要记", False, "u1", "甲")))
+        self.assertEqual(si.action, "silent")
+        self.assertEqual(len(appends), 1, "异常路径必须落盘")
+
+    def test_no_defer_no_append(self):
+        """没挂起任何东西时不应凭空写入。"""
+        from services.session_manager import SessionManager
+        sm = SessionManager(data_dir=None, max_messages=None)
+        cb, appends = self._mk(sm)
+        p, _ = self._pipeline_with(cb, sm)
+        _run(p.run(PipelineInput("g1", "嗨", False, "u1", "甲")))
+        self.assertEqual(appends, [])
+
+    def test_flush_is_idempotent(self):
+        from services.session_manager import SessionManager
+        sm = SessionManager(data_dir=None, max_messages=None)
+        cb, appends = self._mk(sm)
+        p, _ = self._pipeline_with(cb, sm)
+        p.defer_session_append("g1", "一次", name="甲", message_id="m1", sender_uin="u1")
+        self.assertTrue(p.flush_session_append("g1"))
+        self.assertFalse(p.flush_session_append("g1"))
+        self.assertEqual(len(appends), 1)
+
+    def test_next_message_appends_previous(self):
+        """同群两条消息：第一条挂起 → 第二条的 run 会把第一条落盘。"""
+        from services.session_manager import SessionManager
+        sm = SessionManager(data_dir=None, max_messages=None)
+        cb, appends = self._mk(sm)
+        p, _ = self._pipeline_with(cb, sm)
+        p.defer_session_append("g1", "第一条", name="甲", message_id="m1", sender_uin="u1")
+        _run(p.run(PipelineInput("g1", "第一条", False, "u1", "甲")))
+        p.defer_session_append("g1", "第二条", name="乙", message_id="m2", sender_uin="u2")
+        _run(p.run(PipelineInput("g1", "第二条", False, "u2", "乙")))
+        self.assertEqual([a[1] for a in appends], ["第一条", "第二条"])

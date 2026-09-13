@@ -39,6 +39,43 @@ RE_QUOTE_MARK = re.compile(r"^\s*\[r:\s*(-?\d+)\]\s*")
 # 模型学会 [emote:...] 的那一天，标记会被原样发进群里。S3 实现执行器前
 # 这里就先兜住（当前提示词还没教，属预防性收口）。
 RE_TOOL_INTENT_MARK = re.compile(r"\[(?:emote|poke)\s*:[^\]]*\]")
+# 识图注入块：`（配图：<描述>）` / `（配图：1:…；2:…）`（main._augment_with_vision 产出）
+RE_IMAGE_DESC_BLOCK = re.compile(r"（配图：([^）]*)）")
+# 表情（QQ Face）注入块：`（表情：呲牙）`
+RE_FACE_BLOCK = re.compile(r"（表情：([^）]*)）")
+
+
+def split_media_annotations(text: str) -> tuple[str, list[str], list[str]]:
+    """把识图/表情注入块从消息正文里**拆出来**（S2 输入打包重划）。
+
+    背景：识图描述此前被直接拼进用户消息文本
+    （`"你好！ （配图：一只猫）"`），于是它同时是"用户说的话"和
+    "系统给的信息"——RP 模型分不清，KG 也照抽不误（B-014）。
+
+    现在拆开：正文归正文，图片/表情描述作为**独立的结构化块**注入，
+    语义上等价于「模型自己看到了这张图」（dsh read_image 的直投性质），
+    而不是别人转述的一句话。
+
+    返回 ``(正文, 图片描述列表, 表情列表)``。描述里的 `1:`/`2:` 前缀会被保留
+    （多图时用于区分），空描述（`无法识别`）**不丢弃** —— 它是有意义的信号，
+    说明"这里确实有张图但看不清"，RP 不该脑补。
+    """
+    if not text:
+        return text, [], []
+    imgs: list[str] = []
+    faces: list[str] = []
+    for m in RE_IMAGE_DESC_BLOCK.finditer(text):
+        d = (m.group(1) or "").strip()
+        imgs.append(d)
+    for m in RE_FACE_BLOCK.finditer(text):
+        d = (m.group(1) or "").strip()
+        faces.append(d)
+    body = RE_IMAGE_DESC_BLOCK.sub("", text)
+    body = RE_FACE_BLOCK.sub("", body)
+    # 拆完会留下多余空格（如 "你好！ "），规整一下
+    body = re.sub(r"[ \t]{2,}", " ", body).strip()
+    return body, imgs, faces
+
 
 KOUPI_LIST = ("口癖己", "口癖庚", "口癖丁", "口癖丙", "口癖甲", "口癖戊", "口癖乙")
 KOUPI_MAX_TOTAL = 2
