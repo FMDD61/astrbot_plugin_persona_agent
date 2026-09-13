@@ -153,7 +153,12 @@ class PersonaAgent(Star):
         restored = self.session_mgr.load_all()
         if restored:
             logger.info(f"[persona_agent] restored sessions: {restored}")
-        self._memory_store = MemoryStore(str(self.data_dir))
+        # B-014: KG 入库质量门（只出现一次的话题不建边；1 = 关闭门槛退回旧行为）
+        mem_cfg = self.config.get("memory", {}) or {}
+        self._memory_store = MemoryStore(
+            str(self.data_dir),
+            topic_min_occurrences=int(mem_cfg.get("topic_min_occurrences", 2)),
+        )
         # A7③: dense_enabled 与 rag.enabled 同源（reload 时重建 KG 生效）
         rag_on = int(rag_cfg.get("enabled", 1)) == 1
         self.kg_provider = MultiSignalKGProvider(
