@@ -215,24 +215,78 @@ def describe_all(items: list[dict], *, library_dir: Path, api_base: str, api_key
 
 # ---------------------------------------------------------------- 嵌入
 
-def embed_all(items: list[dict], *, model_name: str) -> int:
-    """给 items 填 embedding（原地修改）。返回维度。"""
+# 描述里的"关键词"段：`关键词：开心、惊讶` / `检索关键词：紧张、流汗` 等变体
+# 要求「标签词 + 分隔符」成对出现才命中。
+# 反例（实测踩到）：「没有关键词段的描述，只有画面说明。」—— 句子里含"关键词"
+# 三字但**不是标签**；宽松正则会切出 ['段的描述', '只有画面说明'] 并静默污染索引。
+_RE_KW_SEG = __import__("re").compile(
+    r"(?:检索关键词|关键词|检索词|适合检索|情绪关键词)\s*[：:]\s*([^\n]{2,80})")
+
+
+_KW_LABEL = "关键词"
+
+
+def extract_keywords(desc: str) -> list[str]:
+    """从视觉描述里抽出关键词段。
+
+    实测 90% 的描述自带 `关键词：A、B、C`（562 条里 503 条）。**嵌入要用它，
+    不要用整段描述** —— 描述中位 90 字符（最长 257），而 `[emote:意图短语]`
+    只有 15–25 字符。长描述里混着画面细节/台词/梗，会把嵌入"稀释"，
+    导致短查询与长文档的余弦相似度系统性偏低、几乎选不中任何东西。
+    短↔短匹配才是对的。
+    """
+    d = desc or ""
+    m = _RE_KW_SEG.search(d)
+    if not m:
+        return []
+    raw = m.group(1)
+    parts = [x.strip(" 。.、,，;；") for x in __import__("re").split(r"[、,，;；/|]+", raw)]
+    # 过滤：太长的多半是整句而非关键词；单字符无意义
+    return [x for x in parts if 1 < len(x) <= 12][:8]
+
+
+def embed_all(items: list[dict], *, model_name: str, backend=None) -> int:
+    """给 items 填 embedding（原地修改）。返回维度。
+
+    ``backend`` 可注入（测试用）—— 形如 sentence-transformers 的对象：
+    需有 ``encode(texts, normalize_embeddings=True) -> list[list[float]]``
+    与 ``get_sentence_embedding_dimension()``。
+    """
     todo = [it for it in items if not it.get("embedding")]
     if not todo:
         return int(items[0]["embedding"].__len__()) if items and items[0].get("embedding") else 0
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    try:
-        from sentence_transformers import SentenceTransformer  # type: ignore
-    except ImportError:
-        print("  ! sentence-transformers 不可用 → 跳过嵌入（索引将不可用于选择）", file=sys.stderr)
-        return 0
-    print(f"  载入嵌入模型 {model_name} …")
-    m = SentenceTransformer(model_name, local_files_only=True)
+    m = backend
+    if m is None:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+        except ImportError:
+            print("  ! sentence-transformers 不可用 → 跳过嵌入（索引将不可用于选择）",
+                  file=sys.stderr)
+            return 0
+        print(f"  载入嵌入模型 {model_name} …")
+        m = SentenceTransformer(model_name, local_files_only=True)
     dim = int(m.get_sentence_embedding_dimension())
-    # 描述 + tags 一起编码：tags 是人工修正通道，应该影响检索
-    texts = [" ".join([it.get("desc", "")] + list(it.get("tags") or [])) for it in todo]
-    vecs = m.encode(texts, normalize_embeddings=True).tolist()
+    # 嵌入文本优先级（短↔短匹配）：
+    #   ① tags（人工修正通道，最高优先）
+    #   ② 从描述里抽出的关键词段（90% 的描述自带）
+    #   ③ 整段描述（兜底：没有关键词段时只能用它）
+    texts = []
+    for it in todo:
+        tags = [str(t) for t in (it.get("tags") or []) if str(t).strip()]
+        if not tags:
+            kws = extract_keywords(it.get("desc", ""))
+            if kws:
+                it["tags"] = kws          # 落进索引，供人工修正与 LLM 精选
+            tags = kws
+        basis = " ".join(tags) if tags else (it.get("desc") or "")
+        if not basis.strip():
+            basis = it.get("file", "")    # 连描述都没有 → 用文件名占位（不会选中的）
+        texts.append(basis)
+    raw_vecs = m.encode(texts, normalize_embeddings=True)
+    # sentence-transformers 返回 ndarray（.tolist()），测试桩可能直接给 list
+    vecs = raw_vecs.tolist() if hasattr(raw_vecs, "tolist") else [list(v) for v in raw_vecs]
     for it, v in zip(todo, vecs):
         it["embedding"] = [round(float(x), 6) for x in v]
     print(f"    {len(todo)} 条，维度 {dim}")
