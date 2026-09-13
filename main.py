@@ -1402,7 +1402,7 @@ class PersonaAgent(Star):
                 top_k=int(scfg.get("top_k", 5)),
                 min_score=float(scfg.get("min_score", 0.68)),
                 margin=float(scfg.get("margin", 0.02)),
-                high_confidence=float(scfg.get("high_confidence", 0.78)),
+                high_confidence=float(scfg.get("high_confidence", 0.70)),
             )
             logger.info(
                 f"[persona_agent] sticker service ready: {self._sticker.size} 条"
