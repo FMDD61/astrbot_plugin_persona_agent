@@ -96,3 +96,85 @@ class TestCacheStableSystemPrompt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHourlyTimezoneGuard(unittest.TestCase):
+    """🔴 2026-09-13 实测修复的静默 bug：hourly 分布的时区错位。
+
+    `analyze_style` 原来用 `dt.hour` 统计（**UTC**），文件里也写着
+    "Counts are UTC. The plugin should shift to its local TZ on load." ——
+    但**下游从来没做这个转换**。于是插件在**本地 20:33** 读的是 UTC 20 点
+    的预算（0.34，实为本地凌晨 4 点），而 active_interjection 每条消耗 1.0
+    → **主动插话在本地 10:00–24:00 被完全压制**（群最活跃的时段）。
+    @ 回复不受预算限制，所以一直没被发现。
+    """
+
+    def _mk(self, td, payload):
+        with open(os.path.join(td, "my_hourly_distribution.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+
+    def test_legacy_utc_file_is_shifted(self):
+        with tempfile.TemporaryDirectory() as td:
+            # 旧格式：UTC 索引 + tz_note（无 tz 标记）
+            self._mk(td, {
+                "tz_note": "Counts are UTC. The plugin should shift to its local TZ on load.",
+                "hourly_share": {"20": 0.0001, "12": 0.05},
+                "hourly_budget": {"20": 0.34, "12": 122.80},
+            })
+            sp = StyleProfile(td)
+            # UTC 20 → 本地 04；UTC 12 → 本地 20
+            self.assertAlmostEqual(sp.hourly_budget(4), 0.34)
+            self.assertAlmostEqual(sp.hourly_budget(20), 122.80)
+            self.assertAlmostEqual(sp.hourly_budget(12), 0.0)
+
+    def test_new_local_file_is_used_as_is(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._mk(td, {
+                "tz": "local",
+                "tz_note": "Counts are LOCAL time (UTC+offset). Do not shift again.",
+                "hourly_share": {"20": 0.05},
+                "hourly_budget": {"20": 122.80},
+            })
+            sp = StyleProfile(td)
+            self.assertAlmostEqual(sp.hourly_budget(20), 122.80)   # 不再平移
+            self.assertAlmostEqual(sp.hourly_budget(4), 0.0)
+
+    def test_shift_wraps_around_midnight(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._mk(td, {
+                "tz_note": "Counts are UTC.",
+                "hourly_budget": {"20": 1.0, "23": 2.0, "0": 3.0},
+            })
+            sp = StyleProfile(td)
+            # UTC 20→本地 4, UTC 23→本地 7, UTC 0→本地 8
+            self.assertAlmostEqual(sp.hourly_budget(4), 1.0)
+            self.assertAlmostEqual(sp.hourly_budget(7), 2.0)
+            self.assertAlmostEqual(sp.hourly_budget(8), 3.0)
+
+    def test_custom_offset_honoured(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._mk(td, {
+                "tz_note": "Counts are UTC.",
+                "tz_offset_hours": 0,
+                "hourly_budget": {"20": 1.0},
+            })
+            sp = StyleProfile(td)
+            self.assertAlmostEqual(sp.hourly_budget(20), 1.0)   # 偏移 0 → 不平移
+
+    def test_peak_hours_shifted_too(self):
+        """peak_hours 也必须按本地时（否则两个消费方口径不一致）。"""
+        with tempfile.TemporaryDirectory() as td:
+            self._mk(td, {
+                "tz_note": "Counts are UTC.",
+                "hourly_share": {str(h): (0.1 if h == 12 else 0.001) for h in range(24)},
+            })
+            sp = StyleProfile(td)
+            self.assertIn(20, sp.peak_hours())     # UTC 12 → 本地 20
+            self.assertNotIn(12, sp.peak_hours())
+
+    def test_missing_file_is_zero_not_crash(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = StyleProfile(td)
+            self.assertEqual(sp.hourly_budget(12), 0.0)
+            self.assertEqual(sp.peak_hours(), set())

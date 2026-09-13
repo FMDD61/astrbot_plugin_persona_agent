@@ -25,6 +25,28 @@
 - **日记 `day` 偏移一天**：归档 09-12 的会话，`day` 却取轮换后的 `day_key()`（09-13）。改为按同一口径回推 24h
 - **provider id 写错会静默哑掉（新增加固）**：`_resolve_provider_id()` 现在**先校验配置值存在性** —— 写成不存在的 id 时 `llm_generate` 抛 `ProviderNotFoundError`、被 except 吞成空回复（又一条"看起来正常其实全哑"）。校验失败 → 告警 + 回退到会话 provider；拿不到 `provider_manager` 时返回"未知"照用配置值（不让校验本身成为故障源）。三级回退逻辑抽为纯函数 `llm_params.resolve_provider_id()`，可离线单测（+8 例）
 
+### Fixed (2026-09-13, 🔴 hourly_budget 时区错位 —— 主动插话在活跃时段被完全压制)
+> 开 `active_interjection=1` 后实测抓到的静默 bug，**与 B-006 同形**（行为看起来
+> 像"性格克制"，实为配额恒为 0）。
+
+- **现象**：trace 里出现 `hourly budget exhausted (1.00/0.34)`。本地 20:33 的
+  可用预算只有 **0.34**，而每条回复消耗 **1.0** → **一条都发不出**。
+- **根因**：`tools/analyze_style.py` 用 `dt.hour` 统计（**UTC**），文件里也写了
+  `"tz_note": "Counts are UTC. The plugin should shift to its local TZ on load."`
+  —— 但**下游从来没做这个转换**。于是插件在本地 20:33 读的是 **UTC 20 点**
+  （= 本地凌晨 4 点）的预算。实测 `peak_hours` = `[1..16]`（UTC）= 本地 09:00–24:00，
+  即**活跃时段的预算被当成深夜配额**，本地 10:00–24:00 主动插话全被压制。
+  **@ 回复不受预算限制**（代码有注释），所以这个问题一直没暴露。
+- **修法（双管齐下）**：
+  1. **生成端**（根因）：`analyze_style` 按 `--tz-offset-hours`（默认 +8）落**本地时**，
+     并写 `"tz": "local"` 标记；`tz_note` 改为 "Counts are LOCAL time. Do not shift again."
+  2. **读取端**（护栏）：`StyleProfile._hourly_local()` 识别旧文件（含 `tz_note`
+     且无 `tz`）并按偏移平移，使 `hourly_budget()` 与 `peak_hours()` **两个消费方
+     口径一致**；新文件原样使用
+- 顺带修掉一个自己的 bug：`h.get("tz_offset_hours", 8) or 8` 会把**合法的偏移 0**
+  当成缺省值静默变成 +8（测试抓到）—— 必须区分"键不存在"与"值为 0"。
+- 测试 351 → **357 全绿**（新增时区护栏 6 例，含跨午夜回绕、自定义偏移、peak_hours 一致性）
+
 ### Changed (2026-09-13, S4 Gate 共享上下文：让 Gate 与 RP 看到同一个世界)
 > 用户判断（2026-09-13）："GATE LLM 最好也要塞进全量的群友关系图谱，并且要知道
 > RP LLM 的人格设定，同时判断回不回的消息上文需要尽量长，否则 GATE 本身会降低

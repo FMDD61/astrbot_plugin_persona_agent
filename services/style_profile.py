@@ -232,13 +232,57 @@ class StyleProfile:
             return ""
         return "群友识别（按 QQ 号，优先用别名称呼）：\n" + "\n\n".join(blocks)
 
-    def hourly_budget(self, hour: int) -> float:
+    def _hourly_local(self) -> dict:
+        """按**本地小时**索引的 hourly 分布（兼容历史 UTC 文件）。
+
+        🔴 2026-09-13 实测踩到并修复的静默 bug：
+          `tools/analyze_style.py` 用 ``dt.hour`` 统计（**UTC**），文件里也写了
+          `"tz_note": "Counts are UTC. The plugin should shift to its local TZ on load."`
+          —— 但**下游从来没做这个转换**。于是插件在**本地 20:33** 读的是
+          **UTC 20 点的预算 = 0.34**（那条实际是本地凌晨 4 点），
+          而 active_interjection 每条回复消耗 1.0 → **预算永远不够 → 主动插话
+          在本地 10:00–24:00 被完全压制**（恰好是群最活跃的时段）。
+          @ 回复不受预算限制，所以之前没被发现。
+
+        这里在**读取时**统一成"按本地小时索引"：
+          - 新文件（生成端已改为本地时）→ 直接用
+          - 旧文件（含 tz_note / 无 tz 标记）→ 按 tz_offset 平移
+        """
         h = self._get("my_hourly_distribution.json")
-        budgets = h.get("hourly_budget") or {}
+        tz = str(h.get("tz") or "").lower()
+        legacy_utc = (not tz) and bool(h.get("tz_note"))
+        if tz == "local" or (not legacy_utc):
+            return h
+        # ⚠️ 不能用 `h.get("tz_offset_hours", 8) or 8` —— 合法的偏移 0（UTC）
+        # 会被 `or` 当成缺省值静默变成 +8。必须区分"键不存在"与"值为 0"。
+        _raw_off = h.get("tz_offset_hours", None)
+        try:
+            off = 8 if _raw_off is None else int(_raw_off)
+        except (TypeError, ValueError):
+            off = 8
+
+        out = dict(h)
+        for key in ("hourly_message_count", "hourly_share", "hourly_budget"):
+            src = h.get(key) or {}
+            if not isinstance(src, dict):
+                continue
+            shifted: dict[str, object] = {}
+            for k, v in src.items():
+                try:
+                    hk = (int(k) + off) % 24
+                except (TypeError, ValueError):
+                    continue
+                shifted[str(hk)] = v
+            out[key] = shifted
+        return out
+
+    def hourly_budget(self, hour: int) -> float:
+        budgets = self._hourly_local().get("hourly_budget") or {}
         return float(budgets.get(str(hour), 0.0))
 
     def peak_hours(self) -> set[int]:
-        h = self._get("my_hourly_distribution.json")
+        """活跃时段（**本地小时**）。同样走 `_hourly_local()` 的兼容转换。"""
+        h = self._hourly_local()
         shares = h.get("hourly_share") or {}
         if not shares:
             return set()
