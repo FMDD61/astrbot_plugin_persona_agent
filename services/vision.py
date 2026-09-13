@@ -111,6 +111,36 @@ async def resolve_image_bytes(img, diag: Optional[dict] = None) -> Optional[byte
 PostFn = Callable[[str, dict], Awaitable[dict]]
 
 
+def extract_completion_text(resp: dict) -> str:
+    """从网关响应取描述文本，**兼容 content 为空、答案落在 reasoning 里的情况**。
+
+    🔴 2026-09-13 实测抓到（识图间歇失败的根因）：部分图片模型会把最终答案
+    写进 **`reasoning`** 字段、`content` 留空，例如
+
+        {"content": "", "reasoning": "1. 分析请求… 5. 最后输出：五个Q版角色站于草地…"}
+
+    只读 `content` → 空串 → 调用方渲染成「（配图：无法识别）」，
+    **看起来像"识别不了"，实为解析漏了一个字段**（与 B-005 同形）。
+
+    优先级：`content` → `reasoning` 里的"最后输出/结论"段 → reasoning 末行。
+    """
+    msg = ((resp.get("choices") or [{}])[0].get("message") or {})
+    text = str(msg.get("content") or "").strip()
+    if text:
+        return text
+    reasoning = str(msg.get("reasoning") or msg.get("reasoning_content") or "").strip()
+    if not reasoning:
+        return ""
+    import re as _re
+    for pat in (r"(?:最后输出|最终输出|最终润色|最终答案|结论)[：:]?\s*([^\n]{2,})",
+                r"(?:输出|答案)[：:]?\s*([^\n]{4,})$"):
+        m = _re.search(pat, reasoning)
+        if m:
+            return m.group(1).strip()
+    tail = [l.strip() for l in reasoning.splitlines() if l.strip()]
+    return tail[-1] if tail else ""
+
+
 class VisionService:
     """Vision description with per-image hash cache (TTL) and timeout.
 
@@ -344,8 +374,7 @@ class VisionService:
                 "reasoning_effort": self._reasoning_effort,
             }
             out = await asyncio.wait_for(self._post(payload), timeout=self._timeout)
-            desc = ((out.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-            desc = str(desc).strip()[: self._desc_max_chars]
+            desc = extract_completion_text(out)[: self._desc_max_chars]
             if not desc:
                 # 模型返回空（多为思考吃光 max_tokens）
                 self.last_error = "empty completion (model returned no content)"
