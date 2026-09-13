@@ -25,6 +25,26 @@
 - **日记 `day` 偏移一天**：归档 09-12 的会话，`day` 却取轮换后的 `day_key()`（09-13）。改为按同一口径回推 24h
 - **provider id 写错会静默哑掉（新增加固）**：`_resolve_provider_id()` 现在**先校验配置值存在性** —— 写成不存在的 id 时 `llm_generate` 抛 `ProviderNotFoundError`、被 except 吞成空回复（又一条"看起来正常其实全哑"）。校验失败 → 告警 + 回退到会话 provider；拿不到 `provider_manager` 时返回"未知"照用配置值（不让校验本身成为故障源）。三级回退逻辑抽为纯函数 `llm_params.resolve_provider_id()`，可离线单测（+8 例）
 
+### Added (2026-09-13, S3② 贴纸库：离线入库工具 + 选择器)
+- **`services/sticker.py`（`StickerService`）**：把 `[emote:意图短语]` 匹配成一张贴纸。
+  - **复用已有 BGE**（`embed_via_rag(rag)` 从 `RagService._ensure_backend()` 取），
+    **不加载第二份模型** —— 台式机 7.7 GB，AstrBot 常驻 ~2 GB（含 BGE）
+  - 索引**预计算 embedding** → 线上每次只嵌入一句短语；余弦用 numpy/纯 python，
+    **不引入第二个 Chroma 集合**
+  - **默认纯 BGE 选择**（top1 且与 top2 分差 ≥ margin 直接用，省一次 LLM）；
+    只有候选接近时才走可选 LLM 精选；仍接近则**保守跳过**（宁可不发，也不发错）
+  - 失败原因细分并可观测（S0 的教训）：`empty_intent` / `index_missing` /
+    `empty_library` / `no_embed` / `below_threshold` / `ambiguous` /
+    `picker_no_choice`，全部附 `top_k` 分数供事后调阈
+  - 索引 mtime 热重载（人工文件，改完不该重启）
+- **`tools/build_sticker_index.py`**：离线入库
+  - **扫描阶段按 sha256 去重**（同图改名不重复入库）
+  - **增量且保留人工修正**（红线 #3：工具只建议不覆盖）；`--force` 才重算
+  - 视觉描述**并发 2**（4 核机器别打满）；`--review` 打印审核表（描述错了会
+    "该发害羞却发了嘲讽"，入库前必须有人看一眼）
+  - 无 desc 的条目会醒目标注"基本选不中"
+- 测试 314 → **337 全绿**（`test_sticker.py` 23 例）
+
 ### Added (2026-09-13, S3① 动作链路协议：意图标记解析)
 > 设计文档：`docs/specs/s3-action-channel.md`（2026-09-13 立项，用户定调"先落地代码与协议"）
 
