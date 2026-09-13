@@ -75,8 +75,11 @@ class _FakeGate:
         self._conflict = conflict
         self.calls = []
 
-    async def decide(self, group_id, recent_msgs, speaker, text, rag_hits=None, is_at=False):
+    async def decide(self, group_id, recent_msgs, speaker, text, rag_hits=None,
+                     is_at=False, contexts=None):
+        # S4: pipeline 现在传 contexts（共享上下文）—— 替身要接受并留证
         self.calls.append((group_id, text, is_at))
+        self.last_contexts = contexts
         from services.gate import GateDecision
         return GateDecision(reply=self._reply, conflict=self._conflict,
                             reason=self._reason, ts=__import__("time").time())
@@ -773,3 +776,136 @@ class TestToolIntentsS3(unittest.TestCase):
         si = _run(p.run(PipelineInput("g1", "喂", False, "1", "甲")))
         self.assertEqual(si.emote, "猫猫")
         self.assertEqual(si.text, "好")
+
+
+class TestSharedContextS4(unittest.TestCase):
+    """S4：Gate 与 RP 共享**逐字节相同**的上下文前缀。
+
+    动机（用户 2026-09-13）：Gate 要看到全量群友关系图谱与 RP 的人格设定，
+    判断上文要尽量长，否则"Gate 本身会降低回复质量"。实测发现
+    `system_prompt` 里**已含全部 163 人的别名关系块**（157/163 命中），
+    所以 Gate 只要拿到 RP 的 system prompt + 同一份上下文即可。
+
+    两个收益：
+      ① 质量：Gate 判断依据与 RP 同级（此前只有 740 字符小 prompt + 15 条窗口）
+      ② 成本：网关前缀缓存被 RP/Gate 两次调用复用（否则每次全价重发 ~2.8 万 token）
+    """
+
+    def _setup(self, **over):
+        from services.session_manager import SessionManager
+        sm = SessionManager(data_dir=None, max_messages=None)
+        sm.append("g1", "user", "历史甲", name="甲", message_id="m1", sender_uin="u1")
+        sm.append("g1", "assistant", "机器人的旧回复")
+        sm.append("g1", "user", "历史乙", name="乙", message_id="m2", sender_uin="u2")
+
+        def sa(gid, t, n, mid, uin):
+            sm.append(gid, "user", t, name=n or None, message_id=mid or "", sender_uin=uin or "")
+
+        gate = _FakeGate()
+        captured = {}
+
+        def gen(t, c, e, temp, su, umo):
+            captured["ctx"] = [dict(m) for m in c]
+            return _async("好")
+
+        p = _pipeline(session=sm, session_append=sa, gate=gate, generate=gen,
+                      examples_block=lambda: "【示例块】",
+                      turn_block=lambda lines, ctx: "【现在要回应的】\n" + "\n".join(lines),
+                      **over)
+        return p, gate, captured
+
+    def test_gate_receives_shared_context(self):
+        p, gate, _ = self._setup()
+        _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
+        self.assertIsNotNone(gate.last_contexts, "Gate 必须收到 contexts")
+        self.assertTrue(gate.last_contexts)
+        joined = [str(m.get("content")) for m in gate.last_contexts]
+        # 共享前缀应含示例块与 session 历史
+        self.assertIn("【示例块】", joined)
+        self.assertIn("历史甲", joined)
+        self.assertIn("机器人的旧回复", joined)
+
+    def test_gate_prefix_is_byte_identical_to_rp_prefix(self):
+        """核心不变式：Gate 的 contexts 必须是 RP contexts 的**前缀**。"""
+        p, gate, captured = self._setup()
+        _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
+        g = [str(m.get("content")) for m in gate.last_contexts]
+        rp = [str(m.get("content")) for m in captured["ctx"]]
+        self.assertEqual(g, rp[:len(g)],
+                         "Gate contexts 必须是 RP contexts 的逐字节前缀（缓存复用的前提）")
+
+    def test_current_message_not_in_gate_context(self):
+        """Gate 判"这一条该不该接"，所以它看到的本条之前的世界。"""
+        p, gate, _ = self._setup()
+        _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
+        joined = "\n".join(str(m.get("content")) for m in gate.last_contexts)
+        self.assertNotIn("当前这条", joined)
+        # 也不应含「现在要回应的」块（那是 RP 的本轮块）
+        self.assertNotIn("【现在要回应的】", joined)
+
+    def test_shared_context_helper_matches_assemble_base(self):
+        p, gate, _ = self._setup()
+        _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
+        direct = p.shared_context("g1")
+        self.assertEqual([str(m.get("content")) for m in direct],
+                         [str(m.get("content")) for m in gate.last_contexts])
+
+    def test_shared_system_prompt_is_rp_persona(self):
+        """Gate 的 system prompt 必须是 RP 的人格提示词（含别名关系块）。"""
+        from services.gate import GateService
+        captured = {}
+
+        async def llm(prompt=None, *, messages=None, system_prompt=None):
+            captured["system_prompt"] = system_prompt
+            captured["messages"] = messages
+            return '{"reply": true, "conflict": false, "reason": "ok"}'
+
+        gs = GateService(llm, timeout=5, shared_system_prompt="【人格提示词】正文")
+        d = asyncio.run(gs.decide("g", [], "甲", "你好",
+                                  contexts=[{"role": "user", "content": "历史"}]))
+        self.assertTrue(d.reply)
+        self.assertEqual(captured["system_prompt"], "【人格提示词】正文")
+        msgs = captured["messages"]
+        self.assertEqual(msgs[0], {"role": "user", "content": "历史"})   # 前缀原样
+        self.assertIn("【现在要判断的这一条】", msgs[-1]["content"])
+        self.assertIn("不要引入任何其他维度", msgs[-1]["content"])
+
+    def test_shared_system_prompt_falls_back_when_empty(self):
+        from services.gate import GATE_SYSTEM_PROMPT, GateService
+        captured = {}
+
+        async def llm(prompt=None, *, messages=None, system_prompt=None):
+            captured["sp"] = system_prompt
+            return '{"reply": false, "conflict": false, "reason": "x"}'
+
+        gs = GateService(llm, timeout=5)          # 不传 shared_system_prompt
+        asyncio.run(gs.decide("g", [], "甲", "hi",
+                              contexts=[{"role": "user", "content": "h"}]))
+        self.assertEqual(captured["sp"], GATE_SYSTEM_PROMPT)
+
+    def test_legacy_single_prompt_mode_still_works(self):
+        """不传 contexts → 退回旧的单条 prompt 形态（离线测试台兼容）。"""
+        from services.gate import GateService
+        captured = {}
+
+        async def llm(prompt=None, *, messages=None, system_prompt=None):
+            captured["prompt"] = prompt
+            captured["messages"] = messages
+            return '{"reply": true, "conflict": false, "reason": "ok"}'
+
+        gs = GateService(llm, timeout=5)
+        d = asyncio.run(gs.decide("g", [{"role": "user", "name": "甲", "content": "x"}],
+                                  "甲", "你好"))
+        self.assertTrue(d.reply)
+        self.assertIsNotNone(captured["prompt"])
+        self.assertIsNone(captured["messages"])
+
+    def test_gate_log_has_timestamp(self):
+        """S4 观测补漏：gate_log 此前没有时间戳，无法统计到达率/命中率。"""
+        from services.gate import GateDecision
+        d = GateDecision(reply=True, conflict=False, reason="ok", ts=1700000000.5)
+        log = d.to_log("g", "u")
+        self.assertIn("ts", log)
+        self.assertIn("ts_epoch", log)
+        self.assertEqual(log["ts_epoch"], 1700000000.5)
+        self.assertTrue(str(log["ts"]).endswith("Z"))

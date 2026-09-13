@@ -58,6 +58,39 @@ GATE_SYSTEM_PROMPT = (
 )
 
 
+# S4：共享上下文模式下的**判定指令**（拼在末尾那条 user 消息里）。
+#
+# ⚠️ 这里的"判断维度约束"不是可选项 —— 2026-09-13 实测抓到 Gate **自行引入
+# 未声明的拒答维度**：它把「你怎么知道我昨晚只靠郊狼的环就把自己电🐍了」
+# 判为「内容涉性暗示，不宜回应」。该结论本身无害（那条确实没 @ 机器人），
+# 但同类判断作用于**该回的消息**时会变成静默误杀 —— 而这是本轮唯一
+# "会悄悄降低回复质量"的路径。故在此显式收紧：只判两件事，不得引入内容审查。
+GATE_JUDGE_INSTRUCTION = (
+    "请只判断两件事，**不要引入任何其他维度**：\n"
+    "A) 机器人**现在接这句话合不合适**（值不值得接）；\n"
+    "B) 当前对话**是否正在发生真实冲突**。\n"
+    "\n"
+    "关于 A（值不值得接）：\n"
+    "- 看：是否在向机器人提问/点名/寻求回应；话题是否新鲜、有可接的空间；\n"
+    "  是否有情绪需求（求安慰/分享欲）；机器人（模仿某群友）能不能自然接上。\n"
+    "- **克制优先**：拿不准就选不回。\n"
+    "\n"
+    "关于 B（是否冲突）：冲突 = 真实的恶意对抗（人身攻击、辱骂、威胁、群体对立、\n"
+    "阴阳怪气持续升级、公开挂人）。\n"
+    "**不算冲突**：玩笑互怼/嘴炮约战（双方在乐、无真实恶意）、观点争论、技术辩论、\n"
+    "吐槽抱怨（哪怕语气冲）、单方面情绪发泄但不指向具体人。\n"
+    "判据是**有没有真实的恶意与伤害意图**，不看语气强不强、用词糙不糙。\n"
+    "冲突时 reply 强制 false（避免煽风点火）。拿不准时按冲突处理，但玩笑互怼要判非冲突。\n"
+    "\n"
+    "⚠️ **不评判话题本身的内容与尺度**：群友聊什么、用词荤素、玩什么梗，都不是\n"
+    "「该不该接」的理由。判断依据只有上面 A/B 两条 —— 由人格设定决定这个「人」\n"
+    "会接什么话，不由你做内容审查。\n"
+    "\n"
+    "只输出一个 JSON 对象，不要输出其他内容：\n"
+    '{"reply": true或false, "conflict": true或false, "reason": "一句话理由（不超过20字）"}'
+)
+
+
 @dataclass
 class GateDecision:
     reply: bool            # True=放行 RP 生成；False=静默
@@ -76,19 +109,26 @@ class GateDecision:
             "cached": self.cached,
             "group_id": str(group_id or ""),
             "sender_uin": str(sender_uin or ""),
+            # S4 观测补漏：此前 gate_log **没有时间戳**（ts 只在 trace 里），
+            # 导致无法统计"决策到达率/缓存命中率随时间的变化"——实测排查时
+            # 只能靠外部监视器估算窗口。这里补上 UTC ISO + epoch。
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.ts or time.time())),
+            "ts_epoch": round(float(self.ts or time.time()), 3),
         }
 
 
 class GateService:
     def __init__(
         self,
-        llm_fn: Callable[[str], Awaitable[str]],
+        # S4: llm_fn(prompt) 或 llm_fn(None, messages=[...]) —— 两种调用形态
+        llm_fn: Callable[..., Awaitable[str]],
         *,
         timeout: float = 3.0,
         decide_cooldown_sec: float = 8.0,
         recent_n: int = 15,
         max_rag_hits: int = 3,
         system_prompt: str = GATE_SYSTEM_PROMPT,
+        shared_system_prompt: str = "",
         now_utc_fn: Optional[Callable[[], float]] = None,
     ) -> None:
         self._llm_fn = llm_fn
@@ -97,6 +137,9 @@ class GateService:
         self._recent_n = int(recent_n)
         self._max_rag_hits = int(max_rag_hits)
         self._system_prompt = system_prompt
+        # S4：共享上下文模式的 system prompt（= RP 的人格提示词，含 163 人别名块）。
+        # 为空则退回旧单条模式的 GATE_SYSTEM_PROMPT —— 不因缺配置而失效。
+        self._shared_system_prompt = shared_system_prompt or system_prompt
         self._lock = threading.Lock()
         # per-group decision cache for cooldown-window reuse
         self._cache: dict[str, tuple[float, GateDecision]] = {}
@@ -148,6 +191,43 @@ class GateService:
                 prompt += "\n\n风格参考片段（机器人风格源的相似历史发言）：\n" + "\n".join(hit_lines)
         prompt += "\n\n请判断机器人是否应该接这句话，只输出 JSON。"
         return prompt
+
+    def _build_shared_messages(
+        self,
+        contexts: list[dict],
+        current_speaker: str,
+        current_text: str,
+        rag_hits: Optional[list[dict]] = None,
+        is_at: bool = False,
+    ) -> list[dict]:
+        """共享上下文模式：前缀原样 + 末尾一条判定指令（S4）。
+
+        前缀 = RP 的 `_assemble_base()` 输出（**不加工、不改写**）——
+        逐字节相同才能让网关前缀缓存被两次调用复用。
+
+        末尾那条 user 消息承担三件事：
+          1. 给出本轮候选（说话人 + 本条消息）
+          2. @ 提示（@ 了通常应回，但冲突除外）
+          3. **判定维度的显式约束**（见 GATE_JUDGE_INSTRUCTION）
+        """
+        msgs = [dict(m) for m in contexts if isinstance(m, dict)]
+        tail: list[str] = []
+        tail.append(f"【现在要判断的这一条】{current_speaker}：{current_text}")
+        if is_at:
+            tail.append("（本条 @ 了机器人：通常应当回复；但若正发生冲突，reply 必须为 false）")
+        if rag_hits:
+            hits = []
+            for h in rag_hits[: self._max_rag_hits]:
+                txt = (h.get("document") or h.get("text") or h.get("content") or "").strip()
+                if txt:
+                    sc = h.get("score", "")
+                    hits.append(f"- [{sc:.2f}] {txt[:120]}" if isinstance(sc, float)
+                                else f"- {txt[:120]}")
+            if hits:
+                tail.append("风格参考片段（机器人风格源的相似历史发言）：\n" + "\n".join(hits))
+        tail.append(GATE_JUDGE_INSTRUCTION)
+        msgs.append({"role": "user", "content": "\n\n".join(tail)})
+        return msgs
 
     # ---- parsing ----
 
@@ -212,6 +292,7 @@ class GateService:
         current_text: str,
         rag_hits: Optional[list[dict]] = None,
         is_at: bool = False,
+        contexts: Optional[list[dict]] = None,
     ) -> GateDecision:
         """Return a decision; never raises (conservative silent on failure).
 
@@ -219,6 +300,13 @@ class GateService:
         consecutive messages don't each trigger an LLM call.
         A7④: 缓存键含 is_at——@ 与非 @ 语境不同，不共享窗口结果（@ 时若命中
         非 @ 的 no-reply 缓存会误拦 @ 回复）。
+
+        S4（2026-09-13）：``contexts`` 提供时走**共享上下文**模式 ——
+        Gate 与 RP 看到逐字节相同的前缀（人格 + 示例 + session + KG），
+        只在末尾追加本轮候选与判定指令。两个好处：
+          ① 判断依据与 RP 同级（此前只有 740 字符小 prompt + 15 条窗口）
+          ② 网关前缀缓存被 RP/Gate 两次调用复用（否则每次全价重发 2.8 万 token）
+        ``contexts`` 为 None 时退回旧的 `_build_prompt` 单条模式（离线测试台兼容）。
         """
         import asyncio
 
@@ -235,8 +323,17 @@ class GateService:
                 return d
         self.last_error = None
         try:
-            prompt = self._build_prompt(recent_msgs, current_speaker, current_text, rag_hits, is_at=is_at)
-            raw = await asyncio.wait_for(self._llm_fn(prompt), timeout=self._timeout)
+            if contexts is not None:
+                messages = self._build_shared_messages(
+                    contexts, current_speaker, current_text, rag_hits, is_at=is_at)
+                raw = await asyncio.wait_for(
+                    self._llm_fn(None, messages=messages,
+                                 system_prompt=self._shared_system_prompt),
+                    timeout=self._timeout)
+            else:
+                prompt = self._build_prompt(recent_msgs, current_speaker, current_text,
+                                            rag_hits, is_at=is_at)
+                raw = await asyncio.wait_for(self._llm_fn(prompt), timeout=self._timeout)
             d = self._parse((raw or "").strip())
             if d is None:
                 d = GateDecision(reply=False, reason="gate parse failed", fallback=True)
