@@ -270,3 +270,75 @@ class TestBuildStickerIndex(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKeywordExtraction(unittest.TestCase):
+    """S3②：嵌入要用**关键词段**而非整段描述（短↔短匹配）。
+
+    实测：描述中位 90 字符（最长 257），而 `[emote:意图短语]` 只有 15–25 字符。
+    长描述里混着画面细节/台词/梗，会把嵌入"稀释" → 短查询与长文档余弦相似度
+    系统性偏低 → 阈值下几乎选不中。90% 的描述自带 `关键词：A、B、C`。
+    """
+
+    def test_extracts_after_label_and_colon(self):
+        self.assertEqual(B.extract_keywords("画面说明 关键词：开心、惊讶、张嘴。"),
+                         ["开心", "惊讶", "张嘴"])
+
+    def test_various_labels(self):
+        self.assertEqual(B.extract_keywords("检索关键词：紧张、流汗。"), ["紧张", "流汗"])
+        self.assertEqual(B.extract_keywords("情绪关键词：慌张、害羞"), ["慌张", "害羞"])
+
+    def test_requires_label_with_separator(self):
+        """实测踩到：句子里含"关键词"三字但**不是标签** → 不得抽出。
+
+        宽松正则会切出 ['段的描述', '只有画面说明'] 这种垃圾并静默写进索引。
+        """
+        self.assertEqual(B.extract_keywords("没有关键词段的描述，只有画面说明。"), [])
+        self.assertEqual(B.extract_keywords("画面描述没有标签词"), [])
+
+    def test_empty_after_label(self):
+        self.assertEqual(B.extract_keywords("关键词："), [])
+
+    def test_filters_overlong_fragments(self):
+        """关键词应短；整句多半是正则误命中。"""
+        got = B.extract_keywords("关键词：这是一整句很长的描述不应该被当成关键词、" + "短词")
+        self.assertEqual(got, ["短词"])
+
+    def test_embed_uses_tags_then_keywords_then_desc(self):
+        """嵌入文本优先级：tags > 关键词段 > 整段描述。"""
+        import asyncio
+        seen = {}
+
+        def fake_embed(texts):
+            seen["texts"] = list(texts)
+            return [[1.0, 0.0] for _ in texts]
+
+        with tempfile.TemporaryDirectory() as td:
+            idx = os.path.join(td, "i.json")
+            items = [
+                # ① 有 tags → 用 tags
+                {"id": "a", "file": "a.jpg", "desc": "画面 关键词：猫、狗", "tags": ["人工标签"],
+                 "embedding": None},
+                # ② 无 tags 有关键词段 → 用关键词段，且写回 tags
+                {"id": "b", "file": "b.jpg", "desc": "画面 关键词：害羞、脸红", "tags": [],
+                 "embedding": None},
+                # ③ 都没有 → 兜底整段描述
+                {"id": "c", "file": "c.jpg", "desc": "只有一段画面描述", "tags": [],
+                 "embedding": None},
+            ]
+            write_index(idx, items)
+            svc = StickerService(idx, fake_embed, library_dir=td)
+
+            class _Backend:
+                def get_sentence_embedding_dimension(self):
+                    return 2
+                def encode(self, texts, normalize_embeddings=True):
+                    seen["texts"] = list(texts)   # 记录实际用于嵌入的文本
+                    return [[1.0, 0.0] for _ in texts]
+
+            B.embed_all(svc._items, model_name="nope", backend=_Backend())
+            texts = seen["texts"]
+            self.assertEqual(texts[0], "人工标签")
+            self.assertEqual(texts[1], "害羞 脸红")
+            self.assertEqual(texts[2], "只有一段画面描述")
+            self.assertEqual(svc._items[1]["tags"], ["害羞", "脸红"])
