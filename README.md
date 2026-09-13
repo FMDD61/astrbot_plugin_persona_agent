@@ -10,11 +10,26 @@ AstrBot 插件 — 在 QQ 群内模仿指定用户（配置项 `style_source_qq`
 群消息 → 前置（识图/睡眠/冲突检测）→ PersonaPipeline.run()（A7 共享主链路）
    ├─ RAG 检索（风格源历史）→ Emotion（三维）→ interjection 硬闸（规则）
    ├─ GateLLM 决策层+安全阀（可选，gate.enabled=1；所有 REPLY/含@/TOPIC 都过；
-  │      单 prompt 双任务 {reply, conflict, reason}；conflict=true 强制不发言；0.2 温度+off 思考）
-   ├─ KG 风格指引 + session 全量上下文（prefix caching）+ 固定示例
+  │      单 prompt 双任务 {reply, conflict, reason}；conflict=true 强制不发言；0.2 温度+low 思考）
+   ├─ 冻结引用编号基（QuoteIndex 快照，B-001）→ KG 风格指引 + session 全量上下文
+   │      （prefix caching）+ 固定示例 + 尾部易变行（时间/心情 volatile_line）
    ├─ LLM 生成 → postprocess → SendIntent（含 [r:-N] 引用/表情意图）
    └─ 全链路 trace → logs/<group_id>/trace_log.jsonl（trace_view 可读）
 ```
+
+### 前缀缓存布局（2026-09-13 重排，B-013）
+
+```
+[system]  固定人设（identity/rules/别名块）      ← 恒定，缓存前缀起点
+[user]    …session 全量历史…                     ← 只追加
+[system]  固定示例块（G14）
+[system]  【当前说话人】…                        ← 每发言人常量
+[system]  【当下】时间 + 心情（volatile_line）   ← 逐轮变，**只破坏尾部**
+[system]  KG 尾注                                ← 每轮变
+```
+
+> 易变量**不得**进 system prompt：它是请求的第一个 token 位置，一变则其后
+> 整段会话前缀全部失效（旧实现每小时废一次全量缓存，心情有值时 30s 一次）。
 
 ### 三层记忆
 
@@ -78,7 +93,13 @@ WebUI: `http://<IP>:6185` → Astr 插件 → astrbot_plugin_persona_agent
 | `target_group_id` | 123456789 | 生产群号 |
 | `data_dir` | `<AstrBot 数据目录>/...` | 运行时数据目录 (仅文档用途；git pull 不覆盖) |
 
-> 完整配置见 `_conf_schema.json`：`sleep.*`（睡眠窗 02–07）、`diary.*`、`examples.*`、`vision.*`、`emotion.*`、`housekeeping.*`、`privileged_qq`、`llm.temperature`（温度分档）、`summary.*`（周/月摘要，G13）、`poke.*`、`topic_bank.*`、`dream.*`、`gate.*`（A7 GateLLM 决策层+conflict 安全阀，enabled=0 默认关 / temperature=0.2 / reasoning_effort=off）、`trace.*`（A7 全链路 trace，enabled=1 默认开）、`rag.enabled`（RAG 总开关，A7③）、`vision.cache_persist*`（识图持久缓存，A7③）、`llm.reasoning_effort`（RP 思考 off=不发送该参数；网关只认 low/medium/high/max）、`llm.max_tokens`（默认 512，需容纳 ~200 思考 token）、`emotion.temperature/reasoning_effort`（0.2/off）。
+> 完整配置见 `_conf_schema.json`：`sleep.*`（睡眠窗 02–07）、`diary.*`、`examples.*`、`vision.*`（识图，`model` **必须带命名空间前缀**）、`emotion.*`（`timeout_sec` 须 ≥ 模型单次耗时 4–8s）、`housekeeping.*`、`privileged_qq`、`llm.temperature`（温度分档）、`summary.*`（周/月摘要，G13）、`poke.*`、`topic_bank.*`、`dream.*`、`gate.*`（A7 GateLLM 决策层+conflict 安全阀，enabled=0 默认关 / temperature=0.2 / reasoning_effort=low）、`trace.*`（A7 全链路 trace，enabled=1 默认开）、`rag.enabled`（RAG 总开关，A7③）、`vision.cache_persist*`（识图持久缓存，A7③）、`llm.reasoning_effort`（**off = 不发送该参数 = 模型仍按默认档思考**；网关只认 low/medium/high/xhigh/max）、`llm.max_tokens`（默认 512，需容纳 200–800 思考 token）、`emotion.temperature/reasoning_effort`（0.2/low）。
+
+> ⚠️ **2026-09-13 实测澄清**：网关**不认 `off`** —— 传 off 只是"不发这个参数"，
+> 模型仍会思考（实测 651–738 思考 token / 4–8s），**关不掉**。因此所有
+> 结构化任务的超时必须按"模型真的会思考"来设（否则静默降级，见 B-006/B-007）；
+> `vision.reasoning_effort` 更严格：vision 系列**没有默认档**，传 off 直接 HTTP 400。
+
 
 ## 当前状态
 
@@ -106,9 +127,9 @@ astrbot_plugin_persona_agent/
 ├── _conf_schema.json        # 配置 schema (含 data_dir/test_mode)
 ├── requirements.txt
 ├── services/
-│   ├── session_manager.py   # 每群持久 session (name 字段区分参与者)
+│   ├── session_manager.py   # 每群持久 session (name 区分参与者; _mid/_uin 引用元数据; 空 content 自愈 B-002)
 │   ├── kg_provider.py        # MultiSignalKGProvider (dense+BGE + BM25/FTS5 + entity)
-│   ├── emotion.py            # LLMEmotionProvider v1 (3 维: 意愿/情绪/表情, 30s 缓存, 3s 超时)
+│   ├── emotion.py            # LLMEmotionProvider v1 (3 维: 意愿/情绪/表情; 30s 缓存; 超时须 ≥ 模型耗时 4-8s; 降级留痕)
 │   ├── interjection.py       # 规则硬闸 (AT/RAG/COLD 三级; 用量按群隔离 + usages/<gid>.json)
 │   ├── llm_params.py         # A7④ reasoning_effort 映射 (off→None=不发送该参数; 网关拒 none/off 会 400)
 │   ├── gate.py               # A7 GateLLM 决策层+安全阀 ({reply, conflict, reason}; @/TOPIC 全覆盖; 0.2+off; is_at 缓存键)
@@ -118,7 +139,7 @@ astrbot_plugin_persona_agent/
 │   ├── memory_store.py       # SQLite ADD-only 实体关系图 + FTS5 BM25
 │   ├── conflict_detector.py  # 旧冲突检测 (仅 gate.enabled=0 兜底)
 │   ├── dream_job.py          # 周 cron 记忆巩固 + 漂移报告
-│   ├── context_buffer.py     # 滑动窗口 buffer (仅用于 interjection 决策)
+│   ├── context_buffer.py     # 滑动窗口 buffer + QuoteIndex 引用快照 (B-001 冻结编号基)
 │   ├── examples.py           # G14 静态示例注入 (mtime_ns 热重载 + 规则A/B)
 │   ├── vision.py             # G15 识图 (flash-vision-exp, 三源解析, 诚实占位)
 │   ├── poke.py               # G11 戳一戳 (同人冷却/小时配额/未知成员不回戳/严肃抑制/poke_log)
