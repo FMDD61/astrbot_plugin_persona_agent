@@ -33,7 +33,7 @@ from .services.text_style import (
     RE_REPLY_MARKER,
 )
 from .services import text_style
-from .services.llm_params import reasoning_value
+from .services.llm_params import reasoning_value, resolve_provider_id
 from .services.style_profile import StyleProfile
 from .services.rag_service import RagService
 from .services.interjection import (
@@ -1354,6 +1354,25 @@ class PersonaAgent(Star):
         except Exception as e:
             logger.warning(f"[persona_agent] provider warmup failed: {e}")
 
+    async def _provider_exists(self, provider_id: str) -> Optional[bool]:
+        """校验 provider_id 在 AstrBot 里真实存在。
+
+        返回 True/False；**无法判定时返回 None**（当作"未知，放行"）——
+        provider_manager 缺失或接口变动都不该让插件停止工作。
+        这道校验的意义：配置里写错一个 provider id 时，``llm_generate`` 会抛
+        ``ProviderNotFoundError``，被 except 吞成空回复 → **又一个静默哑掉**。
+        S0 的教训就是"失败必须可见"，所以这里宁可多一次查询。
+        """
+        pm = getattr(self.context, "provider_manager", None)
+        if pm is None or not hasattr(pm, "get_provider_by_id"):
+            return None
+        try:
+            prov = await pm.get_provider_by_id(provider_id)
+        except Exception as e:
+            logger.debug(f"[persona_agent] provider check failed for {provider_id}: {e}")
+            return None
+        return prov is not None
+
     async def _resolve_provider_id(self, umo: Optional[str] = None) -> Optional[str]:
         """单一 provider 解析收口（S0）。
 
@@ -1364,21 +1383,37 @@ class PersonaAgent(Star):
 
         成功解析后缓存到 ``_last_provider_id``，使 cron/异步任务不再依赖
         「先有人触发过一轮回复」。
+
+        S0 加固：配置值**先校验存在性**。写错 id 时回退到 AstrBot 当前会话
+        provider 并告警 —— 否则 ``llm_generate`` 抛 ``ProviderNotFoundError``
+        被吞成空回复，又是一个"看起来正常其实全哑"的坑。
         """
         cfg_pid = (self.config.get("llm") or {}).get("provider_id", "") or ""
+        exists: Optional[bool] = None
         if cfg_pid:
-            self._last_provider_id = cfg_pid
-            return cfg_pid
-        if self._last_provider_id:
-            return self._last_provider_id
-        try:
-            pid = await self.context.get_current_chat_provider_id(umo or "")
-        except Exception as e:
-            logger.debug(f"[persona_agent] provider resolve failed: {e}")
-            pid = None
+            exists = await self._provider_exists(cfg_pid)
+            if exists is False:
+                logger.warning(
+                    f"[persona_agent] configured llm.provider_id={cfg_pid!r} "
+                    "NOT found in AstrBot; falling back to session provider"
+                )
+        session_default = None
+        if not cfg_pid or exists is False:
+            if not self._last_provider_id:
+                try:
+                    session_default = await self.context.get_current_chat_provider_id(umo or "")
+                except Exception as e:
+                    logger.debug(f"[persona_agent] provider resolve failed: {e}")
+                    session_default = None
+        pid = resolve_provider_id(
+            configured=cfg_pid,
+            known=self._last_provider_id,
+            session_default=session_default,
+            configured_exists=exists,
+        )
         if pid:
             self._last_provider_id = pid
-        return pid or None
+        return pid
 
     async def _emotion_llm(self, prompt: str) -> str:
         """G10: emotion analysis call (3s timeout enforced by the provider).

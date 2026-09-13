@@ -23,6 +23,7 @@
 - **cache probe 从未覆盖线上主回复链路**：`_log_llm_probe` 要求 `event.get_group_id()`，而 pipeline 走 `event=None` 的 standalone 回调 → 探针只有 topic 路径写入（105 行全停在 2026-08-27），**缓存命中率长期无数据**。修复：接受显式 `group_id`（由 `umo` 解出群号）
 - **`llm.max_tokens` 是死配置**：schema 有、离线测试台用，**线上生成路径从未读取**。已接上透传
 - **日记 `day` 偏移一天**：归档 09-12 的会话，`day` 却取轮换后的 `day_key()`（09-13）。改为按同一口径回推 24h
+- **provider id 写错会静默哑掉（新增加固）**：`_resolve_provider_id()` 现在**先校验配置值存在性** —— 写成不存在的 id 时 `llm_generate` 抛 `ProviderNotFoundError`、被 except 吞成空回复（又一条"看起来正常其实全哑"）。校验失败 → 告警 + 回退到会话 provider；拿不到 `provider_manager` 时返回"未知"照用配置值（不让校验本身成为故障源）。三级回退逻辑抽为纯函数 `llm_params.resolve_provider_id()`，可离线单测（+8 例）
 
 ### Fixed (2026-09-13, R2 重构 S1：B-001 引用错位 + B-002 空条目静默)
 - **🔴 B-001 `[r:-N]` 引用目标错位（线上事故 11:45，群 100000001）**：LLM 按**它当时看到的上下文**编号，旧实现 `ContextBuffer.quote_target()` 却在生成结束后对**实时** buffer 求值 —— 生成窗口（5–8s）内每进 1 条消息编号整体偏移 1 位（该群 100–400 条/时 → 错位概率约 1/3–1/2）。修复：新增 `QuoteIndex`（**不可变引用快照**）+ `SessionManager.quote_snapshot()`，在**建上下文之后、发起生成之前**冻结编号基，生成结束后对它求值；`message_id`/`sender_uin` 随条目入 session（内部键 `_mid`/`_uin`，所有对外出口剥离，**绝不进 LLM 请求**）。附带消除次要错位：编号基与 `get_contexts()` **同源同过滤**（旧实现 session 含 assistant 条目而 buffer 不含，且 buffer 含被媒体过滤掉的纯图消息）。新增审计字段 `trace.quote_n/quote_id/quote_resolved/quote_basis/quote_target_alias/quote_target_uin/quote_target_missing` —— 此前 trace **没有** quote 字段，11:45 那次只能靠人工比对 SnowLuma 日志
@@ -34,7 +35,7 @@
 - **`reasoning_effort` 语义澄清**：网关**不认 `off`** —— 填 off 只是"不发送该参数"，模型仍按**默认档**思考（实测 651–738 思考 token / 4–8s），**并不能真的关掉思考**。全栈默认改 `low`（思考降至 136–227 token）；`vision.reasoning_effort` 另有硬约束：vision 系列**没有默认档**，传 off 直接 HTTP 400（只接受 low/medium/high/xhigh/max）
 - **工具意图标记预防性收口**：`text_style.postprocess` 增加 `[emote:…]`/`[poke:…]` 剥离规则。当前提示词尚未教这两个协议，但**没有剥离规则就教协议 = 标记原样进群**，故先兜住
 - `_conf_schema.json` 同步：`vision.model`、`emotion.{timeout_sec,reasoning_effort}`、`gate.{timeout_sec,reasoning_effort}`、`llm.reasoning_effort` 默认值与 hint 全部改为实测口径（含 400 错误原因）
-- 测试 225 → **249 全绿**（新增：QuoteIndex 冻结不变量 5 例、session 元数据/自愈 9 例、pipeline 引用快照隔离 4 例、emotion 降级可分辨 3 例、style 缓存恒定 3 例）
+- 测试 225 → **257 全绿**（新增：QuoteIndex 冻结不变量 5 例、session 元数据/自愈 9 例、pipeline 引用快照隔离 4 例、emotion 降级可分辨 3 例、style 缓存恒定 3 例）
 
 ### Fixed (2026-09-10, 协议端迁移准备：poke 死代码 + LLBot 出站通道)
 - **🔴 poke 处理器是死代码（G11 开启也不会生效）**：`on_other` 挂了 `EventMessageType.OTHER_MESSAGE` 过滤器，但 AstrBot **v4.27.4** 的 `_convert_handle_notice_event()` 会把**带 group_id 的通知**归为 `GROUP_MESSAGE`（`OTHER_MESSAGE` 在该路径上不可达）→ 群戳从未进入该处理器，且无任何报错。更隐蔽的是：群戳实际落到 `on_group_message`，`message_str` 为空 → 被媒体过滤器 `event.stop_event()` 吞掉；而 `StarRequestSubStage` 的派发循环是 `for handler in activated_handlers: if event.is_stopped(): break`、handler 顺序 = 装饰器注册顺序（`on_group_message` 在前）→ **单改过滤器也救不回来**。修复：① `on_group_message` 对 `post_type != "message"` 的通知**让路**（不 stop_event）；② 处理函数改名 `on_notice`，过滤器改 `EventMessageType.ALL`，判定下沉到插件侧。依据：AstrBot v4.27.4 源码实测（`_convert_handle_notice_event` / `get_message_type` / `EventMessageTypeFilter` / `StarRequestSubStage` / `PipelineScheduler._process_stages`）

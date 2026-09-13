@@ -10,7 +10,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from services.llm_params import reasoning_value
+from services.llm_params import reasoning_value, resolve_provider_id
 
 
 class TestReasoningValue(unittest.TestCase):
@@ -37,6 +37,45 @@ class TestReasoningValue(unittest.TestCase):
         self.assertIsNone(reasoning_value(""))
         self.assertIsNone(reasoning_value(None))
         self.assertIsNone(reasoning_value(123))
+
+
+class TestResolveProviderId(unittest.TestCase):
+    """S0：provider 三级回退 + **配置值存在性校验**。
+
+    为什么需要校验：配置里写错一个 provider id，``llm_generate`` 会抛
+    ``ProviderNotFoundError``，插件把它吞成空回复 → 表面"没坏"、实际全哑。
+    S0 的整批缺陷都是这个形状，所以这里宁可多查一次。
+    """
+
+    def test_configured_wins(self):
+        self.assertEqual(resolve_provider_id("cfg", "known", "sess", True), "cfg")
+
+    def test_unknown_existence_still_uses_configured(self):
+        """拿不到 provider_manager 时按"未知，放行"，不能因校验本身失败而停摆。"""
+        self.assertEqual(resolve_provider_id("cfg", "known", "sess", None), "cfg")
+
+    def test_bad_configured_falls_back_to_known(self):
+        self.assertEqual(resolve_provider_id("typo", "known", "sess", False), "known")
+
+    def test_bad_configured_falls_back_to_session(self):
+        self.assertEqual(resolve_provider_id("typo", None, "sess", False), "sess")
+
+    def test_bad_configured_no_fallback_returns_none(self):
+        self.assertIsNone(resolve_provider_id("typo", None, None, False))
+
+    def test_empty_configured_uses_known_then_session(self):
+        self.assertEqual(resolve_provider_id("", "known", "sess", None), "known")
+        self.assertEqual(resolve_provider_id("", None, "sess", None), "sess")
+        self.assertIsNone(resolve_provider_id("", None, None, None))
+
+    def test_whitespace_configured_treated_as_empty(self):
+        self.assertEqual(resolve_provider_id("   ", None, "sess", None), "sess")
+
+    def test_never_returns_empty_string(self):
+        """调用方用 ``if not provider_id`` 判定 → 绝不能返回空串。"""
+        for args in (("", None, None, None), ("  ", "", "", False),
+                     ("typo", "", "", False)):
+            self.assertFalse(resolve_provider_id(*args))
 
 
 if __name__ == "__main__":
