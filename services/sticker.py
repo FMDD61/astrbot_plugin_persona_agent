@@ -84,8 +84,18 @@ class StickerService:
         *,
         library_dir: Optional[str | os.PathLike] = None,
         top_k: int = 5,
-        min_score: float = 0.45,
-        margin: float = 0.06,
+        # 🔴 阈值经**真实库标定**（2026-09-13，878 张 / BGE 短↔短匹配）：
+        #     正样本（该选的，同主题 tags 组合查询）top1: p05=0.737 p50=0.846
+        #     负样本（库里无对应图的日常意图）top1:      max=0.618
+        #   原值 0.45 是拍脑袋的初值，**比所有负样本都低** → 任何意图都能"匹配上"
+        #   某张贴纸（实测「代码review通过了」会被配上 0.52 的无关表情），
+        #   而选不中是静默跳过，表现为"它发的表情总是不对"而非任何报错。
+        #   取 0.68：落在负样本 max(0.618) 与正样本 p05(0.737) 之间偏保守侧。
+        min_score: float = 0.68,
+        # margin（top1-top2 分差）：实测该指标区分度**弱**（正样本分差 p25=0.019、
+        # p50=0.056）—— 同一个表情往往有多张近似图，top2 天然接近。故只保留很窄的
+        # 死区（0.02）用于挡"完全并列"，不靠它做主要判断。
+        margin: float = 0.02,
         picker: Optional[Callable[[str, list[StickerHit]], Any]] = None,
     ) -> None:
         self._index_path = Path(index_path)
