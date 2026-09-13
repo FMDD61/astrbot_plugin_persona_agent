@@ -41,6 +41,13 @@ EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 DEFAULT_INDEX = "sticker_index.json"
 DEFAULT_MODEL = "BAAI/bge-base-zh-v1.5"
 
+# 送视觉模型前的降采样上限（长边像素）。
+# 实测素材：963 张 / 392 MB，最大单张 **13.1 MB** —— 原图 base64 进请求体会
+# 让单次调用变得又慢又贵，而描述质量对分辨率并不敏感（≤80 字的短描述）。
+# 768px 是实测够用的档位：既保留表情包的表情/文字细节，又把请求体压到几十 KB。
+DESC_MAX_EDGE = 768
+DESC_JPEG_QUALITY = 82
+
 # 视觉描述提示词：与 services/vision.py 同源（表情包要说明情绪与梗）
 VISION_SYS = (
     "用中文简要描述这张图片中确定可见的内容，不超过80字；"
@@ -87,14 +94,69 @@ def scan_images(library_dir: Path) -> tuple[list[dict], list[str]]:
 
 # ---------------------------------------------------------------- 描述（可选）
 
+def prepare_for_vision(path: str, max_edge: int = DESC_MAX_EDGE) -> tuple[bytes, str]:
+    """把原图压成适合送视觉模型的小图。返回 ``(bytes, mime)``。
+
+    - 长边 > ``max_edge`` 才缩放（小图不动，避免无谓重编码损失）
+    - gif 只取第一帧（表情包动图的第一帧通常已含全部语义；也让体积可控）
+    - 任何一步失败 → **回退成原图**（宁可慢，也不要因为预处理失败而丢掉描述）
+    """
+    try:
+        from PIL import Image  # type: ignore
+        import io
+    except ImportError:
+        return Path(path).read_bytes(), _mime_of(path)
+    try:
+        with Image.open(path) as im:
+            im.seek(0)                      # gif 取第一帧
+            im = im.convert("RGB")
+            w, h = im.size
+            if max(w, h) > max_edge:
+                scale = max_edge / float(max(w, h))
+                im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                               Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=DESC_JPEG_QUALITY, optimize=True)
+            return buf.getvalue(), "image/jpeg"
+    except Exception:
+        return Path(path).read_bytes(), _mime_of(path)
+
+
+def _mime_of(path: str) -> str:
+    ext = Path(path).suffix.lower().lstrip(".")
+    return {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+            "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/png")
+
+
+def _clean_env(v: str) -> str:
+    """环境变量清洗：去掉首尾空白与**换行**。
+
+    实测踩到：`$(cat key)` 取到的值带尾换行 → 拼进 URL 后 httpx 报
+    ``InvalidURL: Invalid port: ':1]'``（报错完全指不到真因）。这类输入
+    错误应该在入口处规整，而不是让底层库抛天书。
+    """
+    return (v or "").strip().strip('"').strip("'").strip()
+
+
+def _validate_base(api_base: str) -> str:
+    """校验 api_base 形态，给出可读报错。返回清洗后的值。"""
+    from urllib.parse import urlparse
+    b = _clean_env(api_base)
+    if not b:
+        raise ValueError("STICKER_VISION_API_BASE 为空")
+    if any(c in b for c in " \t\n\r"):
+        raise ValueError(f"STICKER_VISION_API_BASE 含空白字符（多半是换行混入）: {b!r}")
+    u = urlparse(b)
+    if u.scheme not in ("http", "https") or not u.netloc:
+        raise ValueError(f"STICKER_VISION_API_BASE 不是合法 URL: {b!r}")
+    return b
+
+
 def _describe_one(path: str, api_base: str, api_key: str, model: str, timeout: float) -> str:
     """调视觉模型描述一张图。失败返回空串（调用方决定是否中止）。"""
     import httpx
 
-    data = Path(path).read_bytes()
-    ext = Path(path).suffix.lower().lstrip(".")
-    mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-            "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/png")
+    data, mime = prepare_for_vision(path)
     b64 = base64.b64encode(data).decode()
     payload = {
         "model": model,
@@ -107,24 +169,34 @@ def _describe_one(path: str, api_base: str, api_key: str, model: str, timeout: f
         ],
         "max_tokens": 512, "temperature": 0.3, "reasoning_effort": "low",
     }
-    with httpx.Client(timeout=timeout) as c:
+    # ⚠️ trust_env=False 是必需的：开发机 `no_proxy` 里含 `[::1]`，而 httpx 会把
+    # no_proxy 的每个条目当 URL pattern 解析 → `InvalidURL: Invalid port: ':1]'`，
+    # 报错完全指不到真因（实测踩了）。
+    # 网关是公网直连（实测 HTTPS 200 / 2.9s，不需要代理），所以绕过 env 代理是安全的。
+    with httpx.Client(timeout=timeout, trust_env=False) as c:
         r = c.post(api_base.rstrip("/") + "/chat/completions",
-                   headers={"Authorization": f"Bearer {api_key}"}, json=payload)
+                   headers={"Authorization": f"Bearer {_clean_env(api_key)}"}, json=payload)
         r.raise_for_status()
         d = r.json()
     return (((d.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
 
 
-def describe_all(items: list[dict], *, api_base: str, api_key: str, model: str,
-                 workers: int = 2, timeout: float = 60.0) -> None:
-    """并发给 items 填 desc（原地修改）。workers 默认 2：4 核机器别打满。"""
+def describe_all(items: list[dict], *, library_dir: Path, api_base: str, api_key: str,
+                 model: str, workers: int = 2, timeout: float = 60.0) -> int:
+    """并发给 items 填 desc（原地修改）。返回成功数。
+
+    ⚠️ 路径从 ``library_dir / it["file"]`` 解析，**不依赖中间字段** ——
+    merge 后的条目只保证有 file/sha256（曾经因为依赖 it["path"] 而 KeyError）。
+    workers 默认 2：4 核机器别打满。
+    """
     todo = [it for it in items if not it.get("desc")]
     if not todo:
-        return
+        return 0
     print(f"  视觉描述 {len(todo)} 张（并发 {workers}，模型 {model}）…")
-    done = 0
+    done = ok = 0
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_describe_one, it["path"], api_base, api_key, model, timeout): it
+        futs = {ex.submit(_describe_one, str(library_dir / it["file"]),
+                          api_base, api_key, model, timeout): it
                 for it in todo}
         for fut in cf.as_completed(futs):
             it = futs[fut]
@@ -133,9 +205,12 @@ def describe_all(items: list[dict], *, api_base: str, api_key: str, model: str,
             except Exception as e:
                 it["desc"] = ""
                 print(f"    ! {it['file']}: {type(e).__name__}: {e}", file=sys.stderr)
+            if it.get("desc"):
+                ok += 1
             done += 1
-            if done % 5 == 0 or done == len(todo):
-                print(f"    {done}/{len(todo)}")
+            if done % 10 == 0 or done == len(todo):
+                print(f"    {done}/{len(todo)}（成功 {ok}）", flush=True)
+    return ok
 
 
 # ---------------------------------------------------------------- 嵌入
@@ -259,8 +334,14 @@ def main(argv=None) -> int:
         if not api_base or not api_key:
             print("  ! 未提供 STICKER_VISION_API_BASE/KEY → 跳过视觉描述", file=sys.stderr)
         else:
-            describe_all(items, api_base=api_base, api_key=api_key,
-                         model=args.model, workers=args.workers)
+            try:
+                api_base = _validate_base(api_base)
+            except ValueError as e:
+                print(f"  ! {e} → 跳过视觉描述", file=sys.stderr)
+                api_base = ""
+            if api_base:
+                describe_all(items, library_dir=lib, api_base=api_base, api_key=api_key,
+                             model=args.model, workers=args.workers)
 
     dim = embed_all(items, model_name=args.embed_model)
 
