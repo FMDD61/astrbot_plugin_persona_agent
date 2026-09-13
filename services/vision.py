@@ -51,22 +51,44 @@ def sniff_mime(data: bytes) -> str:
     return "image/png"
 
 
-async def resolve_image_bytes(img) -> Optional[bytes]:
+async def resolve_image_bytes(img, diag: Optional[dict] = None) -> Optional[bytes]:
     """Resolve a Comp.Image to bytes: 本地路径 -> convert_to_file_path
     (AstrBot MediaResolver handles url/base64/localfile), then manual
-    fallbacks: base64:// and http(s) download."""
+    fallbacks: base64:// and http(s) download.
+
+    ``diag``：可选诊断字典。**三条取字节路径全部静默 return None**，
+    失败时无法区分"取不到图"与"模型没描述"（2026-09-13 实测有 5/14 次
+    `无法识别`，却查不出是哪一层）。这里把每级失败原因记进去。
+
+    返回的 bytes 会附在 ``diag["bytes"]``（仅诊断用，调用方负责不入日志）。
+    """
+    def _fail(where: str, exc: Optional[BaseException] = None) -> None:
+        if diag is None:
+            return
+        diag.setdefault("resolve_fail", where)
+        if exc is not None:
+            diag.setdefault("resolve_error", f"{type(exc).__name__}: {exc}")
+
     try:
         path = await img.convert_to_file_path()
         if path:
             with open(path, "rb") as f:
-                return f.read()
-    except Exception:
-        pass
+                data = f.read()
+            if diag is not None:
+                diag["resolve_via"] = "file_path"
+            return data
+        _fail("convert_to_file_path returned empty")
+    except Exception as e:
+        _fail("convert_to_file_path raised", e)
     raw = getattr(img, "file", None) or ""
     if raw.startswith("base64://"):
         try:
-            return base64.b64decode(raw[len("base64://"):])
-        except Exception:
+            data = base64.b64decode(raw[len("base64://"):])
+            if diag is not None:
+                diag["resolve_via"] = "base64"
+            return data
+        except Exception as e:
+            _fail("base64 decode failed", e)
             return None
     if raw.startswith("http://") or raw.startswith("https://"):
         try:
@@ -74,9 +96,14 @@ async def resolve_image_bytes(img) -> Optional[bytes]:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 r = await client.get(raw)
                 if r.status_code == 200:
+                    if diag is not None:
+                        diag["resolve_via"] = "http"
                     return r.content
-        except Exception:
+                _fail(f"http status {r.status_code}")
+        except Exception as e:
+            _fail("http download raised", e)
             return None
+    _fail(f"unresolvable file={str(raw)[:40]!r}")
     return None
 
 
@@ -124,6 +151,11 @@ class VisionService:
         self._persist: dict[str, dict] = {}   # sha256 -> {desc,last_ts,hits}
         self._persist_dirty = False           # 内存有未落盘变更
         self._evicted = 0                     # 淘汰计数（观测上限是否够）
+        # S0 观测：最近一次失败原因 + 分类计数（与 emotion/gate 同一套）。
+        # 「无法识别」在调用方看来是单一结果，但底层至少有 4 种成因
+        # （取不到图 / 模型空返回 / 异常 / 超时）—— 不分开就只能猜。
+        self.last_error: Optional[str] = None
+        self.stats = {"ok": 0, "cache_hit": 0, "empty": 0, "timeout": 0, "error": 0}
         if self._persist_path:
             self._load_persist()
 
@@ -213,13 +245,26 @@ class VisionService:
             r.raise_for_status()
             return r.json()
 
-    async def describe_bytes(self, data: bytes) -> Optional[str]:
+    async def describe_bytes(self, data: bytes, diag: Optional[dict] = None) -> Optional[str]:
+        # S0 观测：与 emotion/gate 同一套 —— 内部失败必须可分辨。
+        # 此前 4 条静默 return None（空数据/空描述/异常/超时）在调用方看来
+        # 都是"无法识别"，2026-09-13 实测 5/14 次失败却查不出哪一层。
+        self.last_error: Optional[str] = None
         if not data:
+            self.last_error = "empty bytes"
+            if diag is not None:
+                diag["vision_fail"] = "empty bytes"
             return None
         h = hashlib.sha256(data).hexdigest()
+        if diag is not None:
+            diag["hash"] = h[:16]
+            diag["bytes"] = len(data)
         with self._lock:
             hit = self._cache.get(h)
             if hit and time.time() - hit[0] < self._cache_ttl:
+                if diag is not None:
+                    diag["cache"] = "memory"
+                self.stats["cache_hit"] += 1
                 return hit[1]
             # A7③ 第二道：持久缓存命中 → 免调视觉模型（跨重启复用）
             if self._persist_path:
@@ -227,10 +272,15 @@ class VisionService:
                 if pent:
                     self._touch_persist(h, str(pent.get("desc", "")))
                     self._cache[h] = (time.time(), str(pent["desc"]))
+                    if diag is not None:
+                        diag["cache"] = "persist"
+                    self.stats["cache_hit"] += 1
                     return str(pent["desc"])
         try:
             b64 = base64.b64encode(data).decode()
             mime = sniff_mime(data)
+            if diag is not None:
+                diag["mime"] = mime
             payload = {
                 "model": self._model,
                 "messages": [
@@ -249,18 +299,37 @@ class VisionService:
             desc = ((out.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
             desc = str(desc).strip()[: self._desc_max_chars]
             if not desc:
+                # 模型返回空（多为思考吃光 max_tokens）
+                self.last_error = "empty completion (model returned no content)"
+                self.stats["empty"] += 1
+                if diag is not None:
+                    diag["vision_fail"] = self.last_error
                 return None
             with self._lock:
                 self._cache[h] = (time.time(), desc)
                 # A7③: 新描述写持久层（标脏，惰性 flush）
                 if self._persist_path:
                     self._touch_persist(h, desc)
+            self.stats["ok"] += 1
+            if diag is not None:
+                diag["cache"] = "miss"
             return desc
-        except Exception:
+        except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"
+            self.stats["timeout" if isinstance(e, asyncio.TimeoutError) else "error"] += 1
+            if diag is not None:
+                diag["vision_fail"] = self.last_error
             return None
 
-    async def describe_image(self, img) -> Optional[str]:
-        data = await resolve_image_bytes(img)
+    async def describe_image(self, img, diag: Optional[dict] = None) -> Optional[str]:
+        if diag is None:
+            diag = {}
+        data = await resolve_image_bytes(img, diag=diag)
         if not data:
+            # 取字节这一级就失败了 —— 与"模型没描述"必须分开记
+            self.last_error = str(diag.get("resolve_fail") or "resolve failed")
+            if diag.get("resolve_error"):
+                self.last_error += f" ({diag['resolve_error']})"
+            self.stats["error"] += 1
             return None
-        return await self.describe_bytes(data)
+        return await self.describe_bytes(data, diag=diag)

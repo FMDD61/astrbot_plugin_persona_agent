@@ -1249,10 +1249,14 @@ class PersonaAgent(Star):
                     await self._ensure_vision(event)
                 if self._vision is not None:
                     descs = []
+                    diags: list[dict] = []
                     for seg in imgs:
+                        d: dict = {}
+                        diags.append(d)
                         try:
-                            descs.append(await self._vision.describe_image(seg) or "")
-                        except Exception:
+                            descs.append(await self._vision.describe_image(seg, diag=d) or "")
+                        except Exception as e:
+                            d["vision_fail"] = f"{type(e).__name__}: {e}"
                             descs.append("")
                     non_empty = [d for d in descs if d]
                     if non_empty:
@@ -1265,6 +1269,14 @@ class PersonaAgent(Star):
                         # Descriptions failed: say so honestly so the reply LLM
                         # never hallucinates content about an unseen image.
                         extra += "（配图：无法识别）"
+                        # ★ S0 观测：把"哪一层失败"写进日志。调用方只看到
+                        #   「无法识别」这一个结果，底层却有 4 种成因（取不到图 /
+                        #   模型空返回 / 异常 / 超时）—— 2026-09-13 实测 5/14 次
+                        #   失败，正是因为没有这行日志而只能猜。
+                        logger.warning(
+                            "[persona_agent] vision failed for all %d image(s): %s"
+                            % (len(imgs), json.dumps(diags, ensure_ascii=False)[:400])
+                        )
             if not extra:
                 return text
             return f"{text} {extra}".strip() if text.strip() else extra
