@@ -35,7 +35,7 @@
 - **`reasoning_effort` 语义澄清**：网关**不认 `off`** —— 填 off 只是"不发送该参数"，模型仍按**默认档**思考（实测 651–738 思考 token / 4–8s），**并不能真的关掉思考**。全栈默认改 `low`（思考降至 136–227 token）；`vision.reasoning_effort` 另有硬约束：vision 系列**没有默认档**，传 off 直接 HTTP 400（只接受 low/medium/high/xhigh/max）
 - **工具意图标记预防性收口**：`text_style.postprocess` 增加 `[emote:…]`/`[poke:…]` 剥离规则。当前提示词尚未教这两个协议，但**没有剥离规则就教协议 = 标记原样进群**，故先兜住
 - `_conf_schema.json` 同步：`vision.model`、`emotion.{timeout_sec,reasoning_effort}`、`gate.{timeout_sec,reasoning_effort}`、`llm.reasoning_effort` 默认值与 hint 全部改为实测口径（含 400 错误原因）
-- 测试 225 → **257 全绿**（新增：QuoteIndex 冻结不变量 5 例、session 元数据/自愈 9 例、pipeline 引用快照隔离 4 例、emotion 降级可分辨 3 例、style 缓存恒定 3 例）
+- 测试 225 → **257 全绿**（新增：QuoteIndex 冻结不变量 5、session 元数据/自愈 9、pipeline 引用快照隔离 4、emotion 降级可分辨 3、style 缓存恒定 3、provider 回退 8）
 
 ### Fixed (2026-09-10, 协议端迁移准备：poke 死代码 + LLBot 出站通道)
 - **🔴 poke 处理器是死代码（G11 开启也不会生效）**：`on_other` 挂了 `EventMessageType.OTHER_MESSAGE` 过滤器，但 AstrBot **v4.27.4** 的 `_convert_handle_notice_event()` 会把**带 group_id 的通知**归为 `GROUP_MESSAGE`（`OTHER_MESSAGE` 在该路径上不可达）→ 群戳从未进入该处理器，且无任何报错。更隐蔽的是：群戳实际落到 `on_group_message`，`message_str` 为空 → 被媒体过滤器 `event.stop_event()` 吞掉；而 `StarRequestSubStage` 的派发循环是 `for handler in activated_handlers: if event.is_stopped(): break`、handler 顺序 = 装饰器注册顺序（`on_group_message` 在前）→ **单改过滤器也救不回来**。修复：① `on_group_message` 对 `post_type != "message"` 的通知**让路**（不 stop_event）；② 处理函数改名 `on_notice`，过滤器改 `EventMessageType.ALL`，判定下沉到插件侧。依据：AstrBot v4.27.4 源码实测（`_convert_handle_notice_event` / `get_message_type` / `EventMessageTypeFilter` / `StarRequestSubStage` / `PipelineScheduler._process_stages`）
