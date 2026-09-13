@@ -695,3 +695,81 @@ class TestDeferredSessionAppend(unittest.TestCase):
         self.assertEqual(p.flush_all_pending_appends(), 2)
         self.assertEqual(p.flush_all_pending_appends(), 0)      # 幂等
         self.assertEqual(sorted(a[1] for a in appends), ["群A的", "群B的"])
+
+
+class TestToolIntentsS3(unittest.TestCase):
+    """S3①：`[emote:]` / `[poke:]` 解析接入 —— 必须与 `[r:-N]` 同理，
+    在 **postprocess 之前** 提取（否则会被剥离规则吃掉，再也拿不到）。
+    """
+
+    def _gen(self, raw):
+        def g(t, c, e, temp, su, umo):
+            return _async(raw)
+        return g
+
+    def test_emote_marker_extracted(self):
+        from services import text_style
+        p = _pipeline(generate=self._gen("好呀 [emote:无奈地摇头]"),
+                      postprocess=text_style.postprocess)
+        si = _run(p.run(PipelineInput("g1", "喂", False, "1", "甲")))
+        self.assertEqual(si.action, "reply")
+        self.assertEqual(si.emote, "无奈地摇头")
+        self.assertEqual(si.text, "好呀")          # 标记已剥离
+        self.assertNotIn("emote", si.text)
+
+    def test_poke_marker_extracted(self):
+        from services import text_style
+        p = _pipeline(generate=self._gen("[poke:100000002] 戳你"),
+                      postprocess=text_style.postprocess)
+        si = _run(p.run(PipelineInput("g1", "喂", False, "1", "甲")))
+        self.assertEqual(si.poke, "100000002")
+        self.assertEqual(si.text, "戳你")
+
+    def test_both_markers_and_quote_coexist(self):
+        from services import text_style
+        from services.session_manager import SessionManager
+        sm = SessionManager(data_dir=None, max_messages=None)
+        sm.append("g1", "user", "被引用的", name="乙", message_id="MID-1", sender_uin="u2")
+        p = _pipeline(session=sm, generate=self._gen("[r:-1] 哈哈 [emote:害羞] [poke:12345678]"),
+                      postprocess=text_style.postprocess)
+        si = _run(p.run(PipelineInput("g1", "喂", False, "1", "甲")))
+        self.assertEqual(si.quote_id, "MID-1")     # 引用仍生效
+        self.assertEqual(si.emote, "害羞")
+        self.assertEqual(si.poke, "12345678")
+        self.assertEqual(si.text, "哈哈")
+        for bad in ("r:", "emote", "poke"):
+            self.assertNotIn(bad, si.text)
+
+    def test_leak_suppressed_even_for_invalid_markers(self):
+        """无效标记（空意图/非法 QQ）也必须剥离 —— 泄漏进群就是乱码。"""
+        from services import text_style
+        p = _pipeline(generate=self._gen("走 [emote:] [poke:abc]"),
+                      postprocess=text_style.postprocess)
+        si = _run(p.run(PipelineInput("g1", "喂", False, "1", "甲")))
+        self.assertIsNone(si.emote)
+        self.assertIsNone(si.poke)
+        self.assertNotIn("emote", si.text)
+        self.assertNotIn("poke", si.text)
+
+    def test_trace_records_intents(self):
+        from services import text_style
+        p = _pipeline(generate=self._gen("嗨 [emote:比心] [poke:12345678]"),
+                      postprocess=text_style.postprocess)
+        si = _run(p.run(PipelineInput("g1", "喂", False, "1", "甲")))
+        self.assertEqual(si.trace.get("tool_intents"),
+                         {"emote": "比心", "poke": "12345678"})
+
+    def test_no_markers_leaves_nothing(self):
+        from services import text_style
+        p = _pipeline(generate=self._gen("普通回复"), postprocess=text_style.postprocess)
+        si = _run(p.run(PipelineInput("g1", "喂", False, "1", "甲")))
+        self.assertIsNone(si.emote)
+        self.assertIsNone(si.poke)
+        self.assertNotIn("tool_intents", si.trace)
+
+    def test_works_without_postprocess(self):
+        """离线测试台可能不注入 postprocess —— 提取不得依赖它。"""
+        p = _pipeline(generate=self._gen("好 [emote:猫猫]"))
+        si = _run(p.run(PipelineInput("g1", "喂", False, "1", "甲")))
+        self.assertEqual(si.emote, "猫猫")
+        self.assertEqual(si.text, "好")

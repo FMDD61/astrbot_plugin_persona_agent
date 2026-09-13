@@ -25,6 +25,20 @@
 - **日记 `day` 偏移一天**：归档 09-12 的会话，`day` 却取轮换后的 `day_key()`（09-13）。改为按同一口径回推 24h
 - **provider id 写错会静默哑掉（新增加固）**：`_resolve_provider_id()` 现在**先校验配置值存在性** —— 写成不存在的 id 时 `llm_generate` 抛 `ProviderNotFoundError`、被 except 吞成空回复（又一条"看起来正常其实全哑"）。校验失败 → 告警 + 回退到会话 provider；拿不到 `provider_manager` 时返回"未知"照用配置值（不让校验本身成为故障源）。三级回退逻辑抽为纯函数 `llm_params.resolve_provider_id()`，可离线单测（+8 例）
 
+### Added (2026-09-13, S3① 动作链路协议：意图标记解析)
+> 设计文档：`docs/specs/s3-action-channel.md`（2026-09-13 立项，用户定调"先落地代码与协议"）
+
+- **`text_style.extract_tool_intents()`**：解析并剥离 `[emote:意图短语]` / `[poke:QQ号]`。
+  规则：一条回复最多一个动作（多个取第一个）；空意图/超长/非法 QQ 视为无效；
+  **无论是否解析成功，标记一律剥离**（B-012 的教训：泄漏进群就是乱码）。
+- **pipeline 接线**：与 `[r:-N]` 同理，在 **`postprocess` 之前** 提取 ——
+  postprocess 会剥离工具标记（S0 预置的防泄漏规则），之后再取就没了。
+  结果写入 `SendIntent.emote` / `.poke`（这两个字段自 A7 起预留，**首次真正被赋值**），
+  trace 补 `tool_intents`。
+- **本阶段零行为变化**：提示词尚未教这两个标记 → 模型不会写 → 线上无差异；
+  main 也尚未消费 `emote`/`poke`（发送在 S3③④）。
+- 测试 307 → **314 全绿**（含"与 `[r:-N]` 并存"、"无效标记也剥离"、"不依赖 postprocess"）
+
 ### Changed (2026-09-13, S2 回复链构造：输入打包重划 + Gate 职责 + 缓存序修正)
 > 动工前的实测把 spec §4.2 的一个前提推翻了，故按证据重做。
 
