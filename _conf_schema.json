@@ -274,8 +274,9 @@
       },
       "model": {
         "type": "string",
-        "description": "视觉模型（网关内；实测 deepseek-v4-flash-vision-exp 可用，mimo-v2.5 视觉返回空）",
-        "default": "deepseek-v4-flash-vision-exp"
+        "description": "视觉模型（网关内模型名，必须带命名空间前缀）",
+        "hint": "🔴 2026-09-13 修复：旧默认 deepseek-v4-flash-vision-exp **缺命名空间前缀**，网关一律 HTTP 400 unsupported_model → 全部图片退化成「（配图：无法识别）」（实测 656/656 条无一成功）。须形如 deepseek/deepseek-v4.1-flash。同一张图实测：v4.1-flash 3.8s / vision-exp 4.7s / Qwen3.8-Flash 4.6s / mimo-v2.5 22.5s（过慢）。",
+        "default": "deepseek/deepseek-v4.1-flash"
       },
       "timeout_sec": {
         "type": "float",
@@ -299,7 +300,8 @@
       },
       "reasoning_effort": {
         "type": "string",
-        "description": "视觉模型思考强度（low/off/high；实测 low+512 tokens 最稳）",
+        "description": "视觉模型思考强度（必填 low/medium/high/xhigh/max）",
+        "hint": "⚠️ vision 系列**没有默认档**：传 off 会 HTTP 400（Invalid option: expected one of low|medium|high|xhigh|max）。实测 low 稳定。",
         "default": "low"
       },
       "cache_persist": {
@@ -318,7 +320,7 @@
   },
   "emotion": {
     "type": "object",
-    "description": "情绪引擎（G10 v1：willingness/mood/sticker 三维 + 30s 缓存 + 3s 超时）",
+    "description": "情绪引擎（G10 v1：willingness/mood/sticker 三维 + 同群缓存）",
     "items": {
       "enabled": {
         "type": "int",
@@ -327,12 +329,14 @@
       },
       "timeout_sec": {
         "type": "float",
-        "description": "情绪 LLM 调用超时（秒），超时回退中性",
-        "default": 3
+        "description": "情绪 LLM 调用超时（秒），超时回退中性并在 trace 记 emotion_degraded",
+        "hint": "🔴 2026-09-13 修复：旧默认 3s **短于模型自身耗时**（实测同一 prompt 4.1–8.0s，思考 token 227–738）→ 每一次调用都超时、静默回退中性值，而 trace 上看起来就像「模型稳定输出中性」（2262 条无一例外）。网关不认 off，思考关不掉，故只能放宽超时。",
+        "default": 30
       },
       "cache_ttl_sec": {
         "type": "float",
         "description": "同群情绪缓存时长（秒）",
+        "hint": "应 >= 模型单次耗时（4–8s），否则每条消息都重复调用。30s 同时覆盖「同群连续消息」与「缓存复用」。",
         "default": 30
       },
       "temperature": {
@@ -342,9 +346,9 @@
       },
       "reasoning_effort": {
         "type": "string",
-        "description": "情绪分析思考强度（A7④：off/low/medium/high）",
-        "hint": "结构化任务默认 off；网关不认 off 时映射 none。",
-        "default": "off"
+        "description": "情绪分析思考强度（low/medium/high/xhigh/max；off = 不发送该参数）",
+        "hint": "⚠️ 网关**不认 off**：填 off 只是「不发该参数」，模型仍按默认档思考（实测 651–738 思考 token / 4–8s），并没有真的关掉思考。",
+        "default": "low"
       }
     }
   },
@@ -386,8 +390,9 @@
       },
       "timeout_sec": {
         "type": "float",
-        "description": "GateLLM 调用超时（秒），超时保守静默",
-        "default": 3.0
+        "description": "GateLLM 调用超时（秒），超时保守静默（trace 记 gate_degraded）",
+        "hint": "🔴 2026-09-13 修复：旧默认 3.0s 与情绪同因 —— 模型自身耗时 4–8s，必然超时 → 保守静默。因 @ 不受 gate 影响，此前未暴露；但一旦 gate.enabled=1，非 @ 消息会被**全部静默**（看起来像 gate 判断力差，实为每次超时）。",
+        "default": 30.0
       },
       "decide_cooldown_sec": {
         "type": "float",
@@ -411,9 +416,9 @@
       },
       "reasoning_effort": {
         "type": "string",
-        "description": "GateLLM 思考强度（A7④：off/low/medium/high）",
-        "hint": "结构化任务默认 off；网关不认 off 时映射 none。",
-        "default": "off"
+        "description": "GateLLM 思考强度（low/medium/high/xhigh/max；off = 不发送该参数）",
+        "hint": "⚠️ 网关不认 off：填 off 只是「不发该参数」，模型仍按默认档思考（实测 4–8s），并没有关掉思考。",
+        "default": "low"
       }
     }
   },
@@ -457,27 +462,27 @@
       "provider_id": {
         "type": "string",
         "description": "LLM provider ID",
-        "hint": "留空使用 AstrBot 当前会话默认 provider。建议在 AstrBot WebUI 配置火山引擎 provider。",
+        "hint": "留空使用 AstrBot 当前会话默认 provider。2026-09-13 全栈统一为 commandcode/deepseek/deepseek-v4.1-flash（RP/Gate/Emotion/日记/摘要同一只；识图见 vision.model）。",
         "default": "",
         "_special": "select_provider"
       },
       "cache_probe_enabled": {
         "type": "int",
         "description": "LLM 调用观测探针（0 关 / 1 开）",
-        "hint": "开启时每次生成追加一行 llm_cache_probe.jsonl（session 长度/系统提示词 hash/usage 缓存命中）。2026-08 评估后转正为常态观测，默认开。",
+        "hint": "开启时每次生成追加一行 llm_cache_probe.jsonl（session 长度/系统提示词 hash/usage 缓存命中）。2026-08 评估后转正为常态观测，默认开。⚠️ 2026-09-13 复盘：探针此前要求传入 event 对象，而 pipeline 走的是无 event 的 standalone 回调 → **线上主回复链路从未落过探针**，缓存命中率长期无数据。已修复。",
         "default": 1
       },
       "max_tokens": {
         "type": "int",
         "description": "回复最大 token 数",
-        "hint": "需容纳模型的思考开销（实测 ~200 tokens）；太小会导致思考吃光预算、正文为空。",
+        "hint": "需容纳模型的思考开销（实测 200–800 tokens，reasoning 关不掉）；太小会导致思考吃光预算、正文为空（实测 256 会截空）。",
         "default": 512
       },
       "reasoning_effort": {
         "type": "string",
-        "description": "RP 主生成思考档位（A7④：off/low/medium/high/max）",
-        "hint": "off=不发送该参数（网关默认；实测角色效果最佳）。注意网关只认 low/medium/high/max，发 off/none 会 HTTP 400。",
-        "default": "off"
+        "description": "RP 主生成思考档位（low/medium/high/xhigh/max；off = 不发送该参数）",
+        "hint": "⚠️ 网关只认 low/medium/high/xhigh/max，发 off/none 会 HTTP 400。填 off 的实际语义是「不发送该参数」= 模型按**默认档**思考（实测 651–738 思考 token / 4–8s），**不能**真的关掉思考。2026-09-13 起默认 low（思考降至 136–227 token，约 4s）。",
+        "default": "low"
       }
     }
   }

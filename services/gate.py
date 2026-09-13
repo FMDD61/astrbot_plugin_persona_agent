@@ -89,6 +89,10 @@ class GateService:
         self._cache: dict[str, tuple[float, GateDecision]] = {}
         # A7④: 时钟注入（离线重放按场景时刻推进节流窗口；缺省真实时钟）
         self._now = now_utc_fn or time.time
+        # S0 观测：最近一次决策的降级原因（None = 正常）。失败会静默降级为
+        # 「不发言」，与模型的正常 no-reply 判定无法区分 → 必须显式带出。
+        self.last_error: Optional[str] = None
+        self.stats = {"ok": 0, "cached": 0, "timeout": 0, "error": 0, "parse_fail": 0}
 
     # ---- prompt building ----
 
@@ -213,15 +217,26 @@ class GateService:
                 d = hit[1]
                 d.cached = True
                 d.ts = now
+                self.last_error = None
+                self.stats["cached"] += 1
                 return d
+        self.last_error = None
         try:
             prompt = self._build_prompt(recent_msgs, current_speaker, current_text, rag_hits, is_at=is_at)
             raw = await asyncio.wait_for(self._llm_fn(prompt), timeout=self._timeout)
             d = self._parse((raw or "").strip())
             if d is None:
                 d = GateDecision(reply=False, reason="gate parse failed", fallback=True)
+                self.last_error = f"parse_failed: {((raw or '').strip())[:120]!r}"
+                self.stats["parse_fail"] += 1
+            else:
+                self.stats["ok"] += 1
         except Exception as e:
             d = GateDecision(reply=False, reason=f"gate error: {type(e).__name__}", fallback=True)
+            # S0 观测：降级必须可见。否则「超时导致全体静默」与「模型判不该回」
+            # 在 gate_log 里同样是 reply=false —— 开 gate.enabled=1 时会静默哑掉。
+            self.last_error = f"{type(e).__name__}: {e}"
+            self.stats["timeout" if isinstance(e, asyncio.TimeoutError) else "error"] += 1
         d.ts = now
         with self._lock:
             self._cache[cache_key] = (now, d)
@@ -244,4 +259,6 @@ class GateService:
                 "cached_groups": list(self._cache.keys()),
                 "cooldown_sec": self._cooldown,
                 "recent_n": self._recent_n,
+                "stats": dict(self.stats),
+                "last_error": self.last_error,
             }

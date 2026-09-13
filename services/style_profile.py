@@ -16,9 +16,16 @@ service never overwrites a file the user has touched (read-only side).
 Interface contract for sub-agent C:
   sp = StyleProfile(data_dir)
   sp.system_prompt(local_hour=None) -> str
-      Builds the system prompt from system_prompt_fragments.json. local_hour
-      is optional; if given, the schedule sentence is rewritten with local
-      timezone awareness. Always returns a non-empty string. Hot-reloads.
+      Builds the **fixed** system prompt from system_prompt_fragments.json
+      (identity/rules/alias block). Always returns a non-empty string.
+      Hot-reloads. local_hour is accepted for backward compatibility but no
+      longer participates (see volatile_line) — the prompt must stay
+      byte-identical across turns so the gateway prefix cache survives.
+
+  sp.volatile_line(local_hour=None, mood="") -> str
+      Per-turn varying bits (local time sentence + current mood). Callers
+      append this as a system message at the END of the context, never into
+      the system prompt.
 
   sp.hourly_budget(hour: int) -> float
       Per-hour interjection budget from my_hourly_distribution.json.
@@ -141,6 +148,16 @@ class StyleProfile:
         return True
 
     def system_prompt(self, local_hour: Optional[int] = None) -> str:
+        """固定人设段（WHO/HOW + 规则 + 别名块）。
+
+        ⚠️ 缓存约束（2026-09-13 修正）：这里**不再拼「现在本地时间 HH 时」**。
+        时间句原先拼在 system prompt 的**末尾**，而 system prompt 是请求的
+        第一个 token 位置 —— 内容一变，其后整段会话前缀全部失效，每小时
+        白白废掉一次全量缓存。时间/心情这类逐轮变化的量改由
+        ``volatile_line()`` 放进**上下文末尾**的一条 system 消息里，
+        只破坏尾部，稳定前缀（人设 + 会话 + 示例块）得以复用。
+        ``local_hour`` 参数保留以兼容既有调用点（不再参与拼接）。
+        """
         f = self._get("system_prompt_fragments.json")
         parts: list[str] = []
         for key in ("identity", "tone", "vocabulary", "schedule", "relations", "group_context", "personality"):
@@ -155,10 +172,20 @@ class StyleProfile:
         alias_block = self._build_alias_block()
         if alias_block:
             text += f"\n\n{alias_block}"
-
-        if local_hour is not None and 0 <= local_hour < 24:
-            text += f"\n\n现在本地时间 {local_hour:02d} 时。"
         return text
+
+    def volatile_line(self, local_hour: Optional[int] = None, mood: str = "") -> str:
+        """逐轮易变信息（时间 + 心情）—— 放在上下文**末尾**专用。
+
+        与固定 system prompt 分离的理由见 ``system_prompt()`` 的缓存说明：
+        易变量若留在前缀里，每次变化都会让整段会话前缀 miss。
+        """
+        lines: list[str] = []
+        if local_hour is not None and 0 <= local_hour < 24:
+            lines.append(f"现在本地时间 {local_hour:02d} 时。")
+        if mood:
+            lines.append(f"当前心情：{mood}")
+        return "\n".join(lines)
 
     def _build_alias_block(self) -> str:
         members = self._iter_members()

@@ -35,6 +35,10 @@ RE_REPLY_MARKER = re.compile(r"\[(?:回复|r:)[^\]]*\]")
 # AstrBot message_str renders media as [图片: <file>] / [ComponentType.X] etc.
 RE_ASTRBOT_MARKER = re.compile(r"\[(?:图片|表情|ComponentType\.[A-Za-z]+)[^\]]*\]")
 RE_QUOTE_MARK = re.compile(r"^\s*\[r:\s*(-?\d+)\]\s*")
+# 工具意图标记（spec §4.3）。**先有剥离规则，才敢把协议教给模型** —— 否则
+# 模型学会 [emote:...] 的那一天，标记会被原样发进群里。S3 实现执行器前
+# 这里就先兜住（当前提示词还没教，属预防性收口）。
+RE_TOOL_INTENT_MARK = re.compile(r"\[(?:emote|poke)\s*:[^\]]*\]")
 
 KOUPI_LIST = ("啃啃", "搓搓", "呜嘿", "bakabaka", "钨钼钨钼", "嗷呜", "捏猫猫的")
 KOUPI_MAX_TOTAL = 2
@@ -135,6 +139,7 @@ def postprocess(text: str) -> str:
     out = strip_meta_parens(out)
     out = RE_REPLY_MARKER.sub("", out)
     out = RE_ASTRBOT_MARKER.sub("", out)
+    out = RE_TOOL_INTENT_MARK.sub("", out)
     out = re.sub(r"(?<=[\u4e00-\u9fff]) +(?=[\u4e00-\u9fff])", "", out)
     out = cap_koupi(out)
     out = strip_emoji(out)

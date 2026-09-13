@@ -684,13 +684,16 @@ class ReplayRuntime:
         )
 
     async def _llm_generate(self, user_text, contexts, emotion, temperature, sender_uin, umo):
-        """RP 生成。风格 system_prompt + 情绪尾巴 + speaker 行与线上一致。"""
+        """RP 生成。与线上 main._generate_reply 同构（防漂移）。
+
+        2026-09-13 缓存重排：system prompt 恒定（不再拼时间/心情），
+        时间与心情改由 ``style.volatile_line()`` 插在上下文**末尾**，
+        使「人设 + 会话 + 示例块」这段前缀可被网关缓存复用。
+        """
         llm_params = _import("llm_params")
         lcfg = self._cfg("llm") or {}
         local_hour = _local_hour_utc8(self.clock())
-        sys_prompt = self.style.system_prompt(local_hour=local_hour) if self.style else ""
-        if emotion and emotion.current_mood:
-            sys_prompt = f"{sys_prompt}\n\n{emotion.current_mood}"
+        sys_prompt = self.style.system_prompt() if self.style else ""
         # speaker hint（同 main._generate_reply：插在 contexts 倒数 system 前）
         alias_txt = ""
         if self.style is not None:
@@ -706,12 +709,22 @@ class ReplayRuntime:
             ctx.insert(-1, {"role": "system", "content": speaker_line})
         else:
             ctx.append({"role": "system", "content": speaker_line})
+        mood = emotion.current_mood if emotion else ""
+        vol = (
+            self.style.volatile_line(local_hour=local_hour, mood=mood)
+            if self.style else ""
+        )
+        if vol:
+            if ctx and ctx[-1].get("role") == "system":
+                ctx.insert(-1, {"role": "system", "content": vol})
+            else:
+                ctx.append({"role": "system", "content": vol})
         messages = [{"role": "system", "content": sys_prompt}] + ctx
         return await asyncio.to_thread(
             self._chat,
             messages,
             temperature,
-            llm_params.reasoning_value(lcfg.get("reasoning_effort", "off")),
+            llm_params.reasoning_value(lcfg.get("reasoning_effort", "low")),
             int(lcfg.get("max_tokens", 512)),
             120.0,
         )
