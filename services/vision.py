@@ -126,19 +126,38 @@ def extract_completion_text(resp: dict) -> str:
     """
     msg = ((resp.get("choices") or [{}])[0].get("message") or {})
     text = str(msg.get("content") or "").strip()
-    if text:
+    if text and not _looks_like_leaked_prompt(text):
         return text
     reasoning = str(msg.get("reasoning") or msg.get("reasoning_content") or "").strip()
     if not reasoning:
         return ""
     import re as _re
     for pat in (r"(?:最后输出|最终输出|最终润色|最终答案|结论)[：:]?\s*([^\n]{2,})",
-                r"(?:输出|答案)[：:]?\s*([^\n]{4,})$"):
+                r"(?:输出|答案)[：:]?\s*([^\n]{2,})$"):
         m = _re.search(pat, reasoning)
         if m:
-            return m.group(1).strip()
+            cand = m.group(1).strip()
+            return "" if _looks_like_leaked_prompt(cand) else cand
+    # 兜底：只在**极短**时取末行 —— 长 reasoning 的末行几乎必然是思考片段
+    # （实测："用户要求用中文简要描述，不超过80字，如果是表情包要说明情绪…"
+    #  这种"我在分析"的句子会被当成图片描述）。宁可返回空让上游重试。
     tail = [l.strip() for l in reasoning.splitlines() if l.strip()]
-    return tail[-1] if tail else ""
+    cand = tail[-1] if tail else ""
+    if len(cand) <= 40 and not _looks_like_leaked_prompt(cand):
+        return cand
+    return ""
+
+
+# 提示词复述/自我规训特征（模型把 system 要求或思考过程写进"答案"）
+_LEAK_MARKERS = (
+    "如是表情包", "不超过80", "不猜测人物", "不要脑补", "需要谨慎", "不能猜",
+    "用户说", "本条要求", "分析请求", "草拟描述", "字数检查",
+)
+
+
+def _looks_like_leaked_prompt(text: str) -> bool:
+    t = text or ""
+    return any(m in t for m in _LEAK_MARKERS)
 
 
 class VisionService:

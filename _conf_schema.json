@@ -150,6 +150,32 @@
         "type": "string",
         "description": "协议端声明：留空=自动（action 优先 + 消息段兜底）；可选 llbot / napcat。两者出站均不支持 poke 消息段（LLBot 出站转换表无 poke 分支、NapCat 为空实现桩），必须走 group_poke action；声明后跳过注定被丢弃的段通道。适配器名恒为 aiocqhttp、无法自动识别协议端，故需人工声明。",
         "default": ""
+      },
+      "hourly_cap": {
+        "type": "int",
+        "description": "被动回戳小时上限（原为硬编码 4，现可配）",
+        "default": 4
+      },
+      "proactive_enabled": {
+        "type": "int",
+        "description": "主动戳人（[poke:QQ]）0 关闭 / 1 开启",
+        "default": 0
+      },
+      "proactive_cooldown_sec": {
+        "type": "float",
+        "description": "主动戳人同人冷却（秒）",
+        "default": 300
+      },
+      "proactive_hourly_cap": {
+        "type": "int",
+        "description": "主动戳人小时上限",
+        "default": 3
+      },
+      "teach": {
+        "type": "int",
+        "description": "是否把 [poke:QQ] 语法教给模型（0/1）",
+        "hint": "库/功能就绪后再开；未开时模型不会写这个标记。",
+        "default": 0
       }
     }
   },
@@ -496,6 +522,65 @@
         "description": "RP 主生成思考档位（low/medium/high/xhigh/max；off = 不发送该参数）",
         "hint": "⚠️ 网关只认 low/medium/high/xhigh/max，发 off/none 会 HTTP 400。填 off 的实际语义是「不发送该参数」= 模型按**默认档**思考（实测 651–738 思考 token / 4–8s），**不能**真的关掉思考。2026-09-13 起默认 low（思考降至 136–227 token，约 4s）。",
         "default": "low"
+      }
+    }
+  },
+  "sticker": {
+    "type": "object",
+    "description": "贴纸库（S3：真实表情图，替代文生图）",
+    "items": {
+      "enabled": {
+        "type": "int",
+        "description": "总开关 0 关闭（全静默）/ 1 开启",
+        "default": 0
+      },
+      "index_path": {
+        "type": "string",
+        "description": "索引路径（空 = <data_dir>/sticker_index.json）",
+        "default": ""
+      },
+      "library_dir": {
+        "type": "string",
+        "description": "贴纸目录（空 = <data_dir>/sticker_library）",
+        "default": ""
+      },
+      "top_k": {
+        "type": "int",
+        "description": "BGE 候选数",
+        "default": 5
+      },
+      "min_score": {
+        "type": "float",
+        "description": "相似度门槛（低于此不发）",
+        "hint": "🔴 须用真实库标定：878 张实测正样本 top1 p05=0.737 / 负样本 max=0.618 → 取 0.68。拍脑袋的 0.45 低于全部负样本，会让任何意图都匹配上某张图。工具：tools/calibrate_sticker_thresholds.py",
+        "default": 0.68
+      },
+      "margin": {
+        "type": "float",
+        "description": "top1-top2 死区（低于此视为并列）",
+        "hint": "实测该指标区分度弱（正样本分差 p25=0.019）—— 只挡完全并列，不要设大。",
+        "default": 0.02
+      },
+      "picker_enabled": {
+        "type": "int",
+        "description": "候选接近时用 LLM 精选（0/1）",
+        "default": 0
+      },
+      "picker_provider_id": {
+        "type": "string",
+        "description": "精选用 provider（空 = 跟随 llm.provider_id）",
+        "default": ""
+      },
+      "picker_timeout_sec": {
+        "type": "float",
+        "description": "精选超时（秒）",
+        "default": 20
+      },
+      "teach": {
+        "type": "int",
+        "description": "是否把 [emote:…] 语法教给模型（0/1）",
+        "hint": "库为空时不该教（写出来也没图可发，白占 token）。",
+        "default": 0
       }
     }
   }
