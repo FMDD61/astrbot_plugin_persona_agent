@@ -93,9 +93,12 @@ class StickerService:
         #   取 0.68：落在负样本 max(0.618) 与正样本 p05(0.737) 之间偏保守侧。
         min_score: float = 0.68,
         # margin（top1-top2 分差）：实测该指标区分度**弱**（正样本分差 p25=0.019、
-        # p50=0.056）—— 同一个表情往往有多张近似图，top2 天然接近。故只保留很窄的
-        # 死区（0.02）用于挡"完全并列"，不靠它做主要判断。
+        # p50=0.056）—— 同一个表情往往有多张近似图，top2 天然接近。
+        # **只在"分数勉强过线"时才有判别意义**；绝对分够高时直接选 top1（见 pick ①）。
         margin: float = 0.02,
+        # 高置信线：≥ 此分直接选 top1、不看分差。取"正样本 p25≈0.796"略降 →
+        # 0.78（实测 0.80+ 的命中被 margin 误拒过）。
+        high_confidence: float = 0.78,
         picker: Optional[Callable[[str, list[StickerHit]], Any]] = None,
     ) -> None:
         self._index_path = Path(index_path)
@@ -104,6 +107,7 @@ class StickerService:
         self._top_k = max(1, int(top_k))
         self._min_score = float(min_score)
         self._margin = float(margin)
+        self._high_confidence = float(high_confidence)
         self._picker = picker
         self._items: list[dict] = []
         self._mtime: float = 0.0
@@ -165,6 +169,7 @@ class StickerService:
             "top_k": self._top_k,
             "min_score": self._min_score,
             "margin": self._margin,
+            "high_confidence": self._high_confidence,
             "picker": bool(self._picker),
             "stats": dict(self.stats),
         }
@@ -213,17 +218,28 @@ class StickerService:
             return PickResult(reason=why)
 
         top = cands[0]
-        near = len(cands) > 1 and (top.score - cands[1].score) < self._margin
+        gap = (top.score - cands[1].score) if len(cands) > 1 else 1.0
+        near = gap < self._margin
 
-        # 高置信：BGE top1 且分差够大 → 直接用，省一次 LLM
-        if top.score >= self._min_score and not near:
+        # ① 绝对分够高 → 直接选 top1，**不看分差**。
+        #    实测教训：`害羞地脸红`(0.80+) 与 `无奈地摇头` 因为 top1-top2 只差
+        #    0.016 被判 ambiguous 而拒发 —— 但高绝对分说明"匹配得很好"，只是库里
+        #    有同义近邻图（害羞类不止一张）。**近邻选哪张都合理**，不该因此不发。
+        #    分差只在"分数勉强过线"时才有判别意义（那时两个候选都不确定）。
+        if top.score >= self._high_confidence:
             self.stats["ok"] += 1
             return PickResult(hit=self._with_path(top), reason="", via="bge",
                               top_k=[{"id": c.id, "score": c.score} for c in cands])
+        # ② 低于门槛 → 拒发（宁可不发，也不发错的）
         if top.score < self._min_score:
             self.stats["below_threshold"] += 1
             return PickResult(reason=f"below_threshold ({top.score:.3f} < {self._min_score})",
                               via="bge",
+                              top_k=[{"id": c.id, "score": c.score} for c in cands])
+        # ③ 门槛内且分差够大 → 直接用
+        if not near:
+            self.stats["ok"] += 1
+            return PickResult(hit=self._with_path(top), reason="", via="bge",
                               top_k=[{"id": c.id, "score": c.score} for c in cands])
 
         # 候选接近 → 可选 LLM 精选
