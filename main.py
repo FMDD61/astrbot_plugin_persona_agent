@@ -93,8 +93,15 @@ class PersonaAgent(Star):
         self._summary: Optional[SummaryService] = None
         self._conflict_detector: Optional[ConflictDetector] = None
         self._generating: dict[str, bool] = {}
-        # A7④: 冲突通知冷却（30min，防刷屏；仅限通知，不影响发言闸）
+        # A7④: 冲突通知冷却（30min，防刷屏；仅限发言闸之外的附加通知）
         self._conflict_notify_ts: float = 0.0
+        # S0: provider 解析缓存 + pipeline 主链路（无 event）落 cache probe 的群号。
+        # ⚠️ 必须在 __init__ 里就存在 —— initialize() 末尾会 create_task 预热，
+        # 而 initialize 后半段才给这两个属性赋值，异步任务可能先跑到（实测
+        # 2026-09-13 启动时报 'PersonaAgent' object has no attribute
+        # '_last_provider_id'）。
+        self._last_provider_id: Optional[str] = None
+        self._probe_group_id: str = ""
 
         self._decision_log_path = self.data_dir / "decision_log.jsonl"
 
@@ -232,9 +239,8 @@ class PersonaAgent(Star):
         self._sleep_end = int(sleep_cfg.get("end_hour", 7))
         diary_cfg = self.config.get("diary", {}) or {}
         self._diary_enabled = int(diary_cfg.get("enabled", 1)) == 1
-        self._last_provider_id: Optional[str] = None
-        # S0: pipeline 主链路（无 event）落 cache probe 用的群号
-        self._probe_group_id: str = ""
+        # _last_provider_id / _probe_group_id 已在 __init__ 里初始化（见那里的
+        # 注释：initialize 末尾的预热任务可能早于本行执行），此处不重复赋值。
         # Test-time sleep override: "awake" / "sleep" / None(window applies);
         # in-memory only, resets on restart.
         self._sleep_override: Optional[str] = None
@@ -1344,27 +1350,51 @@ class PersonaAgent(Star):
             logger.warning(f"[persona_agent] auto-add member failed: {e}")
 
     async def _warm_provider_id(self) -> None:
-        """S0: 启动时预热 provider 解析（cron 任务不再依赖「先有人 @ 过」）。"""
-        try:
-            pid = await self._resolve_provider_id()
+        """S0: 启动时预热 provider 解析（cron 任务不再依赖「先有人 @ 过」）。
+
+        必须**等一下再查**：实测 AstrBot 在插件 ``initialize`` 完成之后才注册
+        provider 实例（插件 15:11:07 加载 → provider 15:11:14.678 进 inst_map）。
+        过早校验会把"还没加载"误判成"配置不存在"（首版即误伤）。
+        故：``verify=False`` + 重试几次；查到就缓存，查不到下轮消息再解析。
+        """
+        last = "unknown"
+        for attempt in range(5):
+            await asyncio.sleep(3.0 if attempt == 0 else 5.0)
+            try:
+                pid = await self._resolve_provider_id(verify=False)
+            except Exception as e:
+                last = f"error: {e}"
+                continue
             if pid:
-                logger.info(f"[persona_agent] provider resolved at startup: {pid}")
-            else:
-                logger.warning("[persona_agent] provider unresolved at startup")
-        except Exception as e:
-            logger.warning(f"[persona_agent] provider warmup failed: {e}")
+                ok = await self._provider_exists(pid)
+                logger.info(
+                    f"[persona_agent] provider resolved at startup: {pid} "
+                    f"(exists={ok}; attempts={attempt + 1})"
+                )
+                return
+            last = "unresolved"
+        logger.warning(f"[persona_agent] provider warmup gave up ({last}); will resolve lazily")
 
     async def _provider_exists(self, provider_id: str) -> Optional[bool]:
         """校验 provider_id 在 AstrBot 里真实存在。
 
-        返回 True/False；**无法判定时返回 None**（当作"未知，放行"）——
-        provider_manager 缺失或接口变动都不该让插件停止工作。
-        这道校验的意义：配置里写错一个 provider id 时，``llm_generate`` 会抛
-        ``ProviderNotFoundError``，被 except 吞成空回复 → **又一个静默哑掉**。
-        S0 的教训就是"失败必须可见"，所以这里宁可多一次查询。
+        返回 True/False；**无法判定时返回 None**（当作"未知，放行"）。
+
+        两个必须区分的情况（2026-09-13 实测踩到）：
+          - **真写错**：id 拼错 → ``llm_generate`` 抛 ``ProviderNotFoundError``
+            被 except 吞成空回复 → 静默哑掉。这是要拦的。
+          - **AstrBot 还没加载完 provider**：实测插件在 ``15:11:07`` 被加载，
+            而 provider 到 ``15:11:14.678`` 才注册进 ``inst_map``。此时查不到
+            **不代表配置错** —— 判成"不存在"会误伤（首版就误伤了）。
+
+        判据：``inst_map`` 为空 = 尚未初始化 → None；不为空再查。
         """
         pm = getattr(self.context, "provider_manager", None)
         if pm is None or not hasattr(pm, "get_provider_by_id"):
+            return None
+        inst_map = getattr(pm, "inst_map", None)
+        if isinstance(inst_map, dict) and not inst_map:
+            # 一条 provider 都还没注册 → 处于启动早期，无从判断
             return None
         try:
             prov = await pm.get_provider_by_id(provider_id)
@@ -1373,7 +1403,9 @@ class PersonaAgent(Star):
             return None
         return prov is not None
 
-    async def _resolve_provider_id(self, umo: Optional[str] = None) -> Optional[str]:
+    async def _resolve_provider_id(
+        self, umo: Optional[str] = None, *, verify: bool = True
+    ) -> Optional[str]:
         """单一 provider 解析收口（S0）。
 
         此前四处各自读 ``llm.provider_id or self._last_provider_id``，而后者
@@ -1384,32 +1416,33 @@ class PersonaAgent(Star):
         成功解析后缓存到 ``_last_provider_id``，使 cron/异步任务不再依赖
         「先有人触发过一轮回复」。
 
-        S0 加固：配置值**先校验存在性**。写错 id 时回退到 AstrBot 当前会话
-        provider 并告警 —— 否则 ``llm_generate`` 抛 ``ProviderNotFoundError``
-        被吞成空回复，又是一个"看起来正常其实全哑"的坑。
+        S0 加固：``verify=True`` 时**先校验配置值存在性**（写错 id 会静默哑掉）；
+        启动预热传 ``verify=False`` —— 那时 provider 可能还没注册完，
+        校验只会误判（见 ``_provider_exists`` 的三个返回值）。
         """
         cfg_pid = (self.config.get("llm") or {}).get("provider_id", "") or ""
         exists: Optional[bool] = None
-        if cfg_pid:
+        if cfg_pid and verify:
             exists = await self._provider_exists(cfg_pid)
             if exists is False:
                 logger.warning(
                     f"[persona_agent] configured llm.provider_id={cfg_pid!r} "
                     "NOT found in AstrBot; falling back to session provider"
                 )
+        # 需要回退时才去问 AstrBot 的会话默认 provider（一次异步查询）
         session_default = None
-        if not cfg_pid or exists is False:
-            if not self._last_provider_id:
-                try:
-                    session_default = await self.context.get_current_chat_provider_id(umo or "")
-                except Exception as e:
-                    logger.debug(f"[persona_agent] provider resolve failed: {e}")
-                    session_default = None
+        need_fallback = (not cfg_pid) or (exists is False)
+        if need_fallback and not self._last_provider_id:
+            try:
+                session_default = await self.context.get_current_chat_provider_id(umo or "")
+            except Exception as e:
+                logger.debug(f"[persona_agent] provider resolve failed: {e}")
+                session_default = None
         pid = resolve_provider_id(
             configured=cfg_pid,
             known=self._last_provider_id,
             session_default=session_default,
-            configured_exists=exists,
+            configured_exists=exists if verify else None,
         )
         if pid:
             self._last_provider_id = pid
