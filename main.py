@@ -102,6 +102,9 @@ class PersonaAgent(Star):
         # '_last_provider_id'）。
         self._last_provider_id: Optional[str] = None
         self._probe_group_id: str = ""
+        # S2: 「现在要回应的」块所需的逐轮状态
+        self._pipeline_has_turn_block: bool = False
+        self._turn_block_emotion = None
 
         self._decision_log_path = self.data_dir / "decision_log.jsonl"
 
@@ -320,6 +323,13 @@ class PersonaAgent(Star):
 
     async def terminate(self) -> None:
         logger.info("[persona_agent] terminating")
+        # S2: 落盘任何挂起的会话条目（进程退出前的兜底）
+        if self._pipeline is not None and self.session_mgr is not None:
+            try:
+                for gid in list(getattr(self._pipeline, "_pending_append", {}) or {}):
+                    self._pipeline.flush_session_append(gid)
+            except Exception as e:
+                logger.warning(f"[persona_agent] pending session flush failed: {e}")
         if self.session_mgr is not None:
             try:
                 self.session_mgr.save_all()
@@ -355,12 +365,17 @@ class PersonaAgent(Star):
             examples_block=self._examples_block,
             postprocess=self._postprocess_plain,
             temperature_for=self._temperature_for,
+            turn_block=self._build_turn_block,
+            session_append=self._session_append,
             rag_k=int(rag_cfg.get("k_retrieve", 8)),
             rag_top_n=int(rag_cfg.get("top_n_final", 3)),
             gate_recent_n=int(gate_cfg.get("recent_n", 15)),
             debounce_sec=0.5,
             rag_enabled=int(rag_cfg.get("enabled", 1)) == 1,
         )
+        # S2: 标记 turn_block 已接线 —— _generate_reply 据此不再重复追加
+        # 说话人行与 volatile 行（它们已并入同一块）
+        self._pipeline_has_turn_block = True
 
     def _is_target_group(self, event: AstrMessageEvent) -> bool:
         gid = event.get_group_id()
@@ -644,17 +659,27 @@ class PersonaAgent(Star):
             # G9: unknown caller -> append a 'new' member entry (async, safe)
             sender_name = str(event.get_sender_name() or "")
             asyncio.create_task(asyncio.to_thread(self._auto_add_member, str(sender_uin), sender_name))
-        # B-001: message_id 随条目入 session —— 使 ``[r:-N]`` 的编号基与
-        # 「真正进 session 的消息」逐条对齐（此前 session 无 id，解析只能对
-        # 实时 buffer 求值，而 buffer 含被媒体过滤掉的纯图消息 → 双错位）。
-        self.session_mgr.append(
-            group_id,
-            "user",
-            text,
-            name=alias,
-            message_id=str(getattr(event.message_obj, "message_id", "") or ""),
-            sender_uin=str(sender_uin or ""),
-        )
+        # S2: 本条**推迟**入会话 —— 由 pipeline 在硬闸决策后、任何 early
+        # return 之前落盘。三个理由：
+        #   ① LLM 上下文与引用编号基都必须在"本条尚未入会话"的状态下构建，
+        #      否则当前消息会被说两遍（session 一次 + 「现在要回应的」块一次）；
+        #   ② 静默/睡眠的消息仍必须记录（v3 设计意图），交给 pipeline 统一保证；
+        #   ③ `_generating` 早退（同群正在生成）时本条会**留到下一轮一起落盘**，
+        #      比旧行为（直接丢弃）更完整。
+        # 元数据（message_id / sender_uin）随条目落盘 —— B-001 的编号基对齐
+        # 依赖它（此前 session 无 id，解析只能对实时 buffer 求值 → 双错位）。
+        _mid = str(getattr(event.message_obj, "message_id", "") or "")
+        if self._pipeline is not None:
+            self._pipeline.defer_session_append(
+                group_id, text, name=alias, message_id=_mid,
+                sender_uin=str(sender_uin or ""),
+            )
+        else:
+            # 兜底：pipeline 未就绪时直接写（保持旧行为）
+            self.session_mgr.append(
+                group_id, "user", text, name=alias,
+                message_id=_mid, sender_uin=str(sender_uin or ""),
+            )
 
         # v3: sleep window — bot stays silent (mimics human rest) but the
         # message has already joined the session/memory for the new day.
@@ -1077,6 +1102,57 @@ class PersonaAgent(Star):
 
     # ----------------------------------------------------------------- LLM
 
+    def _session_append(
+        self, group_id: str, text: str, name: str, message_id: str, sender_uin: str
+    ) -> None:
+        """S2: pipeline 在决策后回调此处，把本条写入会话。
+
+        签名固定为位置参数（pipeline 不感知 SessionManager 的 kwargs）。
+        """
+        self.session_mgr.append(
+            group_id, "user", text, name=name or None,
+            message_id=message_id or "", sender_uin=sender_uin or "",
+        )
+
+    def _build_turn_block(self, turn_lines: list[str], ctx: dict) -> str:
+        """S2：构造「现在要回应的」块（pipeline 的 turn_block 回调）。
+
+        拼成**一条** system 消息，让模型一眼看到"该回哪句、对谁、什么状态"：
+
+            【现在要回应的】本条消息 @ 了你，通常应当回应。
+            发话人：焦糖(337934842)
+            焦糖：daishuki！
+            ［图片］一只橘猫趴在键盘上，表情嫌弃
+            【当下】现在本地时间 16 时。当前心情：轻松调侃
+
+        设计依据（实测）：
+          - 决策窗口 96 条的文本 **59% 已在 session 里** → 不再重复注入窗口，
+            改为把"当前这一轮"显式抬出来（零新增内容，只是重新划界）
+          - 图片/表情描述此前拼在正文里（`"daishuki！ （配图：一只猫）"`），
+            RP 分不清"用户说的"与"系统给的"；现拆成 `［图片］` 行 ——
+            语义上等价于模型自己看图（dsh read_image 的直投性质）
+          - 时间/心情并进同一块，易变量仍集中在上下文末尾（缓存序不变）
+        """
+        uin = str(ctx.get("sender_uin") or "")
+        alias = ctx.get("sender_alias") or (f"群友{uin}" if uin else "群友")
+        head = "【现在要回应的】"
+        if ctx.get("is_at"):
+            head += "本条消息 @ 了你，通常应当回应。"
+        # 只写别名：QQ 号对"怎么回这句话"没有帮助（别名已是唯一标识），
+        # 且与下一行的「别名：内容」重复，白占 token。
+        lines = [head, f"发话人：{alias}"]
+        lines.extend(turn_lines)
+        # 情绪由 _pipeline_generate 在调用生成前写入（pipeline 的 turn_block
+        # 回调签名只带 turn_lines/ctx，情绪在 generate 回调那侧拿得到）
+        mood = getattr(self._turn_block_emotion, "current_mood", "") or ""
+        vol = (
+            self.style.volatile_line(local_hour=self._local_hour(), mood=mood)
+            if self.style else ""
+        )
+        if vol:
+            lines.append("【当下】" + vol.replace("\n", " "))
+        return "\n".join(lines)
+
     async def _generate_reply(
         self,
         event: AstrMessageEvent,
@@ -1096,9 +1172,6 @@ class PersonaAgent(Star):
         local_hour = self._local_hour()
         sys_prompt = self.style.system_prompt() if self.style else ""
 
-        # Dynamic current-speaker hint (2026-08-23 fix): inserted BEFORE the
-        # KG tail (KG stays the last message -> cache prefix untouched; line is
-        # per-speaker constant so it is stable across consecutive messages).
         if speaker_uin is None:
             speaker_uin = str(event.get_sender_id() or "")
         alias_txt = ""
@@ -1109,29 +1182,35 @@ class PersonaAgent(Star):
                 alias_txt = ""
         if not alias_txt:
             alias_txt = f"群友{speaker_uin}"
-        is_src = bool(self.style_source_qq) and speaker_uin == str(self.style_source_qq)
-        speaker_line = (
-            f"【当前说话人】与本消息对应的发话人：QQ {speaker_uin}，群内别名「{alias_txt}」"
-            f"{'（风格源 QQ）' if is_src else ''}。"
-            "请始终用该别名称呼 TA；无法确认时不要臆造其他群友的别名。"
-        )
-        if contexts and isinstance(contexts[-1], dict) and contexts[-1].get("role") == "system":
-            contexts.insert(-1, {"role": "system", "content": speaker_line})
-        else:
-            contexts.append({"role": "system", "content": speaker_line})
 
-        # 逐轮易变信息（时间 + 心情）—— 放在**上下文末尾**，不再拼进 system
-        # prompt。system prompt 是请求的第一个 token 位置，它一变后面整段会话
-        # 前缀全部 miss（原设计每小时废一次全量缓存；心情有值时 30s 一次）。
-        # 位置：speaker_line 之后、KG 尾注之前 —— 与既有「稳定在上、易变在下」
-        # 的顺序一致，且 KG 尾注仍是最后一条。
         mood = emotion.current_mood if emotion else ""
-        vol = self.style.volatile_line(local_hour=local_hour, mood=mood) if self.style else ""
-        if vol:
+        if self._pipeline_has_turn_block:
+            # S2：说话人 / 本条内容 / 图片 / 时间 / 心情 全部由 pipeline 的
+            # `_build_turn_block` 拼成**一条**「现在要回应的」消息 ——
+            # 模型的注意力集中在一处，而不是散在三条独立 system 消息里。
+            # 这里不重复追加。
+            pass
+        else:
+            # 旧调用路径（离线测试台 / 未接线）：保持原行为
+            is_src = bool(self.style_source_qq) and speaker_uin == str(self.style_source_qq)
+            speaker_line = (
+                f"【当前说话人】与本消息对应的发话人：QQ {speaker_uin}，群内别名「{alias_txt}」"
+                f"{'（风格源 QQ）' if is_src else ''}。"
+                "请始终用该别名称呼 TA；无法确认时不要臆造其他群友的别名。"
+            )
             if contexts and isinstance(contexts[-1], dict) and contexts[-1].get("role") == "system":
-                contexts.insert(-1, {"role": "system", "content": vol})
+                contexts.insert(-1, {"role": "system", "content": speaker_line})
             else:
-                contexts.append({"role": "system", "content": vol})
+                contexts.append({"role": "system", "content": speaker_line})
+            # 逐轮易变信息（时间 + 心情）—— 放在**上下文末尾**，不再拼进 system
+            # prompt。system prompt 是请求的第一个 token 位置，它一变后面整段
+            # 会话前缀全部 miss（原设计每小时废一次全量缓存；心情有值时 30s 一次）。
+            vol = self.style.volatile_line(local_hour=local_hour, mood=mood) if self.style else ""
+            if vol:
+                if contexts and isinstance(contexts[-1], dict) and contexts[-1].get("role") == "system":
+                    contexts.insert(-1, {"role": "system", "content": vol})
+                else:
+                    contexts.append({"role": "system", "content": vol})
 
         provider_id = await self._resolve_provider_id(
             umo if umo is not None else event.unified_msg_origin
@@ -1207,6 +1286,8 @@ class PersonaAgent(Star):
         if self.style is None:
             return ""
         self._probe_group_id = self._group_id_from_umo(umo)
+        # S2: 让 _build_turn_block 拿到本轮情绪（回调签名不带 emotion）
+        self._turn_block_emotion = emotion
         try:
             return await self._generate_reply(
                 None,  # type: ignore[arg-type]  # standalone mode

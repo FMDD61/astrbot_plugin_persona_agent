@@ -76,8 +76,8 @@
       "score_threshold": {
         "type": "float",
         "description": "主动插话的 RAG 分数门槛",
-        "hint": "分数低于此值不主动插话。0.40 较吵，0.65 较安静。",
-        "default": 0.55
+        "hint": "⚠️ 这不是'该不该回'的判断，而是**Gate 调用量的音量阀**（Gate 单次 4.8s）。实测非 @ 消息 RAG top1 分布：p50=0.652 / p75=0.687 / p90=0.714，旧值 0.65 正好压在中位数上（放行 51.7%）。0.60 放行 ~74%。真正的语义判断交给 Gate LLM。",
+        "default": 0.6
       },
       "max_example_chars": {
         "type": "int",
@@ -93,7 +93,8 @@
       "min_gap_sec": {
         "type": "int",
         "description": "任意两次发言最小间隔（秒）",
-        "default": 25
+        "default": 20,
+        "hint": "任意两次发言的最小间隔 —— 这是**真实输出的硬天花板**（20s → 理论 ≤4320 条/天，实际远低于此）。旧值 25s 是 S2 前拍的值；2026-09-13 调整为 20s 配合 Gate 决策。"
       },
       "at_cooldown_sec": {
         "type": "int",
