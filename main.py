@@ -47,7 +47,7 @@ from .services.interjection import (
 )
 from .services.topic_bank import TopicBank
 from .services.summary import SummaryService, build_prompt, append_summary
-from .services.json_store import JsonStore
+from .services.json_store import JsonStore, find_jsonl_record
 from .services.context_buffer import ContextBuffer
 from .services.session_manager import SessionManager
 from .services.kg_provider import KGProvider, MultiSignalKGProvider
@@ -2005,6 +2005,18 @@ class PersonaAgent(Star):
                 "n_messages": len(msgs),
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
+            # 🔴 幂等（2026-09-14 实测事故）：用户在夜间反复重启，**新旧实例交叠**
+            # 时同一 cron 被两个进程各跑一次 → 同一天日记写了 2–3 条。
+            # 内存标记跨不了进程，判据必须落在**文件**上。
+            diary_path = self.store.path(f"logs/{group_id}/daily_diary.jsonl")
+            dup = find_jsonl_record(diary_path, {"day": record["day"], "group_id": group_id})
+            if dup is not None:
+                logger.warning(
+                    f"[persona_agent] diary 幂等拦截：{record['day']} 已存在"
+                    f"（{len(dup.get('summary') or '')} 字符），本次丢弃"
+                    f"（多为多实例/重复 cron 触发）"
+                )
+                return
             self.store.append_jsonl(f"logs/{group_id}/daily_diary.jsonl", record)
             logger.info(f"[persona_agent] diary written: day={record['day']} n={len(msgs)}")
         except Exception as e:
@@ -2063,8 +2075,21 @@ class PersonaAgent(Star):
             if not text or self._is_error_response(text):
                 logger.warning(f"[persona_agent] {kind} summary empty/error, skipped")
                 continue
+            # 🔴 幂等（同上）：实测 `weekly_summary.jsonl` 出现 2 条 2026-W37
+            # → 用户私聊**收到两份周报**。同周期已存在则丢弃本次。
+            out_path = self._summary.output_path(kind)
+            existing = find_jsonl_record(
+                out_path, {"kind": kind, "group_id": gid, "period": collected["label"]}
+            )
+            if existing is not None:
+                logger.warning(
+                    f"[persona_agent] {kind} 幂等拦截：{collected['label']} 已存在"
+                    f"（{len(existing.get('summary') or '')} 字符）→ 本次丢弃，"
+                    f"**不重复推送**（多为多实例/重复 cron 触发）"
+                )
+                continue
             record = append_summary(
-                self._summary.output_path(kind),
+                out_path,
                 kind,
                 gid,
                 collected["label"],

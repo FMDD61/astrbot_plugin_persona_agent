@@ -25,6 +25,42 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+def find_jsonl_record(path: Path, match: dict, *, tail_lines: int = 500) -> Optional[dict]:
+    """在 JSONL 文件里找 ``match`` 全部键值相等的记录（幂等去重，跨进程有效）。
+
+    ## 为什么必须有（2026-09-14 实测事故）
+
+    用户在 09-13 夜间反复重启 AstrBot（02:01–02:17 注册了 6 次），**新旧实例交叠**
+    期间同一个 02:05 日旋转 cron 被两个进程各执行一次 →
+    - `weekly_summary.jsonl` 出现 **2 条 2026-W37** → 用户私聊收到**两份周报**
+    - `logs/<gid>/daily_diary.jsonl` 出现 2–3 条同一天日记
+
+    教训：**内存去重（`self._xxx_done` 标记）跨不了进程** —— 多实例场景下两个
+    进程各自"第一次"执行。幂等判据必须落在**文件**上，读回已有记录做比对。
+
+    `tail_lines` 限制读取量：日志文件会长到几千行，但重复记录必然出现在尾部
+    （同一天/同一周期的记录是刚写的）。
+    """
+    try:
+        if not path.exists():
+            return None
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    for line in reversed(lines[-tail_lines:]):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict) and all(rec.get(k) == v for k, v in match.items()):
+            return rec
+    return None
+
+
 class JsonStore:
     def __init__(self, data_dir: str | os.PathLike) -> None:
         self._dir = Path(data_dir)
@@ -37,6 +73,14 @@ class JsonStore:
         return self._dir / name
 
     # ---- read ----
+    def path(self, name: str) -> Path:
+        """公开的路径解析（`_path` 的对外形式）。
+
+        存在的理由：调用方需要把路径交给 `find_jsonl_record()` 做**文件级幂等**
+        检查。没有它就只能用私有 `_path`（跨模块用私有名是坏味道，且改名即炸）。
+        """
+        return self._path(name)
+
     def load_json(self, name: str, default: Optional[dict] = None) -> dict:
         path = self._path(name)
         if not path.exists():
