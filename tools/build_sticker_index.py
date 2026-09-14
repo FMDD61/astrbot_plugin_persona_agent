@@ -48,10 +48,21 @@ DEFAULT_MODEL = "BAAI/bge-base-zh-v1.5"
 DESC_MAX_EDGE = 768
 DESC_JPEG_QUALITY = 82
 
+# 动图（GIF）整图直送的上限。**不要只取第一帧** —— 实测（用户反馈 +
+# 对比实验）：很多 GIF 靠动态动作才能体现含义，首帧会把"疯狂摇头撞桌"
+# 描述成"张嘴"。整图直送实测样例：
+#   347帧/2.4MB → "双手提起裙摆，身体轻微左右摇摆…机械呆萌"（首帧只能给"微微晃动"）
+#   196帧/496KB → "来回推带轮小车…摆烂打工"（首帧偏静态细节）
+# ⚠️ 但整图很贵：1.9MB/109帧 实测 **52s 且空返回**；496KB 约 9s。
+# 所以设体积闸门，超限回退首帧（宁愿描述静态，也不要一条描述都没有）。
+GIF_INLINE_MAX_BYTES = 1_500_000
+GIF_INLINE_TIMEOUT = 180.0
+
 # 视觉描述提示词：与 services/vision.py 同源（表情包要说明情绪与梗）
 VISION_SYS = (
     "用中文简要描述这张图片中确定可见的内容，不超过80字；"
     "如是表情包说明其情绪和梗，并给出 2-4 个适合检索的情绪/动作关键词。"
+    "**如果是动图，重点说明它在动什么（动作过程）**，不要只描述静帧细节。"
     "不要猜测人物身份、不要脑补图中没有的内容；看不清就说看不清。"
 )
 
@@ -94,21 +105,41 @@ def scan_images(library_dir: Path) -> tuple[list[dict], list[str]]:
 
 # ---------------------------------------------------------------- 描述（可选）
 
+def is_animated(path: str) -> int:
+    """返回帧数（>1 即动图）。打不开返回 0。"""
+    try:
+        from PIL import Image  # type: ignore
+        with Image.open(path) as im:
+            return int(getattr(im, "n_frames", 1) or 1)
+    except Exception:
+        return 0
+
+
 def prepare_for_vision(path: str, max_edge: int = DESC_MAX_EDGE) -> tuple[bytes, str]:
-    """把原图压成适合送视觉模型的小图。返回 ``(bytes, mime)``。
+    """把原图压成适合送视觉模型的载荷。返回 ``(bytes, mime)``。
+
+    **动图（多帧 GIF）且体积 ≤ ``GIF_INLINE_MAX_BYTES`` → 整图直送**，让模型
+    看到真实动作；否则降采样取第一帧。理由见 ``GIF_INLINE_MAX_BYTES`` 的注释
+    （实测：首帧会把"疯狂摇头撞桌"描述成"张嘴"；但 1.9MB 整图会 52s 空返回）。
 
     - 长边 > ``max_edge`` 才缩放（小图不动，避免无谓重编码损失）
-    - gif 只取第一帧（表情包动图的第一帧通常已含全部语义；也让体积可控）
-    - 任何一步失败 → **回退成原图**（宁可慢，也不要因为预处理失败而丢掉描述）
+    - 任何一步失败 → **回退成原图**（宁可慢，也不要因预处理失败而丢掉描述）
     """
     try:
         from PIL import Image  # type: ignore
         import io
     except ImportError:
         return Path(path).read_bytes(), _mime_of(path)
+    # 动图 fast path：整图直送
+    try:
+        size = Path(path).stat().st_size
+        if size <= GIF_INLINE_MAX_BYTES and is_animated(path) > 1:
+            return Path(path).read_bytes(), "image/gif"
+    except OSError:
+        pass
     try:
         with Image.open(path) as im:
-            im.seek(0)                      # gif 取第一帧
+            im.seek(0)                      # 静态图/超限动图 → 首帧
             im = im.convert("RGB")
             w, h = im.size
             if max(w, h) > max_edge:
@@ -422,7 +453,7 @@ def retry_missing(items: list[dict], *, library_dir: Path, api_base: str, api_ke
         for i, it in enumerate(todo, 1):
             try:
                 d = _describe_one(str(library_dir / it["file"]),
-                                  api_base, api_key, model, 90.0)
+                                  api_base, api_key, model, GIF_INLINE_TIMEOUT)
                 if d:
                     it["desc"] = d
                     ok += 1
