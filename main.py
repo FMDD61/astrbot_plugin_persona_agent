@@ -60,6 +60,7 @@ from .services import protocol_compat
 from .services.examples import load_examples_block, ExamplesState
 from .services.memory_store import MemoryStore, MemoryEvent
 from .services.dream_job import DreamJob
+from .services.dream import DreamMaker, persist_dream
 from .services.conflict_detector import ConflictDetector
 
 class PersonaAgent(Star):
@@ -216,6 +217,10 @@ class PersonaAgent(Star):
             pass
 
         self._dream_job = DreamJob(self._memory_store, str(self.data_dir))
+        # S11: 做梦（与"熟悉度汇报"无关的那部分；原 DreamJob.run 不再挂 cron）
+        self._dream_maker = DreamMaker(str(self.data_dir),
+                                       anchor_fn=self._dream_anchor_llm,
+                                       dream_fn=self._dream_llm)
 
         dream_cfg = self.config.get("dream", {}) or {}
         if int(dream_cfg.get("enabled", 0)) == 1:
@@ -223,7 +228,8 @@ class PersonaAgent(Star):
                 await self.context.cron_manager.add_basic_job(
                     name="persona_dream_job",
                     cron_expression="0 3 * * 1",
-                    handler=self._dream_job.run,
+                    # ⚠️ 不挂 DreamJob.run（它只写文件、从不推送）—— 挂 runner
+                    handler=self._dream_job_runner,
                     description="Weekly persona style drift report via MemoryStore analysis",
                     timezone="Asia/Shanghai",
                     enabled=True,
@@ -1932,6 +1938,46 @@ class PersonaAgent(Star):
         )
         return (getattr(resp, "completion_text", "") or "").strip()
 
+    async def _dream_anchor_llm(self, system_prompt: str, prompt: str) -> str:
+        """做梦阶段①：锚点抽取（**低温**，结构化任务）。"""
+        provider = await self._resolve_provider_id()
+        if not provider:
+            raise RuntimeError("no LLM provider available for dream anchor")
+        dcfg = self.config.get("dream", {}) or {}
+        _rv = reasoning_value(dcfg.get("reasoning_effort", "low"))
+        resp = await self.context.llm_generate(
+            chat_provider_id=provider,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            temperature=float(dcfg.get("anchor_temperature", 0.3)),
+            **({"reasoning_effort": _rv} if _rv else {}),
+        )
+        return (getattr(resp, "completion_text", "") or "").strip()
+
+    async def _dream_llm(self, system_prompt: str, prompt: str) -> str:
+        """做梦阶段②：写梦境（**温度 1.3**、思考 low —— 用户 2026-09-14 指定）。
+
+        为什么温度这么高：用户要的是"逻辑较为跳跃的梦境语段"，而梦里不该有
+        现实的因果链条。温度低会把梦写成日记的摘要。
+
+        ⚠️ `max_tokens` 给足：400–700 字的正文 + low 档思考，512 会截断
+        （识图那边就是被这个坑过，见 B-019）。
+        """
+        provider = await self._resolve_provider_id()
+        if not provider:
+            raise RuntimeError("no LLM provider available for dream")
+        dcfg = self.config.get("dream", {}) or {}
+        _rv = reasoning_value(dcfg.get("reasoning_effort", "low"))
+        resp = await self.context.llm_generate(
+            chat_provider_id=provider,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            temperature=float(dcfg.get("temperature", 1.3)),
+            max_tokens=int(dcfg.get("max_tokens", 2048)),
+            **({"reasoning_effort": _rv} if _rv else {}),
+        )
+        return (getattr(resp, "completion_text", "") or "").strip()
+
     async def _gate_llm(
         self, prompt: Optional[str] = None, *, messages=None, system_prompt: Optional[str] = None
     ) -> str:
@@ -2218,6 +2264,63 @@ class PersonaAgent(Star):
     async def _monthly_summary_job(self) -> None:
         """Cron: 1st 02:15 — monthly pyramid summary over daily diaries."""
         await self._period_summary("monthly")
+
+    async def _dream_job_runner(self) -> None:
+        """做梦 cron 的**真正入口**：生成 → 落盘 → **推送**。
+
+        🔴 修一个"从来没推送过"的缺陷（用户 2026-09-14："上周我没收到做梦内容"）：
+        原实现把 `self._dream_job.run` 直接挂给 cron，而 `DreamJob.run()` **只写
+        `style_drift_report.json`、从不推送** —— 所以做梦内容一直没到过用户手上
+        （周报/月报有推送，做梦没有）。
+
+        本 runner 负责（S11）：
+          1. 从最近 7 个不同 day 的日记（不足按实际）**做梦**
+          2. 落 `logs/<gid>/dreams.jsonl`（长期留存 + 供 LLM 消费）
+          3. **推送到 dream_binding 的会话**
+        另：旧 DreamJob 的"关系变更建议/话题趋势"**不再由做梦承担**
+        （用户："DreamJob 是做梦，不应该负责处理熟悉度汇报相关内容"）——
+        这里只在日志里记一行，不再作为做梦产物。
+        """
+        groups = [self.target_group_id] if self.test_mode == 0 else [self.test_group_id]
+        for gid in groups:
+            if not gid:
+                continue
+            try:
+                res = await self._dream_maker.make(gid)
+            except Exception as e:
+                logger.warning(f"[persona_agent] dream failed: {type(e).__name__}: {e}")
+                continue
+            if not res.text:
+                logger.info(
+                    f"[persona_agent] dream skipped: {res.stats.get('error') or 'empty'}"
+                    f" (diaries={res.diaries_used})"
+                )
+                continue
+            try:
+                persist_dream(self.data_dir, gid, res)
+            except Exception as e:
+                logger.warning(f"[persona_agent] dream persist failed: {e}")
+            logger.info(
+                f"[persona_agent] dream written: days={len(res.days)} "
+                f"diaries={res.diaries_used} fragments={res.fragments_used} "
+                f"dropped={res.dropped_ratio:.0%} chars={len(res.text)}"
+            )
+            await self._push_dream(res)
+
+    async def _push_dream(self, res) -> None:
+        """把梦推送到绑定会话（失败只 warning）。"""
+        try:
+            binding = self.store.load_json("dream_binding.json", {}) or {}
+            umo = binding.get("unified_msg_origin")
+            if not umo:
+                logger.info("[persona_agent] dream 未推送：dream_binding 无 unified_msg_origin")
+                return
+            head = f"【{res.days[0]} ~ {res.days[-1]} 的梦】" if res.days else "【梦】"
+            chain = MessageChain().message(f"{head}\n\n{res.text}")
+            await self.context.send_message(umo, chain)
+            logger.info(f"[persona_agent] dream pushed to {umo}")
+        except Exception as e:
+            logger.warning(f"[persona_agent] dream push failed: {e}")
 
     async def _period_summary(self, kind: str) -> None:
         """G13: collect diaries + sampled raw messages -> LLM summary ->
