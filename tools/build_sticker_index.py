@@ -59,11 +59,21 @@ GIF_INLINE_MAX_BYTES = 1_500_000
 GIF_INLINE_TIMEOUT = 180.0
 
 # 视觉描述提示词：与 services/vision.py 同源（表情包要说明情绪与梗）
+# 🔴 S6 标定（2026-09-14，956 次实测）：**约定固定返回格式是唯一主导因素**。
+# 自由文本 prompt 下模型把预算花在"输出格式谈判"上，`finish_reason` 191/191
+# 全是 `length`、`reasoning_tokens ≈ max_tokens`，正文一个字都没轮到 →
+# 描述可用率仅 31.2%。约定 JSON schema 后 reasoning 从顶格降到 p50≈150，
+# 可用率 **100%**（n=144，0 截断）。温度不是因素（JSON 下 0.0/0.3/0.7 均 100%），
+# 取 0.0 求可复现；`reasoning_effort` **必须显式发 low**（不发更糟：p95 10.0s vs 5.9s）。
 VISION_SYS = (
-    "用中文简要描述这张图片中确定可见的内容，不超过80字；"
-    "如是表情包说明其情绪和梗，并给出 2-4 个适合检索的情绪/动作关键词。"
-    "**如果是动图，重点说明它在动什么（动作过程）**，不要只描述静帧细节。"
-    "不要猜测人物身份、不要脑补图中没有的内容；看不清就说看不清。"
+    "你是图片标注器。看图片，只输出**一个 JSON 对象**，不要任何解释、不要 markdown 代码块。"
+    '格式固定为：{"desc": "图片描述", "tags": ["关键词1", "关键词2"]}\n'
+    "字段约束：\n"
+    '- "desc"：中文字符串，只描述图中**确定可见**的内容，长度 8-80 字，一句话写完，不加换行；'
+    "若是表情包，在句中点明情绪（如委屈/无语/嘲讽）与可能的梗；不确定的不要写。"
+    "**如果是动图，重点说明它在动什么（动作过程）**，不要只描述静帧细节。\n"
+    '- "tags"：2-4 个中文字符串，每个 2-6 字，是可用于检索的情绪/动作关键词（如「无语」「抱头」「流泪」）。\n'
+    "不要猜测人物身份、不要脑补图中没有的内容；看不清就在 desc 里写「画面模糊，看不清」。"
 )
 
 
@@ -115,48 +125,21 @@ def is_animated(path: str) -> int:
         return 0
 
 
-def prepare_for_vision(path: str, max_edge: int = DESC_MAX_EDGE) -> tuple[bytes, str]:
-    """把原图压成适合送视觉模型的载荷。返回 ``(bytes, mime)``。
-
-    **动图（多帧 GIF）且体积 ≤ ``GIF_INLINE_MAX_BYTES`` → 整图直送**，让模型
-    看到真实动作；否则降采样取第一帧。理由见 ``GIF_INLINE_MAX_BYTES`` 的注释
-    （实测：首帧会把"疯狂摇头撞桌"描述成"张嘴"；但 1.9MB 整图会 52s 空返回）。
-
-    - 长边 > ``max_edge`` 才缩放（小图不动，避免无谓重编码损失）
-    - 任何一步失败 → **回退成原图**（宁可慢，也不要因预处理失败而丢掉描述）
-    """
-    try:
-        from PIL import Image  # type: ignore
-        import io
-    except ImportError:
-        return Path(path).read_bytes(), _mime_of(path)
-    # 动图 fast path：整图直送
-    try:
-        size = Path(path).stat().st_size
-        if size <= GIF_INLINE_MAX_BYTES and is_animated(path) > 1:
-            return Path(path).read_bytes(), "image/gif"
-    except OSError:
-        pass
-    try:
-        with Image.open(path) as im:
-            im.seek(0)                      # 静态图/超限动图 → 首帧
-            im = im.convert("RGB")
-            w, h = im.size
-            if max(w, h) > max_edge:
-                scale = max_edge / float(max(w, h))
-                im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))),
-                               Image.LANCZOS)
-            buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=DESC_JPEG_QUALITY, optimize=True)
-            return buf.getvalue(), "image/jpeg"
-    except Exception:
-        return Path(path).read_bytes(), _mime_of(path)
+# 图像预处理（降采样/动图整图直送）与线上识图**共用**同一份实现，
+# 避免"离线一套、线上一套"漂移（实测不降采样会让同一张图的时延从 4.0s 涨到 29.6s）。
+from services.image_prep import (  # noqa: E402
+    DESC_MAX_EDGE,
+    GIF_INLINE_MAX_BYTES,
+    frame_count,
+    mime_of as _mime_of,
+    prepare_for_vision,
+)
 
 
-def _mime_of(path: str) -> str:
-    ext = Path(path).suffix.lower().lstrip(".")
-    return {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-            "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/png")
+def _parse_json(resp: dict) -> tuple[str, list[str]]:
+    """从响应取 ``(desc, tags)`` —— 与线上 `services.vision.parse_vision_json` 同语义。"""
+    from services.vision import parse_vision_json
+    return parse_vision_json(resp)
 
 
 def _clean_env(v: str) -> str:
@@ -183,8 +166,9 @@ def _validate_base(api_base: str) -> str:
     return b
 
 
-def _describe_one(path: str, api_base: str, api_key: str, model: str, timeout: float) -> str:
-    """调视觉模型描述一张图。失败返回空串（调用方决定是否中止）。"""
+def _describe_one(path: str, api_base: str, api_key: str, model: str,
+                  timeout: float) -> tuple[str, list[str]]:
+    """调视觉模型描述一张图。返回 ``(desc, tags)``；失败返回 ``("", [])``。"""
     import httpx
 
     data, mime = prepare_for_vision(path)
@@ -198,7 +182,7 @@ def _describe_one(path: str, api_base: str, api_key: str, model: str, timeout: f
                 {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
             ]},
         ],
-        "max_tokens": 512, "temperature": 0.3, "reasoning_effort": "low",
+        "max_tokens": 2048, "temperature": 0.0, "reasoning_effort": "low",
     }
     # ⚠️ trust_env=False 是必需的：开发机 `no_proxy` 里含 `[::1]`，而 httpx 会把
     # no_proxy 的每个条目当 URL pattern 解析 → `InvalidURL: Invalid port: ':1]'`，
@@ -209,7 +193,10 @@ def _describe_one(path: str, api_base: str, api_key: str, model: str, timeout: f
                    headers={"Authorization": f"Bearer {_clean_env(api_key)}"}, json=payload)
         r.raise_for_status()
         d = r.json()
-    return extract_text(d)
+    desc, tags = _parse_json(d)
+    if desc:
+        return desc, tags
+    return extract_text(d), []
 
 
 def extract_text(resp: dict) -> str:
@@ -280,7 +267,10 @@ def describe_all(items: list[dict], *, library_dir: Path, api_base: str, api_key
         for fut in cf.as_completed(futs):
             it = futs[fut]
             try:
-                it["desc"] = fut.result()
+                _d, _t = fut.result()
+                it["desc"] = _d
+                if _t:
+                    it["tags"] = _t          # 模型给的结构化关键词优先于正则抽取
             except Exception as e:
                 it["desc"] = ""
                 print(f"    ! {it['file']}: {type(e).__name__}: {e}", file=sys.stderr)
@@ -452,10 +442,12 @@ def retry_missing(items: list[dict], *, library_dir: Path, api_base: str, api_ke
         ok = 0
         for i, it in enumerate(todo, 1):
             try:
-                d = _describe_one(str(library_dir / it["file"]),
-                                  api_base, api_key, model, GIF_INLINE_TIMEOUT)
+                d, t = _describe_one(str(library_dir / it["file"]),
+                                     api_base, api_key, model, GIF_INLINE_TIMEOUT)
                 if d:
                     it["desc"] = d
+                    if t:
+                        it["tags"] = t
                     ok += 1
             except Exception as e:
                 print(f"    ! {it['file'][:36]}: {type(e).__name__}", flush=True)

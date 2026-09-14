@@ -10,8 +10,30 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from services.vision import VisionService, face_name, sniff_mime, resolve_image_bytes
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
-GIF = b"GIF89a" + b"\x00" * 32
 JPG = b"\xff\xd8\xff\xe0" + b"\x00" * 16
+
+
+def _real_gif(frames: int = 2) -> bytes:
+    """真实的可解码多帧 GIF —— 新逻辑要求"多帧才整图直送"，假魔数不够。
+
+    同时这也测到了 `image_prep` 的分流：假字节无法解码 → 回退原字节 + 按魔数标注。
+    """
+    try:
+        from PIL import Image
+    except ImportError:                       # 无 PIL 环境下退回假魔数
+        return b"GIF89a" + b"\x00" * 32
+    import io as _io
+    frames_list = []
+    for i in range(frames):
+        im = Image.new("RGB", (8, 8), (200 - i * 40, 40 + i * 40, 90))
+        frames_list.append(im)
+    buf = _io.BytesIO()
+    frames_list[0].save(buf, format="GIF", save_all=True,
+                        append_images=frames_list[1:], duration=100, loop=0)
+    return buf.getvalue()
+
+
+GIF = _real_gif(2)
 
 
 class TestFaceName(unittest.TestCase):
@@ -68,7 +90,7 @@ class TestVisionService(unittest.TestCase):
 
         async def post(url, payload):
             calls.append(payload)
-            return {"choices": [{"message": {"content": "一只猫在吃草莓麻薯"}}]}
+            return {"choices": [{"message": {"content": '{"desc": "一只猫在吃草莓麻薯", "tags": ["猫"]}'}}]}
 
         async def go():
             v = self._mk(post)
@@ -88,7 +110,7 @@ class TestVisionService(unittest.TestCase):
             captured['url'] = url
             captured['model'] = payload['model']
             captured['img'] = payload['messages'][1]['content'][1]['image_url']['url']
-            return {"choices": [{"message": {"content": "ok"}}]}
+            return {"choices": [{"message": {"content": '{"desc": "ok", "tags": ["猫"]}'}}]}
 
         async def go():
             v = self._mk(post)
@@ -103,7 +125,7 @@ class TestVisionService(unittest.TestCase):
     def test_timeout_fallback_none(self):
         async def post(url, payload):
             await asyncio.sleep(1.0)
-            return {"choices": [{"message": {"content": "x"}}]}
+            return {"choices": [{"message": {"content": '{"desc": "x", "tags": ["猫"]}'}}]}
 
         async def go():
             v = VisionService("https://x/v1", "k", "mimo-v2.5",
@@ -114,7 +136,7 @@ class TestVisionService(unittest.TestCase):
 
     def test_empty_desc_fallback_none(self):
         async def post(url, payload):
-            return {"choices": [{"message": {"content": "  "}}]}
+            return {"choices": [{"message": {"content": '{"desc": "  ", "tags": ["猫"]}'}}]}
 
         async def go():
             v = self._mk(post)
@@ -133,7 +155,7 @@ class TestVisionDiagnostics(unittest.TestCase):
     def test_timeout_reason_recorded(self):
         async def post(url, payload):
             await asyncio.sleep(1.0)
-            return {"choices": [{"message": {"content": "x"}}]}
+            return {"choices": [{"message": {"content": '{"desc": "x", "tags": ["猫"]}'}}]}
 
         async def go():
             v = VisionService("https://x/v1", "k", "m",
@@ -150,7 +172,7 @@ class TestVisionDiagnostics(unittest.TestCase):
 
     def test_empty_completion_reason_recorded(self):
         async def post(url, payload):
-            return {"choices": [{"message": {"content": ""}}]}
+            return {"choices": [{"message": {"content": '{"desc": "", "tags": ["猫"]}'}}]}
 
         async def go():
             v = self._mk(post) if hasattr(self, "_mk") else VisionService(
@@ -211,7 +233,7 @@ class TestVisionDiagnostics(unittest.TestCase):
 
     def test_success_records_ok_and_diag(self):
         async def post(url, payload):
-            return {"choices": [{"message": {"content": "一张猫猫图"}}]}
+            return {"choices": [{"message": {"content": '{"desc": "一张猫猫图", "tags": ["猫"]}'}}]}
 
         async def go():
             v = VisionService("https://x/v1", "k", "m", http_post=post)
@@ -228,7 +250,7 @@ class TestVisionDiagnostics(unittest.TestCase):
 
     def test_cache_hit_recorded(self):
         async def post(url, payload):
-            return {"choices": [{"message": {"content": "图"}}]}
+            return {"choices": [{"message": {"content": '{"desc": "图", "tags": ["猫"]}'}}]}
 
         async def go():
             v = VisionService("https://x/v1", "k", "m", http_post=post)
@@ -247,7 +269,7 @@ class TestVisionDiagnostics(unittest.TestCase):
         """不传 persist_path → 无持久文件、snapshot 标记 disabled。"""
         import tempfile
         async def post(url, payload):
-            return {"choices": [{"message": {"content": "图"}}]}
+            return {"choices": [{"message": {"content": '{"desc": "图", "tags": ["猫"]}'}}]}
 
         async def go():
             with tempfile.TemporaryDirectory() as tmp:
@@ -275,7 +297,7 @@ class TestVisionPersistLRU(unittest.TestCase):
 
         async def post(url, payload):
             calls.append(payload)
-            return {"choices": [{"message": {"content": "\u4e00\u53ea\u732b"}}]}
+            return {"choices": [{"message": {"content": '{"desc": "\u4e00\u53ea\u732b", "tags": ["猫"]}'}}]}
 
         async def go():
             with tempfile.TemporaryDirectory() as tmp:
@@ -300,7 +322,7 @@ class TestVisionPersistLRU(unittest.TestCase):
 
         async def post(url, payload):
             calls.append(payload)
-            return {"choices": [{"message": {"content": "\u56fe"}}]}
+            return {"choices": [{"message": {"content": '{"desc": "\u56fe", "tags": ["猫"]}'}}]}
 
         async def go():
             with tempfile.TemporaryDirectory() as tmp:
@@ -323,7 +345,7 @@ class TestVisionPersistLRU(unittest.TestCase):
         """snapshot \u66b4\u9732 size/max/evicted \u4f9b\u5224\u65ad\u4e0a\u9650\u662f\u5426\u591f\u3002"""
         import tempfile
         async def post(url, payload):
-            return {"choices": [{"message": {"content": "\u56fe"}}]}
+            return {"choices": [{"message": {"content": '{"desc": "\u56fe", "tags": ["猫"]}'}}]}
 
         async def go():
             with tempfile.TemporaryDirectory() as tmp:

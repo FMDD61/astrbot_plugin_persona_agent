@@ -33,19 +33,25 @@
     export STICKER_VISION_API_BASE="$(head -1 /tmp/cred.txt | tr -d '\\r\\n')"
     export STICKER_VISION_API_KEY="$(tail -1 /tmp/cred.txt | tr -d '\\r\\n')"
 
-    # 全网格筛查（默认 18 个配置，串行 + 间隔）
+    # 全网格筛查（默认 19 个配置，串行 + 间隔；实测 ~8s/次）
     python3 -m tools.calibrate_vision_params \\
         --images-dir ../emote/_失败_81张 \\
         --images-dir ../data_out/sticker_library \\
-        --n 40 --out /tmp/vision_calib.json
+        --n 24 --out /tmp/vision_calib.json
 
-    # 只看某些配置 / 复用已有结果
-    python3 -m tools.calibrate_vision_params --configs b,t0.0,low,1024 --out ... 
+    # 只跑指定配置（id 精确或前缀匹配）
+    python3 -m tools.calibrate_vision_params --configs b-t0.0-low-1024,a-t0.3-low-512 ...
+
+    # 稳定性：同一 (配置,图片) 重复 3 次（断点续跑按已有成功数补齐）
+    python3 -m tools.calibrate_vision_params --repeats 3 --configs b-t0.0-low-1024 ...
+
+    # 原图直送 vs 降采样（量化 services/vision.py 现在的"不降采样"代价）
+    python3 -m tools.calibrate_vision_params --raw-images --tag raw ...
 
     # 只看配置清单
     python3 -m tools.calibrate_vision_params --list-configs
 
-    # 只汇总已有 jsonl（不发起调用）
+    # 只汇总已有 jsonl（不发起调用；jsonl 路径 = <out>.jsonl）
     python3 -m tools.calibrate_vision_params --out /tmp/vision_calib.json --analyze-only
 """
 from __future__ import annotations
@@ -358,6 +364,27 @@ def pick_images(dirs: list[Path], n: int, seed: int,
     return chosen
 
 
+def _sniff_mime(data: bytes) -> str:
+    """极简 mime 嗅探（与 services/vision.py::sniff_mime 同义，避免 import 重依赖）。"""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"GIF":
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
+def build_payload_data(path: str, raw: bool) -> tuple[str, str]:
+    """返回 (base64, mime)。raw=True 时**原图直送**（复刻 services/vision.py 的现状：
+    它不做降采样，直接把原图字节发出去 —— 这正是大图 26-36s 的来源）。"""
+    if raw:
+        data = Path(path).read_bytes()
+        return base64.b64encode(data).decode(), _sniff_mime(data)
+    data, mime = prepare_for_vision(path)
+    return base64.b64encode(data).decode(), mime
+
+
 # ---------------------------------------------------------------- 调用
 
 def call_vision(*, api_base: str, api_key: str, model: str, cfg: dict[str, Any],
@@ -519,6 +546,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--analyze-only", action="store_true", help="只汇总已有 jsonl，不调用")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--sleep", type=float, default=0.4, help="每次调用后的间隔秒（防 429）")
+    ap.add_argument("--repeats", type=int, default=1,
+                    help="每个 (配置,图片) 要跑够几次（>1 用于测**稳定性**；断点续跑按已有成功数补齐）")
+    ap.add_argument("--raw-images", action="store_true",
+                    help="原图直送（复刻 services/vision.py 现状：不降采样）。用于量化"
+                         "「降采样 vs 原图」对 prompt_tokens 与耗时的影响")
+    ap.add_argument("--tag", default="", help="给配置 id 加后缀，便于把 A/B 批次分开统计")
     ap.add_argument("--timeout", type=float, default=120.0)
     ap.add_argument("--images", default="", help="逗号分隔的显式图片路径（覆盖 --images-dir/--n）")
     ap.add_argument("--images-from", type=Path, default=None,
@@ -543,6 +576,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not cfgs:
             print(f"没有匹配的配置: {args.configs}", file=sys.stderr)
             return 2
+    if args.tag:
+        cfgs = [dict(c, id=f"{c['id']}+{args.tag}") for c in cfgs]
 
     # ---- 选图
     excl: set[str] = set()
@@ -570,6 +605,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # ---- 载入已完成记录（断点续跑）
     done: set[tuple[str, str]] = set()
+    counts: dict[tuple[str, str], int] = {}
     rows: list[dict[str, Any]] = []
     if jsonl.exists():
         for line in jsonl.read_text(encoding="utf-8").splitlines():
@@ -582,6 +618,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             rows.append(r)
             if r.get("http") == 200:
                 done.add((r["config"], r["file"]))
+                k = (r["config"], r["file"])
+                counts[k] = counts.get(k, 0) + 1
 
     if not args.analyze_only:
         api_base = (os.environ.get("STICKER_VISION_API_BASE") or "").strip().strip('"').strip("'")
@@ -589,17 +627,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not api_base or not api_key:
             print("缺少 STICKER_VISION_API_BASE / STICKER_VISION_API_KEY", file=sys.stderr)
             return 2
-        todo = [(c, im) for c in cfgs for im in imgs if (c["id"], im["file"]) not in done]
-        print(f"图片 {len(imgs)} 张 × 配置 {len(cfgs)} 个 = {len(cfgs) * len(imgs)} 次调用；"
-              f"待跑 {len(todo)}（已完成 {len(cfgs) * len(imgs) - len(todo)}）", flush=True)
+        todo = []
+        for c in cfgs:
+            for im in imgs:
+                need = args.repeats - counts.get((c["id"], im["file"]), 0)
+                todo.extend([(c, im)] * max(0, need))
+        print(f"图片 {len(imgs)} 张 × 配置 {len(cfgs)} 个 × {args.repeats} 次 = "
+              f"{len(cfgs) * len(imgs) * args.repeats} 次调用；待跑 {len(todo)}"
+              f"（已完成 {len(cfgs) * len(imgs) * args.repeats - len(todo)}）", flush=True)
 
         prep: dict[str, tuple[str, str]] = {}
         t_start = time.time()
         for i, (cfg, im) in enumerate(todo, 1):
             if im["path"] not in prep:
                 try:
-                    data, mime = prepare_for_vision(im["path"])
-                    prep[im["path"]] = (base64.b64encode(data).decode(), mime)
+                    prep[im["path"]] = build_payload_data(im["path"], args.raw_images)
                 except Exception as e:
                     print(f"  ! 预处理失败 {im['file']}: {e}", file=sys.stderr)
                     prep[im["path"]] = ("", "")
@@ -613,6 +655,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "dir": im.get("dir", ""), "format": cfg["format"],
                 "temperature": cfg["temperature"], "reasoning_effort": cfg["reasoning_effort"],
                 "max_tokens": cfg["max_tokens"],
+                "raw_image": bool(args.raw_images),
+                "payload_bytes": len(b64) * 3 // 4,
                 **out,
             }
             rec["judge"] = judge(rec)

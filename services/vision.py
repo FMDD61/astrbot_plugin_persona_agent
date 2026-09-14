@@ -40,16 +40,98 @@ def face_name(fid: int) -> str:
         return f"表情#{fid}"
 
 
-def sniff_mime(data: bytes) -> str:
-    if data[:4] == b"GIF8":
-        return "image/gif"
-    if data[:3] == b"\xff\xd8\xff":
-        return "image/jpeg"
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return "image/png"
-    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    return "image/png"
+# 🔴 S6（2026-09-14，956 次实测标定）：**约定固定返回格式是唯一主导因素**。
+#
+# 失败机理（191/191 无例外）：content 为空的响应 `finish_reason` **全是 `length`**，
+# 且 `reasoning_tokens ≈ max_tokens` —— 模型把预算花在**"输出格式谈判"**上
+# （自由文本 prompt 没规定输出形状，它反复推演"要描述？情绪？梗？关键词？多少字？"），
+# 正文一个 token 都没轮到。截断处原文可作证：
+#   「…关键词：颓废、趴桌、困倦、摆烂。**回答格式：**可见：白发戴灰蝴蝶结的…」
+# 约定 JSON schema 后格式谈判消失，reasoning 从"顶格"降到 **p50≈150**。
+#
+# 实测可用率：现网自由文本 **31.2%** → JSON schema **100%**（n=144，0 截断）。
+# 53 张历史失败图：现网 15.1% → 推荐配置 **100%**。
+# 稳定性（同图重复）：现网 24 图里 **7 图结果翻转**；推荐配置 72/72 全成功、0 翻转。
+VISION_SYSTEM_PROMPT = (
+    "你是图片标注器。看图片，只输出**一个 JSON 对象**，不要任何解释、不要 markdown 代码块。"
+    '格式固定为：{"desc": "图片描述", "tags": ["关键词1", "关键词2"]}\n'
+    "字段约束：\n"
+    '- "desc"：中文字符串，只描述图中**确定可见**的内容，长度 8-80 字，一句话写完，不加换行；'
+    "若是表情包，在句中点明情绪（如委屈/无语/嘲讽）与可能的梗；不确定的不要写。"
+    "**如果是动图，重点说明它在动什么（动作过程）**，不要只描述静帧细节。\n"
+    '- "tags"：2-4 个中文字符串，每个 2-6 字，是可用于检索的情绪/动作关键词（如「无语」「抱头」「流泪」）。\n'
+    "不要猜测人物身份、不要脑补图中没有的内容；看不清就在 desc 里写「画面模糊，看不清」。"
+)
+
+# 提示词复述/自我规训特征（模型把 system 要求或思考过程写进"答案"）
+_LEAK_MARKERS = (
+    "如是表情包", "不超过80", "不猜测人物", "不要脑补", "需要谨慎", "不能猜",
+    "用户说", "本条要求", "分析请求", "草拟描述", "字数检查", "输出格式",
+)
+
+
+def _looks_like_leaked_prompt(text: str) -> bool:
+    t = text or ""
+    return any(m in t for m in _LEAK_MARKERS)
+
+
+def parse_vision_json(resp: dict) -> tuple[str, list[str]]:
+    """从响应里取 ``(desc, tags)``，容忍各种残缺形态。
+
+    顺序：content/reasoning → 去 ``` 围栏 → ``json.loads`` → 正则抠第一个 ``{...}``
+    → 正则只抠 ``"desc"`` → 都失败返回空。
+    实测在 442 条真实响应上 **441/442 = 99.8%** 能拿到 desc + 2~4 tags。
+    """
+    import re as _re
+
+    msg = ((resp.get("choices") or [{}])[0].get("message") or {})
+
+    def pull(text):
+        t = str(text or "").strip()
+        if not t:
+            return None
+        if t.startswith("```"):
+            t = _re.sub(r"^```[a-zA-Z]*\s*", "", t)
+            t = _re.sub(r"\s*```$", "", t).strip()
+        try:
+            o = json.loads(t)
+            if isinstance(o, dict) and o.get("desc"):
+                return o
+        except Exception:
+            pass
+        m = _re.search(r"\{.*\}", t, _re.S)
+        if m:
+            try:
+                o = json.loads(m.group(0))
+                if isinstance(o, dict) and o.get("desc"):
+                    return o
+            except Exception:
+                pass
+        m = _re.search(r'"desc"\s*:\s*"([^"]{2,})"', t)
+        return {"desc": m.group(1)} if m else None
+
+    for src in (msg.get("content"), msg.get("reasoning"), msg.get("reasoning_content")):
+        o = pull(src)
+        if not o:
+            continue
+        desc = str(o.get("desc") or "").strip()
+        if not desc or _looks_like_leaked_prompt(desc):
+            continue
+        tags = [str(t).strip() for t in (o.get("tags") or []) if str(t).strip()][:4]
+        return desc, tags
+    return "", []
+
+
+# 图像预处理（降采样/动图）抽到中性模块，与离线入库工具共用。
+# 见 services/image_prep.py 的 docstring：实测不降采样会让同一张图的
+# prompt_tokens 完全相同、而时延从 4.0s 涨到 29.6s（最坏 127.5s）。
+from .image_prep import (
+    DESC_MAX_EDGE,
+    GIF_INLINE_MAX_BYTES,
+    mime_of as _mime_of,
+    prepare_bytes_for_vision,
+    sniff_mime,
+)
 
 
 async def resolve_image_bytes(img, diag: Optional[dict] = None) -> Optional[bytes]:
@@ -112,7 +194,12 @@ PostFn = Callable[[str, dict], Awaitable[dict]]
 
 
 def extract_completion_text(resp: dict) -> str:
-    """从网关响应取描述文本，**兼容 content 为空、答案落在 reasoning 里的情况**。
+    """从网关响应取描述文本（**保留作兼容/测试用**；主路径已改为 `parse_vision_json`）。
+
+    ⚠️ S6 标定修正了一处认知：原先以为"模型把答案只写进 reasoning 就收尾"，
+    但 191/191 条空 content 的响应 `finish_reason` **全是 `length`** —— 真相是
+    **话没说完就被砍断**（见 `VISION_SYSTEM_PROMPT` 上方注释）。本函数仍可用作
+    兜底，但**不能**指望它救回截断的响应：实测它只救回 18.8% 的空返回。
 
     🔴 2026-09-13 实测抓到（识图间歇失败的根因）：部分图片模型会把最终答案
     写进 **`reasoning`** 字段、`content` 留空，例如
@@ -374,26 +461,40 @@ class VisionService:
                     self.stats["cache_hit"] += 1
                     return str(pent["desc"])
         try:
-            b64 = base64.b64encode(data).decode()
-            mime = sniff_mime(data)
+            # 🔴 S6：**先降采样再发送**。此前是原图直送 —— 实测同一张图
+            # prompt_tokens 完全相同（412 vs 412，网关侧图像 token 数固定），
+            # 而时延从 4.0s 涨到 29.6s（最坏 127.5s），纯属白烧上传时间。
+            # 且 >15s 的离群点**全部**是大 GIF，正是它们撞破了 15s 超时。
+            data, mime = prepare_bytes_for_vision(data)
             if diag is not None:
                 diag["mime"] = mime
+                diag["prepared_bytes"] = len(data)
+            b64 = base64.b64encode(data).decode()
             payload = {
                 "model": self._model,
                 "messages": [
-                    {"role": "system", "content":
-                        "用中文简要描述图片中确定可见的内容，不超过80字；如是表情包说明其情绪和梗。不要猜测人物身份、不要脑补图中没有的内容；看不清就说看不清。"},
+                    {"role": "system", "content": VISION_SYSTEM_PROMPT},
                     {"role": "user", "content": [
                         {"type": "text", "text": "描述这张图片。"},
                         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
                     ]},
                 ],
-                "max_tokens": 512,
-                "temperature": 0.3,
+                # S6 标定：2048 而非 512 —— 512 下 reasoning 直接顶格（p50=512）；
+                # 2048 下配对实测**无代价**（同 120 张：时延中位 −0.02s、
+                # completion_tokens 反而 216 vs 247、reasoning 不发散 p50=131）。
+                "max_tokens": 2048,
+                # 0.0：JSON 抽取任务要确定性；实测 0.0/0.3/0.7 在 JSON 下均 100%，
+                # 取 0.0 是为了可复现。
+                "temperature": 0.0,
+                # ⚠️ **必须显式发送**。网关无 off/none 档，只能发 low 或完全不发，
+                # 而实测"不发"更糟（p95 10.0s / max 26.1s vs low 的 5.9s / 5.9s）。
                 "reasoning_effort": self._reasoning_effort,
             }
             out = await asyncio.wait_for(self._post(payload), timeout=self._timeout)
-            desc = extract_completion_text(out)[: self._desc_max_chars]
+            desc, tags = parse_vision_json(out)
+            if diag is not None and tags:
+                diag["tags"] = tags
+            desc = desc[: self._desc_max_chars]
             if not desc:
                 # 模型返回空（多为思考吃光 max_tokens）
                 self.last_error = "empty completion (model returned no content)"
