@@ -382,6 +382,7 @@ class PersonaAgent(Star):
             examples_block=self._examples_block,
             tool_syntax_block=self._tool_syntax_block,
             relations_block=(self.style.relations_block if self.style is not None else None),
+            relations_delta=self._relations_delta_block,
             postprocess=self._postprocess_plain,
             temperature_for=self._temperature_for,
             turn_block=self._build_turn_block,
@@ -1232,6 +1233,69 @@ class PersonaAgent(Star):
                     )
         except Exception as e:
             logger.warning(f"[selfcheck] 自检本身失败（不影响运行）: {e}")
+
+    # ---- S10: 关系图谱增量（追加式）----
+
+    _REL_STATE = "relations_block_state.json"
+
+    def _relations_delta_block(self) -> str:
+        """算出需要追加的"群友识别更新"文本；无变化返回空串。
+
+        ## 设计（用户 2026-09-14 拍板）
+
+        关系图谱**整块**进前缀时，它一变就让其后全部内容（示例块 + session
+        8 万 token）前缀失效。改为：**块不动，增量以一条 system 消息追加到
+        session 尾部** —— 前面逐字节不变。
+
+        接受"更新那一次必然 miss"，因为替代方案（更新不 miss）意味着
+        **全量群聊上下文 + LLM 思维链 + RAG 示例文段全部 miss**。
+
+        状态（``relations_block_state.json``）= ``{uin: 该行文本}``。
+        行文本变化也算增量 —— 否则**人工调整亲疏对 LLM 永远不可见**
+        （与"熟悉度只升不降 + 人工批准"的体系冲突）。
+
+        首次运行：把当前全部行写入状态并**返回空**（初始块已在前缀里，
+        不该在第一次就灌几百行历史）。
+        """
+        if self.style is None:
+            return ""
+        try:
+            lines = self.style.relations_lines()
+        except Exception:
+            return ""
+        if not lines:
+            return ""
+        cur = {uin: line for uin, line in lines}
+        state = self.store.load_json(self._REL_STATE, {}) or {}
+        known = state.get("known") or {}
+        if not known:
+            # 首次：登记全部，不追加（初始块已在恒定前缀里）
+            self.store.save_json(self._REL_STATE,
+                                 {"known": cur, "initialized_at": time.time()})
+            return ""
+        new_lines, changed = self.style.relations_delta(known)
+        if not new_lines and not changed:
+            return ""
+        parts: list[str] = ["［群友识别更新］"]
+        if new_lines:
+            parts.append("新加入或新认识的群友：")
+            parts.extend(new_lines)
+        if changed:
+            parts.append("以下群友的关系/称呼有变化（以本行为准）：")
+            parts.extend(changed)
+        # 落盘新状态（原子写；失败也不影响本轮，下轮会重算同样的增量）
+        try:
+            self.store.save_json(
+                self._REL_STATE,
+                {"known": cur, "updated_at": time.time(),
+                 "added": len(new_lines), "changed": len(changed)})
+        except Exception as e:
+            logger.warning(f"[persona_agent] 关系增量状态落盘失败: {e}")
+        logger.info(
+            f"[persona_agent] 群友识别更新：新增 {len(new_lines)} 人、"
+            f"变化 {len(changed)} 人 → 追加到会话尾部"
+        )
+        return "\n".join(parts)
 
     def _tool_syntax_block(self) -> str:
         """声明可用的动作语法。**内容恒定**（按开关拼一次），进缓存前缀。

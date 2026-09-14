@@ -181,13 +181,75 @@ class StyleProfile:
         # 就能重新缓存 session。
         return text
 
+    def relations_lines(self) -> list[tuple[str, str]]:
+        """关系图谱的逐行形式 ``[(uin, line), ...]``（按文件顺序）。
+
+        S10 新增：需要**按 uin 算增量**（新成员入列时只把新增的人以一条
+        system 消息追加到上下文尾部，而不是整块重发 —— 后者会让其后
+        session 前缀失效）。
+        """
+        out: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for m in self._iter_members():
+            uin = str(m.get("uin", ""))
+            alias = (m.get("alias") or "").strip()
+            if not uin or not alias or m.get("notes") == "bot":
+                continue
+            if alias in seen:
+                continue
+            seen.add(alias)
+            other_names = m.get("other_names") or []
+            closeness = (m.get("closeness") or "known").strip()
+            label = CLOSENESS_LABEL.get(closeness, closeness)
+            line = f"  {uin}: {alias}"
+            if other_names:
+                line += f" (也常被叫作: {'、'.join(other_names)})"
+            line += f"  [{label}]"
+            out.append((uin, line))
+        return out
+
+    def relations_delta(self, known: dict) -> tuple[list[str], list[str]]:
+        """对比"已透露状态"，算出本次需要追加的增量。返回 ``(新群友行, 变化行)``。
+
+        ## 为什么需要（S10，用户 2026-09-14 设计）
+
+        关系图谱原先是**整块**进上下文前缀。它一变（新成员入列，实测一天 8~11 次），
+        **它之后的所有内容**（示例块 + session 全量 8 万 token）前缀全不匹配 →
+        按全价重算（实测 `other=61720`）。
+
+        改为**追加式**：图谱块本身不动，新增/变化以一条 system 消息追加到
+        **session 尾部** —— 前面逐字节不变，只有那一条消息是新的。
+        代价从"图谱之后的一切"缩小到"就那一条"。
+
+        ``known`` 是 ``{uin: 该行文本}`` 的已透露状态。**行文本变化也算增量** ——
+        否则人工调整亲疏（如把某人 new 调成 known）对 LLM 永远不可见。
+
+        首次运行（``known`` 为空）应返回空 —— 初始块已作为前缀存在，
+        不该在第一次调用时灌一整块历史（那是几百行的浪费）。
+        """
+        if not known:
+            return [], []
+        new_lines: list[str] = []
+        changed: list[str] = []
+        for uin, line in self.relations_lines():
+            prev = known.get(uin)
+            if prev is None:
+                new_lines.append(line)
+            elif prev != line:
+                changed.append(line)
+        return new_lines, changed
+
     def relations_block(self) -> str:
         """关系图谱（**独立块**，与人格分离）。
 
         为什么独立：见 ``system_prompt()`` 里的注释 —— 它增长，人格不增长。
         两者拼在一起时，"增长的块"会把"恒定的块"一起拖进失效区。
         """
-        return self._build_alias_block()
+        lines = self.relations_lines()
+        if not lines:
+            return ""
+        return ("群友识别（按 QQ 号，优先用别称呼叫；[熟人] 是关系最近的人）：\n"
+                + "\n".join(line for _, line in lines))
 
     def volatile_line(self, local_hour: Optional[int] = None, mood: str = "") -> str:
         """逐轮易变信息（时间 + 心情）—— 放在上下文**末尾**专用。
