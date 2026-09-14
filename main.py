@@ -1950,10 +1950,10 @@ class PersonaAgent(Star):
             prompt=prompt,
             system_prompt=system_prompt,
             temperature=float(dcfg.get("anchor_temperature", 0.3)),
-            # 🔴 实测踩坑（2026-09-14）：锚点阶段给 512 时 `finish_reason=length`
-            # ——**思考吃光预算、content 全空**（与 B-019 识图同形）。
-            # 锚点文本很短，但"思考"的 token 消耗与输出长度无关。
-            max_tokens=int(dcfg.get("anchor_max_tokens", 2048)),
+            # 🔴 预算给足（2026-09-14 用户指出）：思考 token 是**重尾随机变量**
+            # （同一 prompt 实测 556 或 2048），预算紧则被截断 → content 空。
+            # `max_tokens` 是**上限而非消耗**，给大没有代价。实测 8192/16384 稳定。
+            max_tokens=int(dcfg.get("anchor_max_tokens", 8192)),
             **({"reasoning_effort": _rv} if _rv else {}),
         )
         return (getattr(resp, "completion_text", "") or "").strip()
@@ -1964,8 +1964,9 @@ class PersonaAgent(Star):
         为什么温度这么高：用户要的是"逻辑较为跳跃的梦境语段"，而梦里不该有
         现实的因果链条。温度低会把梦写成日记的摘要。
 
-        ⚠️ `max_tokens` 给足：400–700 字的正文 + low 档思考，512 会截断
-        （识图那边就是被这个坑过，见 B-019）。
+        ⚠️ `max_tokens` **给足**：400–700 字正文 + low 档思考，而思考是重尾随机的
+        （实测同一 prompt 888 也可能顶到 2048）。`max_tokens` 是上限不是消耗，
+        给大没有代价 —— 给紧只会在运气差时截断成空 content（B-019 同形）。
         """
         provider = await self._resolve_provider_id()
         if not provider:
@@ -1977,7 +1978,7 @@ class PersonaAgent(Star):
             prompt=prompt,
             system_prompt=system_prompt,
             temperature=float(dcfg.get("temperature", 1.3)),
-            max_tokens=int(dcfg.get("max_tokens", 2048)),
+            max_tokens=int(dcfg.get("max_tokens", 8192)),
             **({"reasoning_effort": _rv} if _rv else {}),
         )
         return (getattr(resp, "completion_text", "") or "").strip()

@@ -182,8 +182,8 @@ class TestDreamMaker(unittest.TestCase):
         async def anchor_fn(sys_p, prompt):
             seen["anchor_sys"] = sys_p
             seen["anchor_prompt"] = prompt
-            # 锚点阶段用 JSON schema（实测自由文本会让思考吃光 token，见 ANCHOR_SYSTEM 注释）
-            return '{"anchors": ["低烧不退", "凌晨的屏幕光"]}'
+            # 锚点阶段用**自由文本**（2026-09-14 用户指出：问题不是格式而是预算）
+            return "低烧不退\n凌晨的屏幕光"
 
         async def dream_fn(sys_p, prompt):
             seen["dream_sys"] = sys_p
@@ -199,16 +199,30 @@ class TestDreamMaker(unittest.TestCase):
         self.assertIn("低烧", seen["dream_prompt"])
         self.assertIn("感觉锚点", seen["dream_prompt"])
         self.assertIn("身体和感官", seen["anchor_sys"])
-        self.assertIn('"anchors"', seen["anchor_sys"], "锚点阶段必须约定 JSON 格式")
+        # ⚠️ 故意**不**约定 JSON：实测真正的问题是 max_tokens 给太紧，不是格式。
+        # 约定格式在高温度下会破坏生成质量，且 LLM 不保证遵守（用户指出）。
+        self.assertNotIn("JSON", seen["anchor_sys"])
 
-    def test_parse_anchors_forms(self):
+    def test_parse_anchors_still_tolerates_json(self):
+        """`parse_anchors` 保留 JSON 兼容（万一模型自发输出 JSON），但**不要求** JSON。"""
         from services.dream import parse_anchors
+        self.assertEqual(parse_anchors("自由文本一行\n第二行"), "自由文本一行\n第二行")
         self.assertEqual(parse_anchors('{"anchors": ["甲", "乙"]}'), "甲\n乙")
-        self.assertEqual(parse_anchors('```json\n{"anchors": ["甲"]}\n```'), "甲")
-        self.assertEqual(parse_anchors('前言 {"anchors": ["丙"]} 后语'), "丙")
-        self.assertEqual(parse_anchors("自由文本"), "自由文本")   # 兜底原样
         self.assertEqual(parse_anchors(""), "")
-        self.assertEqual(parse_anchors('{"anchors": []}'), '{"anchors": []}')  # 空列表兜底
+        self.assertEqual(parse_anchors("  低烧  \n  屏幕光  ").strip(), "低烧  \n  屏幕光")
+
+    def test_budgets_are_generous(self):
+        """🔴 回归：预算必须给足（用户 2026-09-14 的核心批评）。
+
+        思考 token 是**重尾随机变量**（实测同一 prompt 556~2048），
+        `max_tokens` 是**上限而非消耗** —— 给紧只会在运气差时截断成空 content。
+        实测锚点阶段 2048 会顶格成空，8192/16384 稳定。
+        """
+        import json as _json, os as _os
+        p = _os.path.join(_os.path.dirname(__file__), "..", "_conf_schema.json")
+        d = _json.load(open(p, encoding="utf-8"))["dream"]["items"]
+        self.assertGreaterEqual(d["max_tokens"]["default"], 8192)
+        self.assertGreaterEqual(d["anchor_max_tokens"]["default"], 8192)
 
     def test_anchor_failure_degrades_gracefully(self):
         """锚点失败不致命 —— 降级为直接做梦（仍有日记原料）。"""
