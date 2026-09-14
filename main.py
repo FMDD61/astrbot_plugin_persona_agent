@@ -2038,12 +2038,33 @@ class PersonaAgent(Star):
                     logger.info(f"[persona_agent] flushed {n} pending session append(s) before rotation")
             except Exception as e:
                 logger.warning(f"[persona_agent] pre-rotation flush failed: {e}")
+        # S8：日旋转时顺手聚合缓存命中（长期留存产物）
+        for _gid in list(self.session_mgr.snapshot().keys()):
+            self._update_cache_stats(_gid)
         for gid in list(self.session_mgr.snapshot().keys()):
             old_msgs = self.session_mgr.rotate_if_day_changed(gid)
             if old_msgs:
                 logger.info(f"[persona_agent] daily rotation: group={gid} msgs={len(old_msgs)}")
                 if self._diary_enabled:
                     asyncio.create_task(self._generate_diary(gid, old_msgs))
+
+    def _update_cache_stats(self, group_id: str) -> None:
+        """把前缀缓存探针聚合成**长期留存**的日汇总（用户 2026-09-14 要求）。
+
+        为什么不在每次调用后写：探针是逐次明细且**无轮转**（`trace_log.jsonl`
+        已 43 MB），单次 `input_cached` 波动大、看不出趋势。这里在日旋转时
+        增量聚合一次，产出 `cache_stats.jsonl`（每次一行，紧凑）与
+        `cache_daily.jsonl`（每天一行）——**只增不改、人工与 LLM 都可读**。
+
+        **失败绝不影响主流程**（聚合是旁路观测）。
+        """
+        try:
+            from .tools import cache_stats as _cs
+            rc = _cs.main(["--data-dir", str(self.data_dir), "--group", str(group_id)])
+            if rc != 0:
+                logger.warning(f"[persona_agent] cache_stats 聚合返回 {rc}")
+        except Exception as e:
+            logger.warning(f"[persona_agent] cache_stats 聚合失败（不影响运行）: {e}")
 
     async def _generate_diary(self, group_id: str, msgs: list[dict]) -> None:
         """Daily diary summary reusing the archived day session as context.
