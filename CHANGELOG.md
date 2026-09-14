@@ -25,6 +25,34 @@
 - **日记 `day` 偏移一天**：归档 09-12 的会话，`day` 却取轮换后的 `day_key()`（09-13）。改为按同一口径回推 24h
 - **provider id 写错会静默哑掉（新增加固）**：`_resolve_provider_id()` 现在**先校验配置值存在性** —— 写成不存在的 id 时 `llm_generate` 抛 `ProviderNotFoundError`、被 except 吞成空回复（又一条"看起来正常其实全哑"）。校验失败 → 告警 + 回退到会话 provider；拿不到 `provider_manager` 时返回"未知"照用配置值（不让校验本身成为故障源）。三级回退逻辑抽为纯函数 `llm_params.resolve_provider_id()`，可离线单测（+8 例）
 
+### Added (2026-09-14, S7 主动戳人：`[poke:名字]` → 严格解析 → group_poke)
+> 用户拍板：接口用**名字**不用 QQ 号；解析**严格**（"模型用了未收录的昵称时戳不
+> 出去"可接受）；候选池仅 `close`；同人冷却**复用被动计时器**。
+
+- **接口设计的关键取捨**：`[poke:QQ号]` 要求模型从 185 人名单背出号码 ——
+  比"叫出昵称"难得多，而**戳错人是对外可见的社交事故**。实测模型能准确叫出
+  `虾鱼丸`/`焦糖`，故改为 `[poke:名字]`，服务端解析。
+- **`StyleProfile.resolve_member_name()` —— 严格优先于宽松**：
+  精确匹配 `alias` → 精确匹配 `other_names` → 否则返回 None（**不猜**）。
+  🔴 修掉一个既有的静默错配：`resolve_uin_from_name()` 是**首个匹配即返回**，
+  实测真实数据里 `智乃` 同时属于 `智乃` 与 `桔皮` → 旧函数会静默选第一个，
+  而这正是"戳错人"的成因。新函数遇到歧义**拒绝**。
+- **`PokeService.decide_proactive()` 硬闸**（任一不过 → 静默跳过戳、正文照发）：
+  `proactive_disabled` / `no_target` / `self_poke` / `not_in_pool` / `conflict` /
+  `serious_context` / `cooldown`（**与被动共用计时器**）/ `proactive_hourly_cap`
+  （与被动**分开计** —— 被动是社交回应、主动是自主行为，混计会互相挤占）。
+  **被拒的尝试不推进冷却、不占配额**（只有成功才记账）。
+- **`poke_log.jsonl` 增加 `direction`/`raw_name`/`resolved_via`** ——
+  事后可核对"模型想戳谁 vs 实际戳了谁"。
+- **按 action 通道直发**：主动戳用 `bot.call_action("group_poke", ...)`，
+  不走消息段（段通道在协议端被静默丢弃）；**不需要 `stop_event`**
+  （那是被动回戳为阻止内置 LLM 兜底才要的）。
+- **修两个既有缺陷**：
+  - `poke.hourly_cap` 原为**硬编码 4**，WebUI 里调它完全不生效（死配置，与 B-010 同类）
+  - `PokeService._roll_hour()` 加 S7 字段时**漏重置主动计数** → 主动配额
+    **一天只重置一次**（表现为"只在当天最初几小时能用"）。测试抓到。
+- 测试 397 → **417 全绿**（新增 `tests/test_poke_proactive.py` 19 例）
+
 ### Fixed (2026-09-14, 🔴 S6 识图：自由文本格式导致 69% 的描述拿不到 + 降采样缺失白烧 7 倍时间)
 > 956 次实测标定（串行、0 次 429）。子代理产出
 > `tools/calibrate_vision_params.py` + `data_out/vision_calib/`。

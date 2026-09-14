@@ -290,6 +290,58 @@ class StyleProfile:
         mean = sum(vals) / len(vals)
         return {int(k) for k, v in shares.items() if float(v) >= mean}
 
+    def resolve_member_name(self, name: str) -> tuple[Optional[str], str]:
+        """把模型写的**名字**解析成 uin。返回 ``(uin 或 None, 原因)``。
+
+        ## 为什么需要（S7 拍一拍）
+
+        `[poke:QQ号]` 要求模型从 185 人名单里背出正确号码 —— 比"叫出昵称"难得多，
+        而**戳错人是对外可见的社交事故**。实测模型能准确叫出 `虾鱼丸`/`焦糖`/
+        `小闵`/`纱纱`，所以改成 `[poke:名字]`，由服务端解析。
+
+        ## 严格优先于宽松（用户 2026-09-14 拍板）
+
+        池子里有大量互含简称（`小clove`/`clove`、`虾鱼丸`/`虾虾`/`私虾`）。
+        解析规则：**精确匹配** `alias` → 精确匹配 `other_names` → 都不唯一/都没有
+        **即返回 None**。不猜、不做模糊匹配。代价是"模型用了未收录的昵称"时戳不出去，
+        这个代价可接受；戳错人的代价不可接受。
+        """
+        key = (name or "").strip()
+        if not key:
+            return None, "empty_name"
+        low = key.lower()
+        primary: list[str] = []
+        secondary: list[str] = []
+        for m in self._iter_members():
+            uin = str(m.get("uin") or "")
+            if not uin:
+                continue
+            alias = str(m.get("alias") or "").strip()
+            if alias and alias.lower() == low:
+                primary.append(uin)
+                continue
+            for n in (m.get("other_names") or []):
+                if str(n).strip().lower() == low:
+                    secondary.append(uin)
+                    break
+        if len(primary) == 1:
+            return primary[0], "alias"
+        if len(primary) > 1:
+            return None, f"ambiguous_alias({len(primary)})"
+        if len(secondary) == 1:
+            return secondary[0], "other_name"
+        if len(secondary) > 1:
+            return None, f"ambiguous_other_name({len(secondary)})"
+        return None, "unknown_name"
+
+    def member_closeness(self, uin: str) -> str:
+        """返回该成员的亲疏等级（``close``/``known``/``new``）；未知返回空串。"""
+        u = str(uin or "")
+        for m in self._iter_members():
+            if str(m.get("uin") or "") == u:
+                return str(m.get("closeness") or "")
+        return ""
+
     def preferred_alias(self, uin: str) -> str:
         for m in self._iter_members():
             if str(m.get("uin", "")) == uin:

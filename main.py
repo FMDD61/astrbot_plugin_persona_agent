@@ -244,8 +244,12 @@ class PersonaAgent(Star):
             str(self.data_dir),
             bot_qq=self.bot_qq,
             cooldown_sec=float(poke_cfg.get("cooldown_sec", 300)),
-            hourly_cap=4,
+            # ⚠️ 原为硬编码 4 —— WebUI 里调 `poke.hourly_cap` 完全不生效（死配置，
+            # 与 B-010 同类）。改为读配置。
+            hourly_cap=int(poke_cfg.get("hourly_cap", 4)),
+            proactive_hourly_cap=int(poke_cfg.get("proactive_hourly_cap", 5)),
         )
+        self._poke.proactive_enabled = int(poke_cfg.get("proactive_enabled", 0)) == 1
         self._topic_bank = TopicBank(str(self.data_dir))
         self._summary = SummaryService(str(self.data_dir))
 
@@ -876,6 +880,12 @@ class PersonaAgent(Star):
             async for _sticker_result in self._send_sticker(event, group_id, send_intent):
                 yield _sticker_result
 
+        # ---- S7 主动戳人：[poke:名字] → 校验 → group_poke action ----
+        # 与贴纸**不同**：不 yield 消息段，而是直接调 action（段通道在协议端会被丢弃）。
+        # 也不需要 stop_event（那是被动回戳为阻止内置 LLM 兜底才要的）。
+        if send_intent.poke:
+            await self._send_proactive_poke(event, group_id, send_intent, trace)
+
         if send_intent.sticker_prompt:
             # 旧的 emotion.sticker → 文生图通道：保留但不再是贴纸主路径
             try:
@@ -959,7 +969,12 @@ class PersonaAgent(Star):
             event.stop_event()
             return
 
-        self._poke.configure(cooldown_sec=float(poke_cfg.get("cooldown_sec", 300)))
+        self._poke.configure(
+            cooldown_sec=float(poke_cfg.get("cooldown_sec", 300)),
+            hourly_cap=int(poke_cfg.get("hourly_cap", 4)),
+            proactive_enabled=int(poke_cfg.get("proactive_enabled", 0)) == 1,
+            proactive_hourly_cap=int(poke_cfg.get("proactive_hourly_cap", 5)),
+        )
         alias = ""
         if self.style is not None:
             try:
@@ -1221,8 +1236,11 @@ class PersonaAgent(Star):
             )
         if int((self.config.get("poke", {}) or {}).get("teach", 0)) == 1:
             lines.append(
-                "如果你想戳一下某人（QQ 的拍一拍），在回复里写 `[poke:对方的QQ号]`。"
-                "只在确实想引起对方注意时用，且必须是群里真实成员。"
+                "如果你想戳一下某人（QQ 的拍一拍），在回复里写 `[poke:对方的名字]`，"
+                "名字就用你在群里叫他的那个称呼（如 `[poke:虾鱼丸]`）。"
+                "**只对你熟悉的人用**（关系不熟的人不要戳），"
+                "且只在确实想引起对方注意时用。"
+                "名字必须与群里使用的称呼一致，否则这一戳会被丢弃。"
             )
         if not lines:
             return ""
@@ -1380,6 +1398,76 @@ class PersonaAgent(Star):
             logger.warning(f"[persona_agent] llm returned error response, suppressed ({len(text)} chars)")
             return ""
         return text
+
+    async def _send_proactive_poke(self, event: AstrMessageEvent, group_id: str,
+                                   intent, trace: dict) -> bool:
+        """执行 ``[poke:名字]``（S7 主动戳人）。**绝不抛出**。
+
+        设计（用户 2026-09-14 拍板）：
+          · 接口用**名字**而非 QQ 号 —— 模型背不出 185 人的号码，但能准确叫出昵称；
+            戳错人是对外可见的社交事故，所以宁可戳不出去
+          · 名称解析**严格**：精确匹配 alias → other_names → 否则跳过（不猜）
+          · 候选池 = `close`（30 人）；对不熟的人戳一戳是冒犯
+          · 复用被动回戳的**同人冷却计时器**（用户指定），并单独计主动小时配额
+          · 任一校验不过 → **静默跳过戳、正文照发**
+        """
+        result: dict = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "raw_name": intent.poke, "done": False, "reason": "",
+                        "target": "", "resolved_via": ""}
+        if self._poke is None or self.style is None:
+            return False
+        try:
+            pcfg = self.config.get("poke", {}) or {}
+            if int(pcfg.get("proactive_enabled", 0)) != 1:
+                result["reason"] = "proactive_disabled"
+            else:
+                uin, via = self.style.resolve_member_name(intent.poke)
+                result["resolved_via"] = via
+                if not uin:
+                    result["reason"] = via          # unknown_name / ambiguous_*
+                else:
+                    result["target"] = uin
+                    closeness = self.style.member_closeness(uin)
+                    conflict = bool((trace.get("gate") or {}).get("conflict"))
+                    ok, why = self._poke.decide_proactive(
+                        target_uin=uin, closeness=closeness,
+                        conflict=conflict,
+                        recent_text=str((trace.get("turn_block") or {}) and "") or "",
+                    )
+                    result["reason"] = why
+                    if ok:
+                        bot = getattr(event, "bot", None)
+                        if bot is None or not hasattr(bot, "call_action"):
+                            result["reason"] = "no_action_channel"
+                        else:
+                            await bot.call_action(
+                                "group_poke",
+                                group_id=protocol_compat._as_int_or_str(group_id),
+                                user_id=protocol_compat._as_int_or_str(uin),
+                            )
+                            result["done"] = True
+                            alias = self.style.preferred_alias(uin)
+                            logger.info(
+                                f"[persona_agent] proactive poke → {uin}"
+                                f"({alias or '?'}) via {result['raw_name']!r}"
+                            )
+        except Exception as e:
+            result["reason"] = f"{type(e).__name__}: {e}"
+        finally:
+            try:
+                self._poke.record_proactive(
+                    target_uin=result["target"], group_id=group_id,
+                    done=result["done"], reason=result["reason"],
+                    raw_name=result["raw_name"], resolved_via=result["resolved_via"],
+                )
+            except Exception:
+                pass
+            if not result["done"] and result["reason"] not in ("proactive_disabled", ""):
+                logger.info(
+                    f"[persona_agent] proactive poke skipped: {result['reason']}"
+                    f" name={result['raw_name']!r}"
+                )
+        return bool(result["done"])
 
     # ---------------------------------------------------------- S3 动作链路
 
