@@ -1210,12 +1210,25 @@ class PersonaAgent(Star):
                         logger.warning("[selfcheck] ⚠️ 已教 [emote:] 语法但库为空 → 白教")
             # 人格块体积（缓存前缀的核心成本）
             if self.style is not None:
+                # S9：人格与关系图谱已拆分，两者**都要**看体积 ——
+                # 人格恒定（变了说明人工改了人设，会作废一次全量缓存）；
+                # 关系图谱缓慢增长（新成员入列），但改成了"只在尾部追加"，
+                # 所以增长本身不再击穿它之后的前缀。
                 sp_len = len(self.style.system_prompt())
-                logger.info(f"[selfcheck] 人格提示词 {sp_len} 字符（含别名关系块，进缓存前缀）")
+                rel_len = len(self.style.relations_block())
+                logger.info(
+                    f"[selfcheck] 人格提示词 {sp_len} 字符（恒定块）| "
+                    f"关系图谱 {rel_len} 字符（追加式，进缓存前缀）"
+                )
                 if sp_len > 20000:
                     logger.warning(
-                        f"[selfcheck] ⚠️ 人格提示词 {sp_len} 字符偏大 → "
-                        f"每轮都要进前缀，检查 system_prompt_fragments/别名块是否失控"
+                        f"[selfcheck] ⚠️ 人格提示词 {sp_len} 字符偏大 → 每轮进前缀，"
+                        f"检查 system_prompt_fragments.json 是否失控"
+                    )
+                if rel_len > 30000:
+                    logger.warning(
+                        f"[selfcheck] ⚠️ 关系图谱 {rel_len} 字符偏大 → 虽为追加式，"
+                        f"但每轮都要传；考虑把 new 段压缩或按需注入"
                     )
         except Exception as e:
             logger.warning(f"[selfcheck] 自检本身失败（不影响运行）: {e}")
