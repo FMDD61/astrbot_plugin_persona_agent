@@ -161,18 +161,51 @@ def load_fragments(data_dir: str | Path, ids=DEFAULT_FEWSHOT_IDS) -> list[dict]:
 
 # ---------------------------------------------------------------- 提示词
 
-# 锚点抽取（阶段①）—— 结构化、低温
+# 锚点抽取（阶段①）—— **强制 JSON schema**，低温
+#
+# 🔴 实测（2026-09-14）：自由文本 + "不要解释"反而让模型**反复纠结**
+# "什么才算身体感觉"，2048 token 全花在思考上、`finish_reason=length`、
+# content 全空（与 B-019 识图同形 —— **约定输出格式是唯一主导因素**）。
+# 实测对比（同一批日记）：
+#   自由文本「每条一行，不要解释」      → length / 14.9s / completion 2048（全思考）/ **空**
+#   自由文本 + max_tokens 4096          → stop   / 14.1s / 思考 1818 / 输出是**模仿口吻的句子**
+#   **JSON schema**                     → stop   / **6.1s** / completion 612 / ✅ 有效锚点
 ANCHOR_SYSTEM = (
-    "你要从几篇群聊日记里，抽出**身体与感觉**的锚点，供之后写一段梦境用。\n"
-    "只抽**能落在身体上或感官上的东西**：体温、疼痛、睡眠、气味、光线、声音、时段、"
-    "具体的物件。**不要**抽事件、情节、观点、人物关系。\n"
-    "抽 3–6 条，每条一行，直接写内容，不要编号、不要解释、不要复述原句。\n"
-    "例：\n"
-    "  有人一直低烧，额头烫\n"
-    "  膝盖的钝痛反反复复\n"
-    "  凌晨的屏幕光\n"
-    "  药味混着橘子皮的味道"
+    "读日记，列出其中**身体和感官**的细节。\n"
+    "只输出一个 JSON 对象，不要任何解释、不要 markdown 代码块：\n"
+    '{"anchors": ["...", "..."]}\n'
+    "anchors 放 3-6 条，每条 6-16 字，只写体感"
+    "（体温/疼/困/饿/气味/光线/声音/时段），不写事件、不写人名、不写观点。"
 )
+
+
+def parse_anchors(raw: str) -> str:
+    """从锚点响应里取 ``anchors`` 列表，拼成逐行文本（失败返回原文本）。"""
+    t = (raw or "").strip()
+    if not t:
+        return ""
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t).strip()
+    obj = None
+    try:
+        obj = json.loads(t)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", t, re.S)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                obj = None
+    if isinstance(obj, dict):
+        items = obj.get("anchors")
+        if isinstance(items, list):
+            lines = [str(x).strip() for x in items if str(x).strip()]
+            if lines:
+                return "\n".join(lines)
+    # 兜底：原样返回（调用方仍能当参考文本用）
+    return t
+
 
 # 做梦（阶段②）—— 自由写作
 DREAM_SYSTEM = (
@@ -292,8 +325,8 @@ class DreamMaker:
         anchors = ""
         if self._anchor_fn is not None:
             try:
-                anchors = str(await self._anchor_fn(
-                    ANCHOR_SYSTEM, build_anchor_prompt(frag_diaries)) or "").strip()
+                anchors = parse_anchors(str(await self._anchor_fn(
+                    ANCHOR_SYSTEM, build_anchor_prompt(frag_diaries)) or ""))
             except Exception as e:
                 # 锚点失败不致命 —— 降级为"直接做梦"（少了意象源但仍有日记）
                 res.stats["anchor_error"] = f"{type(e).__name__}: {e}"
