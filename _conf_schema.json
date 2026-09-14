@@ -223,8 +223,8 @@
       "max_tokens": {
         "type": "int",
         "description": "做梦最大 token",
-        "default": 2048,
-        "hint": "400-700 字正文 + low 档思考，512 会截断（识图被这个坑过，见 B-019）。"
+        "default": 8192,
+        "hint": "🔴 max_tokens 是**上限而非消耗**，给大没有代价。思考 token 是重尾随机变量（实测同一 prompt 556~2048），给紧会在运气差时截断成空 content（B-019 同形）。"
       },
       "diary_window": {
         "type": "int",
@@ -244,8 +244,8 @@
       "anchor_max_tokens": {
         "type": "int",
         "description": "锚点抽取最大 token",
-        "default": 2048,
-        "hint": "🔴 实测 512 时 finish_reason=length（思考吃光预算、content 全空，与 B-019 识图同形）。锚点文本很短，但思考的 token 消耗与输出长度无关。"
+        "default": 8192,
+        "hint": "同上：实测 2048 时思考顶格 2048 → content 空；8192/16384 稳定产出。"
       }
     }
   },
