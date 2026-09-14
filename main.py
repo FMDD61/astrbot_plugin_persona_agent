@@ -1950,6 +1950,10 @@ class PersonaAgent(Star):
             prompt=prompt,
             system_prompt=system_prompt,
             temperature=float(dcfg.get("anchor_temperature", 0.3)),
+            # 🔴 实测踩坑（2026-09-14）：锚点阶段给 512 时 `finish_reason=length`
+            # ——**思考吃光预算、content 全空**（与 B-019 识图同形）。
+            # 锚点文本很短，但"思考"的 token 消耗与输出长度无关。
+            max_tokens=int(dcfg.get("anchor_max_tokens", 2048)),
             **({"reasoning_effort": _rv} if _rv else {}),
         )
         return (getattr(resp, "completion_text", "") or "").strip()

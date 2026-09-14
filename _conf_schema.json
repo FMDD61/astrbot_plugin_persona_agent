@@ -240,6 +240,12 @@
         "type": "float",
         "description": "残缺化上限",
         "default": 0.3
+      },
+      "anchor_max_tokens": {
+        "type": "int",
+        "description": "锚点抽取最大 token",
+        "default": 2048,
+        "hint": "🔴 实测 512 时 finish_reason=length（思考吃光预算、content 全空，与 B-019 识图同形）。锚点文本很短，但思考的 token 消耗与输出长度无关。"
       }
     }
   },

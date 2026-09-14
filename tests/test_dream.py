@@ -182,7 +182,8 @@ class TestDreamMaker(unittest.TestCase):
         async def anchor_fn(sys_p, prompt):
             seen["anchor_sys"] = sys_p
             seen["anchor_prompt"] = prompt
-            return "  低烧不退\n  凌晨的屏幕光"
+            # 锚点阶段用 JSON schema（实测自由文本会让思考吃光 token，见 ANCHOR_SYSTEM 注释）
+            return '{"anchors": ["低烧不退", "凌晨的屏幕光"]}'
 
         async def dream_fn(sys_p, prompt):
             seen["dream_sys"] = sys_p
@@ -197,7 +198,17 @@ class TestDreamMaker(unittest.TestCase):
         # 锚点结果必须进入做梦提示词（这正是子代理指出的"意象源"缺口）
         self.assertIn("低烧", seen["dream_prompt"])
         self.assertIn("感觉锚点", seen["dream_prompt"])
-        self.assertIn("身体与感觉", seen["anchor_sys"])
+        self.assertIn("身体和感官", seen["anchor_sys"])
+        self.assertIn('"anchors"', seen["anchor_sys"], "锚点阶段必须约定 JSON 格式")
+
+    def test_parse_anchors_forms(self):
+        from services.dream import parse_anchors
+        self.assertEqual(parse_anchors('{"anchors": ["甲", "乙"]}'), "甲\n乙")
+        self.assertEqual(parse_anchors('```json\n{"anchors": ["甲"]}\n```'), "甲")
+        self.assertEqual(parse_anchors('前言 {"anchors": ["丙"]} 后语'), "丙")
+        self.assertEqual(parse_anchors("自由文本"), "自由文本")   # 兜底原样
+        self.assertEqual(parse_anchors(""), "")
+        self.assertEqual(parse_anchors('{"anchors": []}'), '{"anchors": []}')  # 空列表兜底
 
     def test_anchor_failure_degrades_gracefully(self):
         """锚点失败不致命 —— 降级为直接做梦（仍有日记原料）。"""
