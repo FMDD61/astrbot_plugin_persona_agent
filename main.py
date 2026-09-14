@@ -381,6 +381,7 @@ class PersonaAgent(Star):
             generate=self._pipeline_generate,
             examples_block=self._examples_block,
             tool_syntax_block=self._tool_syntax_block,
+            relations_block=(self.style.relations_block if self.style is not None else None),
             postprocess=self._postprocess_plain,
             temperature_for=self._temperature_for,
             turn_block=self._build_turn_block,

@@ -106,7 +106,12 @@ class _FakeInterjection:
 
 
 def _pipeline(**over):
-    """Build a pipeline with all fakes; override via kwargs."""
+    """Build a pipeline with all fakes; override via kwargs.
+
+    ⚠️ 新增可选回调时**必须在这里转发** —— 否则测试与线上接线不一致会静默失真
+    （已踩过三次：`turn_block`/`session_append`/`examples_block`/`tool_syntax_block`/
+    `relations_block`）。下面用 `over.get(...)` 显式列出，取值时一眼可见。
+    """
     p = PersonaPipeline(
         style=None,
         rag=over.get("rag", _FakeRag([{"document": "历史片段A", "score": 0.72}])),
@@ -118,6 +123,8 @@ def _pipeline(**over):
         buffer=over.get("buffer", None),
         generate=over.get("generate", lambda t, c, e, temp, su, umo: _async("好的~")),
         examples_block=over.get("examples_block", lambda: ""),
+        tool_syntax_block=over.get("tool_syntax_block", None),
+        relations_block=over.get("relations_block", None),
         postprocess=lambda s: s.strip(),
         temperature_for=lambda trig: 0.8,
         turn_block=over.get("turn_block", None),
@@ -909,3 +916,175 @@ class TestSharedContextS4(unittest.TestCase):
         self.assertIn("ts_epoch", log)
         self.assertEqual(log["ts_epoch"], 1700000000.5)
         self.assertTrue(str(log["ts"]).endswith("Z"))
+
+
+class TestRelationsBlockSplitS9(unittest.TestCase):
+    """S9：关系图谱从人格提示词里拆出，作为**独立的 system 消息**排在 session 之前。
+
+    ## 为什么（2026-09-14 实测）
+
+    别名/关系块随新成员入列持续增长（一天 8~11 次、每次约 +23 字符），而它原本
+    拼在 `system_prompt()` **末尾** → 每次增长都让**其后全部内容**（session 全量，
+    实测 8 万 token）的前缀缓存失效：
+
+        提示词变更那次: prompt 65560 → cached 3840 (5.9%) → other **61720** 全价
+        正常调用:      prompt 82475 → cached 82176 (99.6%) → other 仅 299
+
+    拆开后：人格块恒定（永远命中），关系块变化只废它自己之后的部分，
+    且**下一个调用就能重新缓存 session**。
+    """
+
+    def _setup(self, **over):
+        from services.session_manager import SessionManager
+        sm = SessionManager(data_dir=None, max_messages=None)
+        sm.append("g1", "user", "历史甲", name="甲", message_id="m1", sender_uin="u1")
+        sm.append("g1", "assistant", "机器人的旧回复")
+        captured = {}
+
+        def gen(t, c, e, temp, su, umo):
+            captured["ctx"] = [dict(m) for m in c]
+            return _async("好")
+
+        # 用 setdefault 而非显式传参 —— 否则调用方想覆盖同一个键时会
+        # "got multiple values for keyword argument"（写测试时踩到）
+        over.setdefault("session", sm)
+        over.setdefault("session_append", lambda *a: None)
+        over.setdefault("generate", gen)
+        over.setdefault("examples_block", lambda: "【示例块】")
+        over.setdefault("tool_syntax_block", lambda: "【工具语法】")
+        over.setdefault("relations_block", lambda: "【关系图谱】")
+        over.setdefault("turn_block",
+                        lambda l, c: "【现在要回应的】\n" + "\n".join(l))
+        p = _pipeline(**over)
+        return p, captured
+
+    def test_relations_block_is_its_own_system_message(self):
+        p, captured = self._setup()
+        _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
+        ctx = captured["ctx"]
+        contents = [str(m.get("content")) for m in ctx]
+        self.assertIn("【关系图谱】", contents)
+        i = contents.index("【关系图谱】")
+        self.assertEqual(ctx[i]["role"], "system")
+
+    def test_order_is_stable_then_growing(self):
+        """顺序必须是：工具语法 → 示例块 → **关系图谱** → session → …
+
+        关系图谱比 session 更靠前，它变化时才不会作废 session 前缀。
+        """
+        p, captured = self._setup()
+        _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
+        contents = [str(m.get("content")) for m in captured["ctx"]]
+        i_ts = contents.index("【工具语法】")
+        i_ex = contents.index("【示例块】")
+        i_rel = contents.index("【关系图谱】")
+        i_sess = contents.index("历史甲")
+        self.assertLess(i_ts, i_ex, "工具语法应在示例块之前")
+        self.assertLess(i_ex, i_rel, "示例块应在关系图谱之前")
+        self.assertLess(i_rel, i_sess, "🔴 关系图谱必须在 session 之前（否则session前缀会被作废）")
+
+    def test_relations_block_is_in_shared_prefix_for_gate(self):
+        """Gate 的共享前缀也必须含关系图谱（Gate 同样要认识群友）。"""
+        p, _ = self._setup()
+        base = [str(m.get("content")) for m in p.shared_context("g1")]
+        self.assertIn("【关系图谱】", base)
+
+    def test_empty_relations_block_not_injected(self):
+        p, captured = self._setup(relations_block=lambda: "")
+        _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
+        contents = [str(m.get("content")) for m in captured["ctx"]]
+        self.assertNotIn("", contents)
+        self.assertIn("历史甲", contents)
+
+    def test_system_prompt_no_longer_contains_relations(self):
+        """回归：`system_prompt()` 不得再拼别名/关系块（那是拆分的要点）。"""
+        import tempfile as _tf, json as _json, os as _os
+        from services.style_profile import StyleProfile
+        with _tf.TemporaryDirectory() as td:
+            with open(_os.path.join(td, "system_prompt_fragments.json"), "w",
+                      encoding="utf-8") as f:
+                _json.dump({"identity": "我是焦糖"}, f, ensure_ascii=False)
+            with open(_os.path.join(td, "member_relations.json"), "w",
+                      encoding="utf-8") as f:
+                _json.dump({"members": [
+                    {"uin": "1", "alias": "花鱼", "closeness": "close",
+                     "other_names": ["花心"]}]}, f, ensure_ascii=False)
+            sp = StyleProfile(td)
+            self.assertNotIn("花鱼", sp.system_prompt(), "人格块不得含关系图谱")
+            self.assertIn("花鱼", sp.relations_block(), "关系图谱应能独立取得")
+            self.assertIn("我是焦糖", sp.system_prompt())
+
+
+class TestRelationsBlockAppendOnly(unittest.TestCase):
+    """S9：关系块必须"只在尾部追加"（用户要的 skill-catalog 语义）。
+
+    ## 实测依据（2026-09-14）
+
+    原实现按 `【熟人】/【认识】/【新人】` **三段分组**输出 → 块内顺序与文件顺序
+    不一致 → 任何中段插入都让其后内容位移 → 整块之后的 session 前缀作废。
+    而 `member_relations.json` 的文件顺序**本就是追加式**：
+
+        [0..109]   人工策展的 close/known 混合
+        [110..184] 全部 auto_added=True、清一色 new（自动入列追加在尾部）
+
+    改为按文件顺序输出后：新成员永远出现在块尾 → **前缀逐字节稳定**。
+    """
+
+    def _mk(self, td, members):
+        import json as _json, os as _os
+        with open(_os.path.join(td, "member_relations.json"), "w",
+                  encoding="utf-8") as f:
+            _json.dump({"members": members}, f, ensure_ascii=False)
+
+    def _sp(self, td):
+        from services.style_profile import StyleProfile
+        return StyleProfile(td)
+
+    def test_new_member_extends_block_as_prefix(self):
+        """🔴 核心不变式：新增成员后，新块必须以旧块为前缀。"""
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as td:
+            base = [
+                {"uin": "1", "alias": "花鱼", "closeness": "close", "other_names": []},
+                {"uin": "2", "alias": "虾鱼丸", "closeness": "close", "other_names": ["虾虾"]},
+                {"uin": "3", "alias": "路人", "closeness": "known", "other_names": []},
+            ]
+            self._mk(td, base)
+            before = self._sp(td).relations_block()
+            self._mk(td, base + [
+                {"uin": "9", "alias": "新来的", "closeness": "new",
+                 "other_names": [], "auto_added": True}])
+            after = self._sp(td).relations_block()
+            self.assertTrue(after.startswith(before),
+                            "新增成员必须只在尾部追加（否则中段位移会作废整个前缀）")
+            self.assertIn("新来的", after.splitlines()[-1])
+
+    def test_file_order_preserved_not_grouped(self):
+        """按**文件顺序**输出，不做 close/known/new 分组重排。"""
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as td:
+            # 故意交错：close, new, known, close —— 分组实现会把 new 排到最后
+            self._mk(td, [
+                {"uin": "1", "alias": "甲", "closeness": "close", "other_names": []},
+                {"uin": "2", "alias": "乙", "closeness": "new", "other_names": []},
+                {"uin": "3", "alias": "丙", "closeness": "known", "other_names": []},
+                {"uin": "4", "alias": "丁", "closeness": "close", "other_names": []},
+            ])
+            blk = self._sp(td).relations_block()
+            idx = [blk.index(n) for n in ("甲", "乙", "丙", "丁")]
+            self.assertEqual(idx, sorted(idx), "必须保持文件顺序，不得分组重排")
+
+    def test_closeness_labels_survive(self):
+        """分段标题没了，但每行的 `[熟人]/[认识]/[新人]` 标签必须保留。"""
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as td:
+            self._mk(td, [
+                {"uin": "1", "alias": "甲", "closeness": "close", "other_names": []},
+                {"uin": "2", "alias": "乙", "closeness": "known", "other_names": []},
+                {"uin": "3", "alias": "丙", "closeness": "new", "other_names": []},
+            ])
+            blk = self._sp(td).relations_block()
+            for label in ("熟人", "认识", "新人"):
+                self.assertIn(f"[{label}]", blk, f"{label} 标签不得丢失")
+            for title in ("【熟人】", "【认识】", "【新人】"):
+                self.assertNotIn(title, blk, "不应再有分段标题（那会破坏追加顺序）")
