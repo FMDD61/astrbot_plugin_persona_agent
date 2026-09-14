@@ -91,6 +91,23 @@ class TestStickerPick(unittest.TestCase):
         self.assertEqual(svc.stats["below_threshold"], 1)
         self.assertTrue(r.top_k)          # 失败也要能看到候选分数（事后调阈）
 
+    def test_margin_default_off_accepts_dense_clusters(self):
+        """回归（2026-09-14）：`margin` 默认 **0（关闭）**。
+
+        实测证明这个参数的概念本身是错的：959 张库里大量同角色近似图，
+        top1/top2 天生接近；而**两个候选分数都高时它们都是好匹配，选哪个都对**，
+        不存在"模型犹豫"。端到端 16 条真实意图：margin=0.02 → 12/16（把 0.68/0.70
+        分的好匹配判成 ambiguous 而静默不发）、0.005 → 13/16、**0.0 → 15/16**。
+        """
+        import inspect
+        sig = inspect.signature(StickerService.__init__)
+        self.assertEqual(sig.parameters["margin"].default, 0.0)
+        # 行为：并列候选 + 高分 → 仍然发出（不因"模糊"而静默）
+        svc = self._svc(mk_items([("a", "无奈"), ("b", "无奈")]),
+                        min_score=0.1, high_confidence=0.5)
+        r = asyncio.run(svc.pick("无奈"))
+        self.assertIsNotNone(r.hit, "margin 关闭时高分并列不应导致拒发")
+
     def test_ambiguous_without_picker_skips_conservatively(self):
         # "无奈 开心" 与两条候选等距 → 分差 < margin → ambiguous → 宁可不发
         # 注意 high_confidence 要抬高，否则会被①高置信分支短路

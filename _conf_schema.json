@@ -308,7 +308,8 @@
       "timeout_sec": {
         "type": "float",
         "description": "单图像描述超时（秒），超时降级为无描述",
-        "default": 15
+        "default": 30,
+        "hint": "S6 标定（n=192）：p50 4.0s / p90 5.5s / p95 6.3s / p99 8.7s / max 26.9s —— 15s 会砍掉约 1% 的调用。>15s 的离群点全部是被整图直送的大 GIF（要压尾延迟就调小 image_prep.GIF_INLINE_MAX_BYTES）。"
       },
       "cache_ttl_sec": {
         "type": "float",
@@ -552,14 +553,14 @@
       "min_score": {
         "type": "float",
         "description": "相似度门槛（低于此不发）",
-        "hint": "🔴 须用真实库标定：878 张实测正样本 top1 p05=0.737 / 负样本 max=0.618 → 取 0.68。拍脑袋的 0.45 低于全部负样本，会让任何意图都匹配上某张图。工具：tools/calibrate_sticker_thresholds.py",
-        "default": 0.68
+        "hint": "🔴 须用真实库标定。959 张 v2 索引实测：负样本（库里无对应的日常意图）top1 max=0.583；正样本 top1 p05=0.710；合法弱意图最低 0.635（'摸头杀'）→ 取 **0.65** 落在负样本 max 与弱意图之间。工具：tools/calibrate_sticker_thresholds.py",
+        "default": 0.65
       },
       "margin": {
         "type": "float",
         "description": "top1-top2 死区（低于此视为并列）",
-        "hint": "实测该指标区分度弱（正样本分差 p25=0.019）—— 只挡完全并列，不要设大。",
-        "default": 0.02
+        "hint": "🔴 默认 0（关闭）。2026-09-14 实测证明这个概念本身是错的：959 张库里大量同角色近似图，top1/top2 天生接近；而**两个候选分数都高时它们都是好匹配，选哪个都对**，不存在'模型犹豫'。端到端 16 条真实意图：margin=0.02 → 12/16（把 0.68/0.70 分的好匹配判成 ambiguous 而静默不发）、0.005 → 13/16、**0.0 → 15/16**。想启用 LLM 精选再调大（需同时开 picker_enabled）。",
+        "default": 0.0
       },
       "picker_enabled": {
         "type": "int",
