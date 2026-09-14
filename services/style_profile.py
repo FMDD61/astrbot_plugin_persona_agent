@@ -169,10 +169,25 @@ class StyleProfile:
             parts.append("规则：\n- " + "\n- ".join(str(r) for r in rules if r))
         text = "\n\n".join(parts) if parts else "你是这个 QQ 群里的一名普通成员。"
 
-        alias_block = self._build_alias_block()
-        if alias_block:
-            text += f"\n\n{alias_block}"
+        # 🔴 S9（2026-09-14）：**别名/关系图谱不再拼进这里**。
+        #
+        # 实测问题：这块随新成员入列持续增长（一天 +8~11 次、每次约 +23 字符），
+        # 而它原本拼在 system prompt **末尾** → 每次增长都让**其后全部内容**
+        # （session 全量历史，实测 8 万 token）的缓存失效：
+        #   提示词变更那次: prompt 65560 → cached 3840 (5.9%) → other **61720** 全价
+        #   正常调用:      prompt 82475 → cached 82176 (99.6%) → other 仅 299
+        # 现在由 `relations_block()` 单独提供，调用方把它作为**独立的一条
+        # system 消息**放在人格之后 —— 它变时只废自己之后的部分，且下一个调用
+        # 就能重新缓存 session。
         return text
+
+    def relations_block(self) -> str:
+        """关系图谱（**独立块**，与人格分离）。
+
+        为什么独立：见 ``system_prompt()`` 里的注释 —— 它增长，人格不增长。
+        两者拼在一起时，"增长的块"会把"恒定的块"一起拖进失效区。
+        """
+        return self._build_alias_block()
 
     def volatile_line(self, local_hour: Optional[int] = None, mood: str = "") -> str:
         """逐轮易变信息（时间 + 心情）—— 放在上下文**末尾**专用。
@@ -188,15 +203,31 @@ class StyleProfile:
         return "\n".join(lines)
 
     def _build_alias_block(self) -> str:
+        """关系图谱块 —— **按文件顺序输出，保证"只在尾部追加"**。
+
+        ## 为什么不再按亲疏分段分组（S9，2026-09-14）
+
+        原实现把成员分进 `【熟人】/【认识】/【新人】` 三段再输出。后果：块内顺序
+        与文件顺序**不一致**，任何中段插入都会让其后全部内容位移 →
+        整块之后的前缀（session 全量，实测 8 万 token）缓存失效。
+
+        而实测 `member_relations.json` 的**文件顺序本身就是追加式的**：
+
+            [0..109]   人工策展的 close/known 混合（含少量 new）
+            [110..184] 全部 `auto_added=True`，清一色 new —— 自动入列追加在尾部
+
+        所以**按文件顺序输出**即天然满足"只在尾部追加"：新成员永远出现在块尾，
+        前面逐字节不变 → 前缀稳定（这正是用户要的 skill-catalog 语义）。
+
+        取舍：不再有 `【熟人】` 分段标题。但亲疏**没丢** —— 每个成员行的
+        `[熟人]/[认识]/[新人]` 标签保留，LLM 照样能判断关系远近。
+        """
         members = self._iter_members()
         if not members:
             return ""
-
-        close_lines: list[str] = []
-        known_lines: list[str] = []
-        new_lines: list[str] = []
+        lines: list[str] = []
         seen_aliases: set[str] = set()
-
+        # ⚠️ 不排序、不分组：严格按 `_iter_members()` 的顺序（= 文件顺序）
         for m in members:
             uin = str(m.get("uin", ""))
             alias = (m.get("alias") or "").strip()
@@ -209,28 +240,16 @@ class StyleProfile:
             seen_aliases.add(alias)
             other_names = m.get("other_names") or []
             closeness = (m.get("closeness") or "known").strip()
-
             label = CLOSENESS_LABEL.get(closeness, closeness)
             line = f"  {uin}: {alias}"
             if other_names:
                 line += f" (也常被叫作: {'、'.join(other_names)})"
             line += f"  [{label}]"
-
-            if closeness == "close":
-                close_lines.append(line)
-            elif closeness == "known":
-                known_lines.append(line)
-            else:
-                new_lines.append(line)
-
-        blocks: list[str] = []
-        for title, lines in [("熟人", close_lines), ("认识", known_lines), ("新人", new_lines)]:
-            if lines:
-                blocks.append(f"【{title}】\n" + "\n".join(lines))
-
-        if not blocks:
+            lines.append(line)
+        if not lines:
             return ""
-        return "群友识别（按 QQ 号，优先用别名称呼）：\n" + "\n\n".join(blocks)
+        return ("群友识别（按 QQ 号，优先用别名称呼；列表按入群先后排列，"
+                "**[熟人] 是关系最近的人**）：\n" + "\n".join(lines))
 
     def _hourly_local(self) -> dict:
         """按**本地小时**索引的 hourly 分布（兼容历史 UTC 文件）。
