@@ -25,6 +25,38 @@
 - **日记 `day` 偏移一天**：归档 09-12 的会话，`day` 却取轮换后的 `day_key()`（09-13）。改为按同一口径回推 24h
 - **provider id 写错会静默哑掉（新增加固）**：`_resolve_provider_id()` 现在**先校验配置值存在性** —— 写成不存在的 id 时 `llm_generate` 抛 `ProviderNotFoundError`、被 except 吞成空回复（又一条"看起来正常其实全哑"）。校验失败 → 告警 + 回退到会话 provider；拿不到 `provider_manager` 时返回"未知"照用配置值（不让校验本身成为故障源）。三级回退逻辑抽为纯函数 `llm_params.resolve_provider_id()`，可离线单测（+8 例）
 
+### Fixed (2026-09-14, 🔴 S6 识图：自由文本格式导致 69% 的描述拿不到 + 降采样缺失白烧 7 倍时间)
+> 956 次实测标定（串行、0 次 429）。子代理产出
+> `tools/calibrate_vision_params.py` + `data_out/vision_calib/`。
+
+- **🔴 失败机理（决定性，191/191 无例外）**：所有 `content` 为空的响应
+  `finish_reason` **全是 `length`**，且 `reasoning_tokens ≈ max_tokens`。
+  **不是**"模型把答案只写进 reasoning 就收尾"（该假设被证伪：**没有任何一例**
+  是 `stop` + 空 content），而是**话没说完就被砍断**。截断处原文可证：
+  「…关键词：颓废、趴桌、困倦、摆烂。**回答格式：**可见：白发戴灰蝴蝶结的…」
+  —— 模型把预算花在**"输出格式谈判"**上（自由文本 prompt 没说清输出形状）。
+- **修法：约定固定 JSON schema**（唯一主导因素）。reasoning 从"顶格"降到
+  **p50≈150**，描述可用率 **31.2% → 100%**（n=144，0 截断）。
+  53 张历史失败图：现网 **15.1% → 100%**。
+- **温度不是因素**：JSON 下 0.0/0.3/0.7 均 100%；取 0.0 求可复现。
+- **`reasoning_effort` 必须显式发 `low`**：网关无 off/none 档，只能发 low 或
+  完全不发，而**不发更糟**（p95 10.0s/max 26.1s vs low 的 5.9s/5.9s）。
+- **`max_tokens` 512 → 2048**：配对实测**无代价**（同 120 张：时延中位 −0.02s、
+  completion_tokens 反而 216 vs 247、reasoning 不发散 p50=131）。
+- **🔴 `vision.py` 不降采样 = 白烧 7 倍时间**：同一张图 A/B 的 **prompt_tokens
+  完全相同**（412 vs 412，网关侧图像 token 数固定），而时延 **4.0s → 29.6s
+  均值 / 最坏 127.5s**。原图不带来任何额外视觉信息，只贡献上传时间。
+  新增 `services/image_prep.py`（与离线入库工具共用），线上识图改为先降采样；
+  实测 13.4MB GIF：**13383KB → 27KB、26s → 4.2s**。
+- **稳定性**：现网配置 24 图各跑 2 次有 **7 图结果翻转**（真随机，机制是
+  "reasoning 是重尾随机变量撞上 token 上限"）；推荐配置 **72/72 全成功、0 翻转**。
+- **动图整图直送**：多帧 GIF 且 ≤1.5MB → 发 `image/gif`（保留动作语义），
+  否则回退首帧降采样。实测首帧把"疯狂摇头撞桌"描述成"张嘴"。
+- 新增 `services/image_prep.py` + `tests/test_image_prep.py`（20 例）。
+  测试 376 → **396 全绿**（系统 python 无 PIL 时 7 例自动跳过）。
+- **待办（需你在 WebUI 改）**：`vision.timeout_sec` 15 → **30**
+  （推荐配置 p95=6.3s、p99=8.7s、max 26.9s，**>15s 占 1.04%**）。
+
 ### Added (2026-09-13, S3③ 出站发贴纸 + 提示词教学 + 开关 + 启动自检)
 - **出站发贴纸接通**：`main._send_sticker()` —— `SendIntent.emote` → `StickerService.pick()`
   → `Comp.Image.fromFileSystem(path)`（✅ 读宿主源码确认原生支持本地文件通路，
