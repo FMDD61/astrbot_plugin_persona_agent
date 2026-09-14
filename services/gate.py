@@ -210,7 +210,14 @@ class GateService:
           2. @ 提示（@ 了通常应回，但冲突除外）
           3. **判定维度的显式约束**（见 GATE_JUDGE_INSTRUCTION）
         """
-        msgs = [dict(m) for m in contexts if isinstance(m, dict)]
+        # 🔴 S10（2026-09-14 用户观察）：判定指令**放到最前面**，成为缓存前缀的一部分。
+        #
+        # 它本身约 600 字符（≈450 token），原先拼在**末尾那条 user 消息**里 ——
+        # 位置在 8 万 token 的 session 之后，而后面还有 `【现在要判断的这一条】`
+        # 这种逐轮变化的量跟在它后面，**每次都要重算**。
+        # 移到最前 + 内容恒定 ⇒ 它进入稳定前缀，**一次付清**。
+        msgs: list[dict] = [{"role": "system", "content": GATE_JUDGE_INSTRUCTION}]
+        msgs += [dict(m) for m in contexts if isinstance(m, dict)]
         tail: list[str] = []
         tail.append(f"【现在要判断的这一条】{current_speaker}：{current_text}")
         if is_at:
@@ -225,7 +232,7 @@ class GateService:
                                 else f"- {txt[:120]}")
             if hits:
                 tail.append("风格参考片段（机器人风格源的相似历史发言）：\n" + "\n".join(hits))
-        tail.append(GATE_JUDGE_INSTRUCTION)
+        # 判定指令已上移到最前（见上），末尾只留逐轮变化的部分
         msgs.append({"role": "user", "content": "\n\n".join(tail)})
         return msgs
 

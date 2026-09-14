@@ -94,6 +94,8 @@ class PersonaPipeline:
         tool_syntax_block: Optional[Callable[[], str]] = None,
         # S9: 关系图谱块（独立于人格 —— 它增长、人格不增长）
         relations_block: Optional[Callable[[], str]] = None,
+        # S10: 关系图谱增量（新群友/亲疏变化 → 追加到 session 尾部）
+        relations_delta: Optional[Callable[[], str]] = None,
         # S2: 「现在要回应的」块构造器。pipeline 负责拆出正文/图片/表情，
         # main 负责加说话人/时间/心情等上下文（它才知道这些）。
         turn_block: Optional[Callable[[list[str], dict], str]] = None,
@@ -126,6 +128,7 @@ class PersonaPipeline:
         self._examples_block = examples_block
         self._tool_syntax_block = tool_syntax_block
         self._relations_block = relations_block
+        self._relations_delta = relations_delta
         # S2: 「现在要回应的」块构造器（可选；未接线时退回旧行为）
         self._turn_block = turn_block
         self._session_append = session_append
@@ -548,6 +551,19 @@ class PersonaPipeline:
         #        （v3 意图："静默但照常记录"）。
         #   建上下文之前的早退由上方 `_ensure_session_append` 兜底；此处幂等。
         self._ensure_session_append(group_id, trace)
+        # S10：关系图谱增量 —— 追加到 session **尾部**（一条 system 消息）。
+        # 为什么在尾部：图谱块在最前面，若它变化，**它之后的一切**（示例块 +
+        # session 全量 8 万 token）前缀都不匹配 → 全价重算（实测 other=61720）。
+        # 改成"块不动、增量追加在尾"后，前缀逐字节不变，只有这一条是新的。
+        # 位置：紧跟本条落盘之后、引用快照之前（快照要包含它，编号基才与 LLM 一致）。
+        if self._relations_delta is not None and self.session_mgr is not None:
+            try:
+                _delta = self._relations_delta()
+                if _delta:
+                    self.session_mgr.append(group_id, "system", _delta)
+                    trace["relations_delta"] = len(_delta)
+            except Exception as e:
+                trace["relations_delta_error"] = f"{type(e).__name__}: {e}"
         # B-002 观测：本会话被丢弃的空 content 条目（>0 = 数据曾损坏，已自愈）
         if self.session_mgr is not None and hasattr(self.session_mgr, "dropped_empty"):
             try:

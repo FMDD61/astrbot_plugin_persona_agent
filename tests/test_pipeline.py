@@ -108,9 +108,10 @@ class _FakeInterjection:
 def _pipeline(**over):
     """Build a pipeline with all fakes; override via kwargs.
 
-    ⚠️ 新增可选回调时**必须在这里转发** —— 否则测试与线上接线不一致会静默失真
-    （已踩过三次：`turn_block`/`session_append`/`examples_block`/`tool_syntax_block`/
-    `relations_block`）。下面用 `over.get(...)` 显式列出，取值时一眼可见。
+    ⚠️ 新增可选回调时**必须在这里转发** —— 否则测试与线上接线不一致会静默失真。
+    **已踩过四次**：`turn_block`/`session_append`/`examples_block`/`tool_syntax_block`/
+    `relations_block`/`relations_delta`（每次都是"测试绿但接线漏了"）。
+    新增回调后请立刻在此加一行，并跑一次真实接线路径的测试。
     """
     p = PersonaPipeline(
         style=None,
@@ -125,6 +126,7 @@ def _pipeline(**over):
         examples_block=over.get("examples_block", lambda: ""),
         tool_syntax_block=over.get("tool_syntax_block", None),
         relations_block=over.get("relations_block", None),
+        relations_delta=over.get("relations_delta", None),
         postprocess=lambda s: s.strip(),
         temperature_for=lambda trig: 0.8,
         turn_block=over.get("turn_block", None),
@@ -873,9 +875,16 @@ class TestSharedContextS4(unittest.TestCase):
         self.assertTrue(d.reply)
         self.assertEqual(captured["system_prompt"], "【人格提示词】正文")
         msgs = captured["messages"]
-        self.assertEqual(msgs[0], {"role": "user", "content": "历史"})   # 前缀原样
+        # S10：判定指令**上移到最前**（内容恒定 → 进缓存前缀，一次付清）。
+        # 原先它在末尾那条 user 消息里，位于 8 万 token 的 session 之后 →
+        # 每次都要跟着重算。
+        self.assertEqual(msgs[0]["role"], "system")
+        self.assertIn("不要引入任何其他维度", msgs[0]["content"])
+        # 共享前缀原样保留，紧随判定指令之后
+        self.assertEqual(msgs[1], {"role": "user", "content": "历史"})
+        # 末尾只留逐轮变化的部分
         self.assertIn("【现在要判断的这一条】", msgs[-1]["content"])
-        self.assertIn("不要引入任何其他维度", msgs[-1]["content"])
+        self.assertNotIn("不要引入任何其他维度", msgs[-1]["content"])
 
     def test_shared_system_prompt_falls_back_when_empty(self):
         from services.gate import GATE_SYSTEM_PROMPT, GateService
@@ -1088,3 +1097,154 @@ class TestRelationsBlockAppendOnly(unittest.TestCase):
                 self.assertIn(f"[{label}]", blk, f"{label} 标签不得丢失")
             for title in ("【熟人】", "【认识】", "【新人】"):
                 self.assertNotIn(title, blk, "不应再有分段标题（那会破坏追加顺序）")
+
+
+class TestRelationsDeltaS10(unittest.TestCase):
+    """S10：关系图谱**增量追加到 session 尾部**（用户设计）。
+
+    ## 为什么（2026-09-14 实测）
+
+    图谱块在最前面，它一变（新成员入列，一天 8~11 次）→ **它之后的一切**
+    （示例块 + session 全量 8 万 token）前缀都不匹配 → 全价重算
+    （实测 `other=61720`，正常调用只有 `other≈300`）。
+
+    改为"块不动 + 增量追加到尾部"后，前缀逐字节不变，只有那一条消息是新的。
+    用户明确：**接受"更新那一次必然 miss"**，因为替代方案（更新不 miss）意味着
+    全量群聊上下文 + LLM 思维链 + RAG 示例文段全部 miss。
+    """
+
+    def _setup(self, delta=None):
+        from services.session_manager import SessionManager
+        sm = SessionManager(data_dir=None, max_messages=None)
+        sm.append("g1", "user", "历史甲", name="甲", message_id="m1", sender_uin="u1")
+        captured = {}
+
+        def gen(t, c, e, temp, su, umo):
+            captured["ctx"] = [dict(m) for m in c]
+            return _async("好")
+
+        over = dict(session=sm, session_append=lambda *a: None, generate=gen,
+                    relations_block=lambda: "【关系图谱】",
+                    relations_delta=delta)
+        p = _pipeline(**over)
+        return p, sm, captured
+
+    def test_delta_appended_to_session_tail(self):
+        p, sm, captured = self._setup(delta=lambda: "［群友识别更新］\n  9: 新人 [新人]")
+        _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
+        msgs = sm.get_contexts("g1")
+        # 顺序：… → 增量(system) → 本条用户消息 → assistant
+        # 所以增量**不在末尾**，但它必须在 session 里（下一轮前缀可见）
+        sys_msgs = [m for m in msgs if m.get("role") == "system"]
+        self.assertEqual(len(sys_msgs), 1)
+        self.assertIn("［群友识别更新］", str(sys_msgs[0]["content"]))
+        # 它必须在历史条目**之后**（追加语义：只在尾部加，不动前面）
+        i_delta = msgs.index(sys_msgs[0])
+        self.assertGreater(i_delta, 0, "增量应追加在历史之后，而非插到前面")
+        self.assertIn("历史甲", str(msgs[0].get("content")),
+                      "历史不得被改动（前缀稳定是这套设计的全部意义）")
+
+    def test_delta_not_visible_to_current_turn(self):
+        """增量追加在**构建上下文之后** —— 本轮 LLM 看不到它（下一轮才看到）。
+
+        这不是缺陷而是顺序使然：上下文已组装完毕。也让"本轮不该被自己刚追加的
+        内容影响"成立。
+        """
+        p, sm, captured = self._setup(delta=lambda: "［群友识别更新］MARKER_XYZ")
+        _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
+        joined = "\n".join(str(m.get("content")) for m in captured["ctx"])
+        self.assertNotIn("MARKER_XYZ", joined)
+        # 但已经进了 session（下一轮会看到）
+        self.assertIn("MARKER_XYZ",
+                      "\n".join(str(m.get("content")) for m in sm.get_contexts("g1")))
+
+    def test_no_delta_means_no_append(self):
+        p, sm, _ = self._setup(delta=lambda: "")
+        before = len(sm.get_contexts("g1"))
+        _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
+        # 只多了本条用户消息（+1），没有额外的 system 增量
+        sys_msgs = [m for m in sm.get_contexts("g1") if m.get("role") == "system"]
+        self.assertEqual(sys_msgs, [], "无增量时不应产生任何 system 消息")
+
+    def test_none_delta_callback_is_safe(self):
+        p, sm, _ = self._setup(delta=None)
+        _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
+        self.assertTrue(sm.get_contexts("g1"))
+
+    def test_delta_error_does_not_break_turn(self):
+        def boom():
+            raise RuntimeError("delta boom")
+        p, sm, _ = self._setup(delta=boom)
+        intent = _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
+        self.assertIsNotNone(intent)
+        # 增量出错不得影响本轮（降级必须可见但不阻断）
+        self.assertTrue(any(k.startswith("relations_delta")
+                            for k in (intent.trace or {})),
+                        f"应记录增量失败，trace keys={list((intent.trace or {}).keys())}")
+
+
+class TestRelationsDeltaState(unittest.TestCase):
+    """`relations_delta()` 的增量语义（新 uin vs 行文本变化）。"""
+
+    def _sp(self, td, members):
+        import json as _json, os as _os
+        with open(_os.path.join(td, "member_relations.json"), "w",
+                  encoding="utf-8") as f:
+            _json.dump({"members": members}, f, ensure_ascii=False)
+        from services.style_profile import StyleProfile
+        return StyleProfile(td)
+
+    def test_first_run_returns_empty(self):
+        """首次（known 为空）必须返回空 —— 初始块已在前缀里，不该灌一整块。"""
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as td:
+            sp = self._sp(td, [{"uin": "1", "alias": "甲", "closeness": "close"}])
+            self.assertEqual(sp.relations_delta({}), ([], []))
+
+    def test_new_member_detected(self):
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as td:
+            sp = self._sp(td, [{"uin": "1", "alias": "甲", "closeness": "close"}])
+            known = dict(sp.relations_lines())
+            sp2 = self._sp(td, [{"uin": "1", "alias": "甲", "closeness": "close"},
+                                {"uin": "2", "alias": "乙", "closeness": "new"}])
+            new, changed = sp2.relations_delta(known)
+            self.assertEqual(len(new), 1)
+            self.assertIn("乙", new[0])
+            self.assertEqual(changed, [])
+
+    def test_closeness_change_is_a_delta(self):
+        """🔴 人工调整亲疏必须产生增量 —— 否则对 LLM 永远不可见。
+
+        用户明确："我可能产生人工去把 close 调成 known 等行为"。
+        """
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as td:
+            sp = self._sp(td, [{"uin": "1", "alias": "甲", "closeness": "close"}])
+            known = dict(sp.relations_lines())
+            sp2 = self._sp(td, [{"uin": "1", "alias": "甲", "closeness": "known"}])
+            new, changed = sp2.relations_delta(known)
+            self.assertEqual(new, [])
+            self.assertEqual(len(changed), 1, "亲疏变化必须被检出")
+            self.assertIn("[认识]", changed[0])
+
+    def test_alias_change_is_a_delta(self):
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as td:
+            sp = self._sp(td, [{"uin": "1", "alias": "甲", "closeness": "close",
+                                "other_names": []}])
+            known = dict(sp.relations_lines())
+            sp2 = self._sp(td, [{"uin": "1", "alias": "甲", "closeness": "close",
+                                 "other_names": ["小甲"]}])
+            _, changed = sp2.relations_delta(known)
+            self.assertEqual(len(changed), 1)
+            self.assertIn("小甲", changed[0])
+
+    def test_no_change_returns_empty(self):
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as td:
+            members = [{"uin": "1", "alias": "甲", "closeness": "close"}]
+            sp = self._sp(td, members)
+            known = dict(sp.relations_lines())
+            sp2 = self._sp(td, members)
+            self.assertEqual(sp2.relations_delta(known), ([], []))
