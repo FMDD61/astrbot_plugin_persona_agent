@@ -20,6 +20,7 @@ from typing import Optional
 DIARY_FILE = "daily_diary.jsonl"
 WEEKLY_FILE = "weekly_summary.jsonl"
 MONTHLY_FILE = "monthly_summary.jsonl"
+YEARLY_FILE = "yearly_summary.jsonl"
 _PRELUDE = (
     "请把过去一段时间群里发生的事写成一段简短摘要（第一人称、本人语气），"
     "按时间顺序包含主要话题与群友互动，不要列条、不要编造日日记与原文里没有的事。"
@@ -40,6 +41,57 @@ def monthly_window(today: date) -> tuple[date, date, str]:
     end = first_this - timedelta(days=1)
     start = end.replace(day=1)
     return start, end, end.strftime("%Y-%m")
+
+
+def yearly_window(today: date) -> tuple[date, date, str]:
+    """Previous complete calendar year + label YYYY。（S12 新增）
+
+    ## 为什么年报读**月报**而不是日记
+
+    用户 2026-09-15 确认："保持扁平结构和年报读月报"。层级选择的关键在于
+    **刻度是否可整除**：
+
+      - 日 → 月：可整除（每月一个自然月）→ 月报读日日记，**无错位**
+      - 月 → 年：可整除（每年 12 个自然月）→ 年报读月报，**无错位**
+      - 日 → 周：**不可整除**（ISO 周与月边界互相切割）
+
+    所以**周报是旁支、不进主链**：它有自己的视角（"近期动态"），
+    与月报内容有重叠是正常的。若强行让月报读周报，跨月的那一周会让
+    两个月都"不完整"，且该误差**无法在月层级修正**（周不可分）。
+    """
+    y = today.year - 1
+    return date(y, 1, 1), date(y, 12, 31), str(y)
+
+
+def list_summaries(path: Path, group_id: str, start: date, end: date,
+                   prefix: str = "") -> list[dict]:
+    """读某层的摘要记录（用于年报读月报）。``prefix`` 按 period 前缀过滤。"""
+    out: list[dict] = []
+    try:
+        lines = path.read_text("utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("group_id", "")) != group_id:
+            continue
+        period = str(rec.get("period") or "")
+        if prefix and not period.startswith(prefix):
+            continue
+        summary = str(rec.get("summary") or "").strip()
+        if not summary:
+            continue
+        out.append({"period": period, "summary": summary})
+    out.sort(key=lambda r: r["period"])
+    return out
 
 
 def list_diaries(path: Path, group_id: str, start: date, end: date) -> list[dict]:
@@ -96,8 +148,28 @@ def sample_days(data_dir: str, group_id: str, start: date, end: date,
 
 
 def build_prompt(kind: str, group_id: str, label: str, diaries: list[dict],
-                 samples: list[str], max_chars: int = 800) -> str:
-    label_cn = "一周" if kind == "weekly" else "一个月"
+                 samples: list[str], max_chars: int = 800,
+                 monthlies: Optional[list[dict]] = None) -> str:
+    """组装摘要提示词。
+
+    `yearly` 走**月报**作原料（`monthlies`），其余走日日记 + 原文抽样。
+    """
+    label_cn = {"weekly": "一周", "monthly": "一个月",
+                "yearly": "一年"}.get(kind, "一段时间")
+    if kind == "yearly":
+        lines = [
+            f"（请为群 {group_id} 写 {label_cn}（{label}）的本人语气回顾，"
+            f"约 {max(min(max_chars, 800), 120)} 字以内。）",
+            "【各月月记】",
+        ]
+        ml = monthlies or []
+        if ml:
+            for rec in ml:
+                lines.append(f"- {rec.get('period')}: {str(rec.get('summary'))[:300]}")
+        else:
+            lines.append("（无）")
+        lines.append("\n请把这一年的脉络写成一段连贯的回顾，不要逐月罗列。")
+        return "\n".join(lines)
     lines = [
         f"（请为群 {group_id} 写 {label_cn}（{label}）的本人语气摘要，"
         f"约 {max(min(max_chars, 800), 120)} 字以内。）",
@@ -140,8 +212,32 @@ class SummaryService:
 
     def collect(self, kind: str, group_id: str, today: Optional[date] = None
                 ) -> dict:
+        """收集某一层级的原料。
+
+        - `weekly` / `monthly`：窗口取**日日记**（+ 抽样原文防失真）
+        - `yearly`：窗口取**12 篇月报**（月→年可整除，无错位；理由见
+          `yearly_window` 的 docstring）
+        """
         today = today or date.today()
-        start, end, label = weekly_window(today) if kind == "weekly" else monthly_window(today)
+        if kind == "weekly":
+            start, end, label = weekly_window(today)
+        elif kind == "monthly":
+            start, end, label = monthly_window(today)
+        else:
+            start, end, label = yearly_window(today)
+
+        if kind == "yearly":
+            # 年报读月报：把该年 12 篇月报当作"原料"（每篇已是干净的聚合）
+            src = list_summaries(self.output_path("monthly"), group_id,
+                                 start, end, prefix=label)
+            return {
+                "kind": kind, "group_id": group_id, "label": label,
+                "start": start.isoformat(), "end": end.isoformat(),
+                "diaries": [], "samples": [],
+                "monthlies": src,
+                "n_diaries": len(src), "n_samples": 0,
+            }
+
         diaries = list_diaries(self._dir / DIARY_FILE, group_id, start, end)
         samples = sample_days(str(self._dir), group_id, start, end)
         return {
@@ -152,4 +248,5 @@ class SummaryService:
         }
 
     def output_path(self, kind: str) -> Path:
-        return self._dir / (WEEKLY_FILE if kind == "weekly" else MONTHLY_FILE)
+        return self._dir / {"weekly": WEEKLY_FILE, "monthly": MONTHLY_FILE,
+                            "yearly": YEARLY_FILE}.get(kind, WEEKLY_FILE)
