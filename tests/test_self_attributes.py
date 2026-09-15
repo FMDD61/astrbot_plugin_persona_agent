@@ -53,18 +53,33 @@ PROVIDED = {
 #      → 会误报成"只读不写"（实测 `_REL_STATE` 就是这类）
 #   2. 条件分支里的读取（如 `_dream_job` 只在 cron 注册块内使用）可能被漏算
 # 因此本测试的价值在于**捕获新增问题**，而非完备证明。
-KNOWN_WRITE_ONLY = {"_REL_STATE", "_decision_log_path", "_sleep_enabled",
-                    "_dream_job"}
+# 已知的"只写不读"白名单 —— **当前为空**（S13 清理批次已处理全部三处）：
+#   - `_REL_STATE`：检查器补上"类级属性收集"后不再漏报
+#   - `_decision_log_path`：删除（只赋不用的历史遗留）
+#   - `_sleep_enabled`：删除（`_is_sleeping` 每次读活配置，该快照无用）
+#   - `_dream_job`：随 `services/dream_job.py` 整体删除（S11 起即为死代码）
+#
+# 保留这个集合是为了**将来**：若某个"只写不读"是刻意为之（如纯观测字段），
+# 列在这里而不是让测试失败。
+#
+# ⚠️ 本检查器是**启发式**，边界如实记录：
+#   1. 括号内的赋值（续行写法）不会被算作写入 → 会误报"只读不写"
+#   2. 条件分支里的读取可能被漏算
+#   3. 只覆盖 `PersonaAgent` 一个类
+# 价值在于**捕获新增问题**，而非完备证明。
+KNOWN_WRITE_ONLY: set[str] = set()
 
 
 def _class_attrs(path: Path, cls_name: str) -> tuple[set[str], set[str]]:
     """返回 (被赋值的属性名, 被读取的**非方法**属性名)。
 
-    两个必须注意的点（本检查器前两版都栽过）：
+    三个必须注意的点（本检查器前三版都栽过）：
       1. 必须排除**方法名** —— `self._admin_bind(...)` 是方法调用，
-         AST 上与属性读取长得一样；不排除会把所有方法调用误报成"只读不写"
+         AST 上与属性读取长得一样；不排除会把所有方法调用误报
       2. 必须排除**赋值目标节点本身** —— `self.X = 1` 里的 `self.X` 也是
          `ast.Attribute`，不排除会同时进 writes 和 reads
+      3. 必须收集**类级属性** —— `_REL_STATE = "..."` 写在类体里（不带 self.），
+         不收集会把它误报成"只读不写"
     """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     target = None
@@ -78,16 +93,15 @@ def _class_attrs(path: Path, cls_name: str) -> tuple[set[str], set[str]]:
     methods = {n.name for n in target.body
                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
-    # 类级属性/常量：`_X = "..."` 直接写在类体里（不带 self.）——
-    # 它们也是合法的 `self._X` 来源（实测 `_REL_STATE` 就是这种，漏收集会误报）
     writes: set[str] = set()
-    for node in target.body:
+    for node in target.body:                      # 类级属性/常量
         if isinstance(node, ast.Assign):
             for t in node.targets:
                 if isinstance(t, ast.Name):
                     writes.add(t.id)
+
     write_nodes: set[int] = set()
-    for node in ast.walk(target):
+    for node in ast.walk(target):                 # self.X = ...
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             tgts = node.targets if isinstance(node, ast.Assign) else [node.target]
             for t in tgts:
