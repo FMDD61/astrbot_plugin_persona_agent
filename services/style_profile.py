@@ -94,6 +94,23 @@ class StyleProfile:
     def _get(self, name: str) -> dict:
         return self._maybe_reload(name)
 
+    @staticmethod
+    def is_bot_member(m: dict) -> bool:
+        """该条目是否为 **bot 账号**（而非真人群友）。
+
+        ## 为什么单独收口（S12，2026-09-14）
+
+        成员表里有 **2 个 bot 账号混在真人中间**（星野、苗爷），原先靠
+        `m.get("notes") == "bot"` 排除。但 `notes` 要**让给"群友描述"**
+        （LLM 生成 + 人工可改），所以标记迁到 `kind`。
+
+        兼容读取：**`kind` 或 `notes` 任一为 "bot" 都算 bot** ——
+        迁移期双写，两边都认。**必须两边都查**：漏掉会让 bot 账号被当成真人
+        暴露给 LLM（关系图谱、熟悉度、描述全都会带上它）。
+        """
+        return str(m.get("kind") or "").strip() == "bot" \
+            or str(m.get("notes") or "").strip() == "bot"
+
     def _iter_members(self) -> list[dict]:
         rel = self._get("member_relations.json")
         return rel.get("members", rel.get("top_members", []))
@@ -193,7 +210,7 @@ class StyleProfile:
         for m in self._iter_members():
             uin = str(m.get("uin", ""))
             alias = (m.get("alias") or "").strip()
-            if not uin or not alias or m.get("notes") == "bot":
+            if not uin or not alias or self.is_bot_member(m):
                 continue
             if alias in seen:
                 continue
@@ -295,7 +312,7 @@ class StyleProfile:
             alias = (m.get("alias") or "").strip()
             if not uin or not alias:
                 continue
-            if m.get("notes") == "bot":
+            if self.is_bot_member(m):
                 continue
             if alias in seen_aliases:
                 continue
