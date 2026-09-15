@@ -432,6 +432,48 @@ class StyleProfile:
             return None, f"ambiguous_other_name({len(secondary)})"
         return None, "unknown_name"
 
+    # 等级序（与 services/familiarity.py 的 CLOSENESS_ORDER 同源语义）
+    _CLOSENESS_RANK = {"new": 0, "known": 1, "close": 2}
+
+    def set_closeness(self, uin: str, value: str, *, force: bool = False) -> bool:
+        """写入某成员的亲疏等级。返回是否真的改了。
+
+        ``force=False``（默认）时**只允许提升** —— 这是写入层的最后一道闸：
+        即便调用方判断失误，也不会把等级降下来（"只升不降"是三处共同保证的：
+        提案生成过滤 / 批准时二次校验 / 这里）。
+
+        ``force=True`` 给人工路径用（用户明确"人工可以绕过所有限制"）。
+
+        原子写 + 只改目标条目的 `closeness` 字段，**不动** human 编辑的其他字段。
+        """
+        import os as _os
+        u = str(uin or "").strip()
+        v = str(value or "").strip()
+        if not u or v not in self._CLOSENESS_RANK:
+            return False
+        rel = self._get("member_relations.json")
+        members = rel.get("members", [])
+        target = None
+        for m in members:
+            if str(m.get("uin") or "") == u:
+                target = m
+                break
+        if target is None:
+            return False
+        cur = str(target.get("closeness") or "").strip()
+        if cur == v:
+            return False
+        if not force and self._CLOSENESS_RANK[v] <= self._CLOSENESS_RANK.get(cur, -1):
+            return False          # 非提升 → 拒绝
+        target["closeness"] = v
+        rel["members"] = members
+        path = self._path("member_relations.json")
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(rel, ensure_ascii=False, indent=2), encoding="utf-8")
+        _os.replace(tmp, path)
+        self._cache.pop("member_relations.json", None)   # 让下次读取拿到新值
+        return True
+
     def member_closeness(self, uin: str) -> str:
         """返回该成员的亲疏等级（``close``/``known``/``new``）；未知返回空串。"""
         u = str(uin or "")
