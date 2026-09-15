@@ -203,12 +203,10 @@ class PersonaAgent(Star):
                 decide_cooldown_sec=float(gate_cfg.get("decide_cooldown_sec", 8.0)),
                 recent_n=int(gate_cfg.get("recent_n", 15)),
                 max_rag_hits=int(gate_cfg.get("max_rag_hits", 3)),
-                # S4：共享上下文模式的 system prompt = RP 的人格提示词
-                # （**含 163 人别名关系块**）。这样 Gate 与 RP 看到逐字节
-                # 相同的前缀 → 判断依据同级 + 网关前缀缓存被两次调用复用。
-                shared_system_prompt=(
-                    self.style.system_prompt() if self.style is not None else ""
-                ),
+                # 🔴 S14 修正 S4 的错误：Gate 的 system 必须是**裁判身份**，
+                # 不能是 RP 人格。实测把人格当 system 会让模型"参与聊天而不是
+                # 判断"（解析失败率 0%→45%，244 条决策退化为保守静默）。
+                # 不传 shared_system_prompt → GateService 自动用 GATE_SYSTEM_PROMPT。
             )
             logger.info("[persona_agent] GateLLM decision layer enabled (A7/S4 共享上下文)")
         else:
@@ -408,6 +406,7 @@ class PersonaAgent(Star):
             examples_block=self._examples_block,
             tool_syntax_block=self._tool_syntax_block,
             relations_block=(self.style.relations_block if self.style is not None else None),
+            system_prompt=(self.style.system_prompt if self.style is not None else None),
             relations_delta=self._relations_delta_block,
             postprocess=self._postprocess_plain,
             temperature_for=self._temperature_for,
@@ -1623,10 +1622,11 @@ class PersonaAgent(Star):
         if _mt > 0:
             gen_kwargs["max_tokens"] = _mt
         try:
+            # S14：**不再传 system_prompt** —— 它已在 contexts 第一条
+            # （会话状态）。传了会与首条重复，且每次热加载会破缓存。
             resp = await self.context.llm_generate(
                 chat_provider_id=provider_id,
                 prompt=None,
-                system_prompt=sys_prompt,
                 contexts=contexts,
                 **gen_kwargs,
             )

@@ -26,12 +26,28 @@ from pathlib import Path
 from typing import Optional
 
 
+#: 可变块在 deque 里占位的标记（见 ``Session.append_system_update`` 的说明）。
+#: 用标记占位而非直接存内容，是为了让它**不受 maxlen 驱逐** —— 代价是
+#: ``len(messages)`` 会把标记算进去（本项目所有 ``sess.messages`` 访问都经
+#: SessionManager，一致地跳过标记即可）。
+_BLOCK_MARK = "__sys_block__"
+
+
 @dataclass
 class Session:
     group_id: str
     day: str = ""
     """Session day key (rotation window), empty until first use."""
     messages: deque[dict] = field(default_factory=lambda: deque(maxlen=600))
+    #: 会话开卷时的 system prompt（**不放进 deque**）。
+    #: 🔴 为什么不放 deque：deque 有 maxlen，容量压力下它会被**静默挤掉**
+    #: （测试抓到：max_messages=10 灌 50 条后 prompt 消失）→ 下次构建又会
+    #: 重写 [0] → **破缓存**。它是会话状态，必须与容量无关。
+    system_prompt: str = ""
+    #: 可变块内容：``{block_id: content}``。同样刻意**不放 deque**
+    #: （deque 有 maxlen，内容会被驱逐；标记不会）。
+    sys_blocks: dict[int, str] = field(default_factory=dict)
+    _next_block_id: int = 0
 
     def append(
         self,
@@ -51,7 +67,96 @@ class Session:
             msg["_mid"] = str(message_id)
         if sender_uin and role == "user":
             msg["_uin"] = str(sender_uin)
+        # 🔴 S14：deque 满时，**先驱逐最老的真消息**，别把可变块标记挤掉。
+        # 契约（docstring 早已写明）：保留 system + 最近 N 条 ——
+        # 纯靠 deque(maxlen) 会连标记一起 FIFO 掉，且在"下一个 append"时才
+        # 表现为标记先消失（测试抓到：max_messages=12 灌 30 条后块没了）。
+        ml = self.messages.maxlen
+        if ml is not None and len(self.messages) >= ml:
+            for i, m in enumerate(self.messages):
+                if _BLOCK_MARK not in m:      # 找最老的真消息
+                    del self.messages[i]
+                    break
         self.messages.append(msg)
+
+    def has_system_prompt(self) -> bool:
+        """会话是否已经"开卷"（已记录首轮 system prompt）。"""
+        return bool(self.system_prompt)
+
+    def ensure_system_prompt(self, content: str) -> bool:
+        """确保会话第一条是 system prompt。返回**是否新写入**。
+
+        ## 为什么 system prompt 要进会话（S14，用户设计）
+
+        旧实现每轮把 system prompt 作为 ``llm_generate(system_prompt=…)``
+        独立参数传入 —— prompt 一改，**整个请求的第一个 token 就变了**，
+        其后全部（实测 8 万 token 的会话）前缀缓存失效。
+        实测代价：一天 8–11 次变更，单次 61k–99k 全价 token。
+
+        新实现把它**写进会话第一条**，此后**从日志加载**：
+          - 不变 → 前缀永远稳定
+          - 变更 → 走 ``append_system_update()`` **追加**，不动第一条
+
+        ``content`` 为空时不写（避免往历史里塞空 system 条目）。
+        """
+        c = str(content or "").strip()
+        if not c:
+            return False
+        if self.has_system_prompt():
+            return False
+        self.system_prompt = c          # 存在字段里，不受 deque maxlen 驱逐
+        return True
+
+    def append_system_update(self, content: str) -> bool:
+        """prompt 变更 → **追加**一个更新块。返回是否真的追加。
+
+        追加是**必然选择**：prompt 变了不能改第一条（改了 = 破坏全量前缀
+        缓存），只能往后加。用户拍板：**追加块累积保留、不清理**
+        （清理 = 改历史 = 破缓存）。
+
+        内容与"上一次生效的设定"相同时不追加 —— 否则每轮都会产生新块、
+        每轮都破缓存。
+
+        块内容存在 ``sys_blocks``，deque 里只放**标记** —— 这样容量压力下
+        块不会随消息一起被驱逐（它是设定的一部分）。
+        """
+        c = str(content or "").strip()
+        if not c or not self.has_system_prompt():
+            return False
+        last = self.last_system_content()
+        if not last or self._norm(last) == self._norm(c):
+            return False
+        bid = self._next_block_id
+        self._next_block_id += 1
+        self.sys_blocks[bid] = c
+        self.messages.append({"role": "system", _BLOCK_MARK: bid})
+        return True
+
+    @staticmethod
+    def _norm(t: str) -> str:
+        """比较用的归一化（只比正文，忽略声明前缀差异）。"""
+        s = str(t or "")
+        # 去掉"［设定更新］…以此为准："这类声明头，只比正文
+        for sep in ("：", ":"):
+            if "为准" in s and sep in s:
+                s = s.split(sep, 1)[1]
+                break
+        return " ".join(s.split())
+
+    def last_system_content(self) -> str:
+        """当前**生效**的设定全文 = 首条 system，或最后一个更新块。"""
+        last = self.system_prompt
+        for m in self.messages:
+            if _BLOCK_MARK in m:
+                c = self.sys_blocks.get(m[_BLOCK_MARK])
+                if c:
+                    last = c
+        return last
+
+    def _materialize(self, m: dict) -> dict:
+        """把 deque 里的标记还原成真正的 system 消息。"""
+        bid = m.get(_BLOCK_MARK)
+        return {"role": "system", "content": str(self.sys_blocks.get(bid) or "")}
 
     def get_messages(self) -> list[dict]:
         """公开条目（剥离内部键 + 丢弃空 content）。
@@ -61,7 +166,18 @@ class Session:
         把异常吞掉 → 表现为「收到消息但永远不回复」的永久静默。
         这里在唯一收口点过滤：正常会话无空条目 → **零行为变化**。
         """
-        return [_public(m) for m in self.messages if _has_content(m)]
+        out: list[dict] = []
+        if self.system_prompt:
+            out.append({"role": "system", "content": self.system_prompt})
+        for m in self.messages:
+            if _BLOCK_MARK in m:                 # 可变块：还原成真正的 system
+                mm = self._materialize(m)
+                if mm["content"]:
+                    out.append(mm)
+                continue
+            if _has_content(m):
+                out.append(_public(m))
+        return out
 
     def quote_entries(self) -> list[tuple[str, str, str]]:
         """引用编号基的原始三元组（与 ``get_messages()`` 逐条对齐）。
@@ -72,19 +188,29 @@ class Session:
         return [
             (str(m.get("_mid") or ""), str(m.get("_uin") or ""), str(m.get("name") or ""))
             for m in self.messages
-            if _has_content(m)
+            if _has_content(m) and _BLOCK_MARK not in m
         ]
 
     def recent(self, n: int = 20) -> list[dict]:
         # 与 get_messages 同过滤，保证调用方看到的内容一致（B-002）
-        items = [_public(m) for m in self.messages if _has_content(m)]
+        items = self.get_messages()
         return items[-n:] if len(items) > n else items
 
     def size(self) -> int:
-        return len(self.messages)
+        """可见条目数（**不含**可变块标记 —— 它们不是消息）。"""
+        return sum(1 for m in self.messages if _BLOCK_MARK not in m)
 
     def clear(self) -> None:
+        """清空会话（轮转/重置）。
+
+        ⚠️ 必须同时清 ``system_prompt`` 与 ``sys_blocks`` —— 否则轮转后
+        `has_system_prompt()` 仍为真 → **新会话不会写入最新的 prompt**，
+        而是继续用上一轮的旧设定（测试抓到）。
+        """
         self.messages.clear()
+        self.system_prompt = ""
+        self.sys_blocks.clear()
+        self._next_block_id = 0
 
 
 # 内部元数据键前缀：绝不进 LLM 请求/对外 API
@@ -162,10 +288,74 @@ class SessionManager:
         )
         self._maybe_save(group_id)
 
-    def get_contexts(self, group_id: str) -> list[dict]:
+    def ensure_system_prompt(self, group_id: str, content: str) -> bool:
+        """确保该群的会话第一条是 system prompt。返回是否新写入。"""
         with self._lock:
             sess = self._get_or_create(group_id)
-        return sess.get_messages()
+        with self._lock:
+            return sess.ensure_system_prompt(content)
+
+    def append_system_update(self, group_id: str, content: str) -> bool:
+        """prompt 变更 → 追加更新块。返回是否真的追加。
+
+        ⚠️ 调用方应传**已带声明头**的文本（"以此为准"），本方法不负责包装。
+        """
+        with self._lock:
+            sess = self._get_or_create(group_id)
+        with self._lock:
+            return sess.append_system_update(content)
+
+    def system_prompt_of(self, group_id: str) -> str:
+        """当前生效的设定全文（供调用方判断是否需要追加）。"""
+        with self._lock:
+            sess = self._get_or_create(group_id)
+        with self._lock:
+            return sess.last_system_content()
+
+    def sync_system_prompt(self, group_id: str, latest: str) -> str:
+        """把"当前最新 prompt"同步进会话。返回动作：``init``/``update``/``noop``。
+
+        - **首次**（会话还没开卷）→ 写入第一条（``init``）
+        - **已开卷但 prompt 变了** → **追加**更新块（``update``）
+          —— 不能改第一条（改了 = 破坏全量前缀缓存）
+        - 未变 → ``noop``
+
+        追加块的声明头由**本方法**包装（调用方只给正文），保证格式统一：
+            ［设定更新］以下为最新设定，与此冲突之处以此为准：
+            <新版全文>
+
+        用户拍板：追加块**累积保留、不清理**。
+        """
+        c = str(latest or "").strip()
+        if not c:
+            return "noop"
+        with self._lock:
+            sess = self._get_or_create(group_id)
+        with self._lock:
+            if not sess.has_system_prompt():
+                sess.ensure_system_prompt(c)
+                return "init"
+            if sess._norm(sess.last_system_content()) == sess._norm(c):
+                return "noop"
+            wrapped = ("［设定更新］以下为最新设定，与此冲突之处以此为准：\n" + c)
+            return "update" if sess.append_system_update(wrapped) else "noop"
+
+    def get_contexts(self, group_id: str, *, drop_leading_system: bool = False) -> list[dict]:
+        """会话历史（含首条 system prompt）。
+
+        ``drop_leading_system=True``：**去掉开头的 system prompt**，只留历史。
+        给 Gate 用 —— 它有自己的裁判 system，不该继承 RP 的人格
+        （S4 的教训：把 RP 人格当 Gate 的 system 会让模型"参与聊天"而不是判断；
+        实测解析失败率 0%→45%）。两者**共用同一份历史**、**各用各的 system**，
+        这也正是用户要的"不再共用缓存"。
+        """
+        with self._lock:
+            sess = self._get_or_create(group_id)
+        msgs = sess.get_messages()
+        if drop_leading_system:
+            while msgs and msgs[0].get("role") == "system":
+                msgs.pop(0)
+        return msgs
 
     def quote_snapshot(self, group_id: str):
         """B-001: 冻结当前编号基，供 ``[r:-N]`` 在生成结束后求值。
@@ -243,7 +433,9 @@ class SessionManager:
                 sess.day = key
                 return None
             old_day = sess.day
-            sess.messages.clear()
+            # 轮转 = 新会话：system prompt 与可变块都要重置，
+            # 否则新一天会继续用旧设定、且不写入最新的 prompt。
+            sess.clear()
             sess.day = key
             self._saved_at_count[group_id] = 0
             self._last_save[group_id] = 0.0
@@ -292,6 +484,10 @@ class SessionManager:
                 "day": sess.day or "",
                 "saved_at": time.time(),
                 "messages": list(sess.messages),
+                # S14: system prompt + 可变块内容（都不在 deque 里）
+                "system_prompt": sess.system_prompt,
+                "sys_blocks": {str(k): v for k, v in sess.sys_blocks.items()},
+                "next_block_id": sess._next_block_id,
             }
             path = self._session_path(group_id, sess.day or None)
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -358,12 +554,25 @@ class SessionManager:
             msgs = payload.get("messages") or []
             # B-002: 恢复时同样过滤空 content（脏数据可能来自旧版本插件）。
             # B-001: 保留 _mid/_uin 元数据（deque 整体迁移，不重建条目）。
+            # 🔴 S14：**必须保留 system 条目**。
+            # 旧代码写的是 `role in ("user","assistant")` → **system 被静默丢弃**
+            # → system prompt 持久化失效（每次恢复都会重写 [0] → 破缓存），
+            # 且 S10 的［群友识别更新］块也会丢。
+            # 可变块标记（只有 __sys_block__ 键）也要保留，其内容在 sys_blocks。
+            def _keep(m) -> bool:
+                if not isinstance(m, dict):
+                    return False
+                if _BLOCK_MARK in m:
+                    return True                     # 可变块标记
+                if m.get("role") == "system":
+                    return _has_content(m)          # system prompt
+                return _has_content(m) and m.get("role") in ("user", "assistant")
+
             cleaned = [
                 _public(m) | {
                     k: m[k] for k in ("_mid", "_uin") if m.get(k)
                 }
-                for m in msgs
-                if _has_content(m) and m.get("role") in ("user", "assistant")
+                for m in msgs if _keep(m)
             ]
             dropped = sum(
                 1 for m in msgs
@@ -371,6 +580,10 @@ class SessionManager:
                 and m.get("role") in ("user", "assistant")
                 and not _has_content(m)
             )
+            # 恢复 system prompt + 可变块内容
+            sys_prompt = str(payload.get("system_prompt") or "")
+            blocks = payload.get("sys_blocks") or {}
+            nbid = int(payload.get("next_block_id") or 0)
             with self._lock:
                 if dropped:
                     self._empty_dropped[gid] = self._empty_dropped.get(gid, 0) + dropped
@@ -382,6 +595,12 @@ class SessionManager:
                 if self._max_messages is not None:
                     cleaned = cleaned[-self._max_messages:]
                 sess.messages = deque(cleaned, maxlen=self._max_messages)
+                sess.system_prompt = sys_prompt
+                # 只恢复**仍在 deque 里**的块（被淘汰的标记不再引用它们）
+                live = {m[_BLOCK_MARK] for m in sess.messages if _BLOCK_MARK in m}
+                sess.sys_blocks = {int(k): str(v) for k, v in blocks.items()
+                                   if int(k) in live}
+                sess._next_block_id = max([nbid] + [k + 1 for k in live] or [0])
                 sess.day = day
                 self._last_save[gid] = time.time()
                 self._saved_at_count[gid] = len(sess.messages)

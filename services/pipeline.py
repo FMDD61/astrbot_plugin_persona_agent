@@ -94,6 +94,8 @@ class PersonaPipeline:
         tool_syntax_block: Optional[Callable[[], str]] = None,
         # S9: 关系图谱块（独立于人格 —— 它增长、人格不增长）
         relations_block: Optional[Callable[[], str]] = None,
+        # S14: 当前最新 system prompt（会话首条 + 变更时追加）
+        system_prompt: Optional[Callable[[], str]] = None,
         # S10: 关系图谱增量（新群友/亲疏变化 → 追加到 session 尾部）
         relations_delta: Optional[Callable[[], str]] = None,
         # S2: 「现在要回应的」块构造器。pipeline 负责拆出正文/图片/表情，
@@ -128,6 +130,9 @@ class PersonaPipeline:
         self._examples_block = examples_block
         self._tool_syntax_block = tool_syntax_block
         self._relations_block = relations_block
+        self._system_prompt = system_prompt
+        #: 上一次 system prompt 同步动作（init/update/noop），供 trace 读取
+        self._last_sys_sync: str = ""
         self._relations_delta = relations_delta
         # S2: 「现在要回应的」块构造器（可选；未接线时退回旧行为）
         self._turn_block = turn_block
@@ -176,6 +181,19 @@ class PersonaPipeline:
         别名关系**，实测 157/163 命中），所以判断依据远弱于 RP。
         让两者共享同一份前缀，既提升 Gate 质量，又让网关前缀缓存被两次调用复用。
         """
+        # S14：system prompt 进会话（第一条）——
+        # 旧实现在 main 里每轮作为 `llm_generate(system_prompt=…)` 传参，
+        # prompt 一改整个请求的第一个 token 就变 → 其后 8 万 token 前缀全废
+        # （实测一天 8~11 次变更、单次 61k~99k 全价 token）。
+        # 现在：首次写入会话、之后从日志加载、变更走**追加块**。
+        # ⚠️ `_assemble_base` 没有 trace（那是 run() 的局部量）→ 同步结果
+        # **记在实例上**，由 run() 取走写进 trace。此前写成 `trace[...]` 并
+        # 被 except 吞掉 → **system prompt 同步静默失效**（正是本项目那个
+        # 经典病根：降级不可见）。故这里**不吞异常**，让它冒到调用方。
+        if self.session_mgr is not None and self._system_prompt is not None:
+            self._last_sys_sync = self.session_mgr.sync_system_prompt(
+                group_id, self._system_prompt())
+
         contexts = (
             self.session_mgr.get_contexts(group_id)
             if self.session_mgr is not None
@@ -199,8 +217,17 @@ class PersonaPipeline:
         )
         if rel_block:
             head.append({"role": "system", "content": rel_block})
+        # 🔴 顺序：**人格（session 首条）必须在整个数组最前**，
+        # head 块（工具语法/示例/关系图谱）紧随其后。
+        # 此前写成 `head + contexts` 把人格推到了第 3 位 —— 人格就不在
+        # "第一个 system" 的位置了（AstrBot 的 system_prompt 参数是插在最前的，
+        # 而我们改成进会话后，必须自己保证这一点）。
         if head:
-            contexts = head + contexts
+            if contexts and isinstance(contexts[0], dict) \
+                    and contexts[0].get("role") == "system":
+                contexts = [contexts[0]] + head + contexts[1:]
+            else:
+                contexts = head + contexts
         if kg_content:
             contexts.append({"role": "system", "content": kg_content})
         return contexts
@@ -220,12 +247,30 @@ class PersonaPipeline:
         return out
 
     def shared_context(self, group_id: str) -> list[dict]:
-        """给 Gate 用的共享上下文（不含本轮块）。
+        """给 Gate 用的上下文：**同一份历史，但不含 RP 的 system prompt**。
 
-        Gate 判定的是"这一条该不该接"，所以它看到的应该是**本条之前**的
-        世界 —— 与 RP 的 base 完全一致。
+        Gate 有自己的裁判 system（``GATE_SYSTEM_PROMPT``）。若把 RP 的人格
+        当 system 传给它，模型会**参与聊天而不是判断** —— 这是实测事故
+        （S4 引入，解析失败率 0%→45%，244 条决策退化为保守静默）。
+
+        与 RP **共用同一份历史**、**各用各的 system** → 符合用户"不再共用
+        缓存"的要求（前缀不同，各自独立命中）。
         """
-        return self._assemble_base(group_id)
+        base = self._assemble_base(group_id)
+        # 首条就是人格（装配保证）→ 掉它。gate 用自己的裁判 system。
+        if base and isinstance(base[0], dict) and base[0].get("role") == "system":
+            content = str(base[0].get("content") or "")
+            if content == self._current_system_prompt() or "群友" in content[:40]:
+                base.pop(0)
+        return base
+
+    def _current_system_prompt(self) -> str:
+        if self._system_prompt is None:
+            return ""
+        try:
+            return str(self._system_prompt() or "").strip()
+        except Exception:
+            return ""
 
     def _ensure_session_append(self, group_id: str, trace: dict) -> bool:
         """幂等落盘：每轮最多写一次。早退路径用它兜底。"""
@@ -496,6 +541,8 @@ class PersonaPipeline:
 
         # ---- 上下文装配（S4：RP 与 Gate **共用同一份**）----
         base_contexts = self._assemble_base(group_id, kg_content)
+        if getattr(self, "_last_sys_sync", ""):
+            trace["sys_prompt_sync"] = self._last_sys_sync
 
         # ---- S2 输入打包重划：把「该回哪句」显式标注出来 ----
         # 实测依据：决策窗口（96 条/1h）的文本有 **59% 已在 session 里**，
