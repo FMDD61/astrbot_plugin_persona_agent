@@ -216,8 +216,19 @@ class GateService:
         # 位置在 8 万 token 的 session 之后，而后面还有 `【现在要判断的这一条】`
         # 这种逐轮变化的量跟在它后面，**每次都要重算**。
         # 移到最前 + 内容恒定 ⇒ 它进入稳定前缀，**一次付清**。
-        msgs: list[dict] = [{"role": "system", "content": GATE_JUDGE_INSTRUCTION}]
-        msgs += [dict(m) for m in contexts if isinstance(m, dict)]
+        msgs: list[dict] = [dict(m) for m in contexts if isinstance(m, dict)]
+        # 🔴 判定指令的位置**不能离候选太远**（S13 实测回归，2026-09-15）
+        #
+        # S10 我为了"让判定指令进缓存前缀、省 token"，把它从末尾 user 消息里
+        # 挪到**最前面的 system 消息**。结果**模型不再认为自己是裁判** ——
+        # 它看到的是一条 system 指令 + 满屏群聊上下文，于是开始**参与聊天**：
+        #     gate_degraded: "parse_failed: '笑什么呢成员亥，说出来让我也乐一乐~'"
+        #     gate_degraded: "parse_failed: '湛江的话虾很新鲜吧，成员亥有口福了'"
+        # 实测影响：解析失败率从 **0% 飙到 40~60%**（起点正是 S10 上线时刻
+        # 09-14 14:00 UTC），244 条决策退化为"保守静默" → **直接压制发言频率**。
+        #
+        # 修法：仍独立成一条 system 消息（内容恒定 → 与 S4 一样能进缓存前缀），
+        # 但**紧贴候选消息之前**，让"你现在的任务是判断"这件事在位置上成立。
         tail: list[str] = []
         tail.append(f"【现在要判断的这一条】{current_speaker}：{current_text}")
         if is_at:
@@ -232,7 +243,10 @@ class GateService:
                                 else f"- {txt[:120]}")
             if hits:
                 tail.append("风格参考片段（机器人风格源的相似历史发言）：\n" + "\n".join(hits))
-        # 判定指令已上移到最前（见上），末尾只留逐轮变化的部分
+        # 结构：共享前缀 → [system: 判定指令] → [user: 本轮候选]
+        # 判定指令**恒定**，所以它自己那一段仍可被网关前缀缓存复用；
+        # 而它紧贴候选，"裁判"角色在位置上成立。
+        msgs.append({"role": "system", "content": GATE_JUDGE_INSTRUCTION})
         msgs.append({"role": "user", "content": "\n\n".join(tail)})
         return msgs
 
