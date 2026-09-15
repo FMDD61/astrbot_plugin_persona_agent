@@ -85,6 +85,28 @@
   GATE_JUDGE_INSTRUCTION`（后者**不在** RP 上下文里）。
 - 测试 428 → **436 全绿**（新增追加语义不变式 3 例 + 拆分 5 例）
 
+### Removed (2026-09-15, S13 死代码清理)
+> 起因：`_admin_binding` 丢失事故后新加的 `self` 属性检查器报告了 3 处
+> "只写不读"，逐一查明后清理。
+
+- **删除 `services/dream_job.py`（整个类）**：自 S11 起即为死代码 —— cron 改挂
+  `_dream_job_runner`，而 `DreamJob.run` 只写不推、其"关系变更建议"已由
+  `services/familiarity.py` 取代。**这也完成了用户要求的"做梦不负责熟悉度"的收尾。**
+  删除前已确认全仓无代码引用（仅注释与 cron 名字含 `dream_job`）。
+- 删除 `self._dream_job` / `self._decision_log_path` / `self._sleep_enabled`
+  三个只赋不用的属性。
+  - `_decision_log_path`：日志路径已改走 JsonStore，历史遗留
+  - `_sleep_enabled`：`_is_sleeping()` **每次读活配置**，该快照无用
+    （顺带确认 `sleep.enabled` 开关**是生效的**，且支持热改）
+- `tests/test_self_attributes.py` 的 `KNOWN_WRITE_ONLY` 白名单清空并保留
+  —— 留给将来"刻意的只写字段"，同时在注释里如实记录检查器的三处局限
+  （括号续行赋值、条件分支内读取、只覆盖一个类）。
+- ⚠️ **过程教训（第二次同类失误）**：清理时我又用"索引区间切割"改测试文件，
+  **连续两次把 `_class_attrs` 辅助函数一起切掉**。已改为"只精准替换目标行"，
+  并在操作前加 `assert` 校验关键符号仍存在。**行号/索引切割是本轮反复出错的手法，
+  后续避免使用。**
+- 测试 528 全绿（删除死代码不改变任何行为）
+
 ### Added (2026-09-15, S12 熟悉度体系 + /admin 收窄 + 年报)
 > 用户定稿：`/admin` 统一入口；推送与权限合并；熟悉度**只升不降**、除新成员入列外
 > 须人工批准、人工可绕过。

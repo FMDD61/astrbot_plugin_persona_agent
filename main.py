@@ -59,7 +59,6 @@ from .services.poke import PokeService
 from .services import protocol_compat
 from .services.examples import load_examples_block, ExamplesState
 from .services.memory_store import MemoryStore, MemoryEvent
-from .services.dream_job import DreamJob
 from .services.dream import DreamMaker, persist_dream
 from .services.familiarity import (
     CLOSENESS_CN,
@@ -98,7 +97,6 @@ class PersonaAgent(Star):
         self._gate: Optional[GateService] = None
         self._pipeline: Optional[PersonaPipeline] = None
         self._memory_store: Optional[MemoryStore] = None
-        self._dream_job: Optional[DreamJob] = None
         self._poke: Optional[PokeService] = None
         self._topic_bank: Optional[TopicBank] = None
         self._summary: Optional[SummaryService] = None
@@ -119,7 +117,6 @@ class PersonaAgent(Star):
         # S3: 贴纸服务（懒建；复用 RagService 已加载的 BGE）
         self._sticker = None
 
-        self._decision_log_path = self.data_dir / "decision_log.jsonl"
 
     # ----------------------------------------------------------------- lifecycle
 
@@ -225,8 +222,11 @@ class PersonaAgent(Star):
         except RuntimeError:
             pass
 
-        self._dream_job = DreamJob(self._memory_store, str(self.data_dir))
-        # S11: 做梦（与"熟悉度汇报"无关的那部分；原 DreamJob.run 不再挂 cron）
+        # S11/S13: 做梦与"熟悉度汇报"**彻底分离**。
+        # `DreamJob`（services/dream_job.py）自 S11 起已是死代码 —— cron 改挂
+        # `_dream_job_runner`，而 DreamJob.run 只写不推、且它的"关系变更建议"
+        # 已由 `services/familiarity.py` 取代（用户："DreamJob 是做梦，不应该
+        # 负责处理熟悉度汇报相关内容"）。故整个类与实例一并移除。
         self._dream_maker = DreamMaker(str(self.data_dir),
                                        anchor_fn=self._dream_anchor_llm,
                                        dream_fn=self._dream_llm)
@@ -270,7 +270,6 @@ class PersonaAgent(Star):
 
         # v3: sleep window + diary (rotation at 02:00 inside the sleep window)
         sleep_cfg = self.config.get("sleep", {}) or {}
-        self._sleep_enabled = int(sleep_cfg.get("enabled", 1)) == 1
         self._sleep_start = int(sleep_cfg.get("start_hour", 2))
         self._sleep_end = int(sleep_cfg.get("end_hour", 7))
         diary_cfg = self.config.get("diary", {}) or {}
@@ -2544,9 +2543,10 @@ class PersonaAgent(Star):
         """做梦 cron 的**真正入口**：生成 → 落盘 → **推送**。
 
         🔴 修一个"从来没推送过"的缺陷（用户 2026-09-14："上周我没收到做梦内容"）：
-        原实现把 `self._dream_job.run` 直接挂给 cron，而 `DreamJob.run()` **只写
+        原实现把 `DreamJob.run` 直接挂给 cron，而它**只写
         `style_drift_report.json`、从不推送** —— 所以做梦内容一直没到过用户手上
-        （周报/月报有推送，做梦没有）。
+        （周报/月报有推送，做梦没有）。S13 起 `DreamJob` 已整体删除
+        （其"关系变更建议"由 services/familiarity.py 取代）。
 
         本 runner 负责（S11）：
           1. 从最近 7 个不同 day 的日记（不足按实际）**做梦**
