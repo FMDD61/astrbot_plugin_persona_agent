@@ -544,6 +544,30 @@ class PersonaAgent(Star):
         except Exception as e:
             logger.warning(f"[persona_agent] reload pipeline rebuild failed: {e}")
 
+    def _admin_binding(self) -> dict:
+        """管理员绑定（S12：**推送目标与权限来源合并为一份**）。
+
+        用户 2026-09-14 拍板："三者是同一个 QQ，命令就可以收窄了…
+        同时绑定私聊推送和管理员权限"。合并的好处：不会出现"能收到推送但
+        没权限操作"的错位。
+
+        兼容：`admin_binding.json` 缺失时回退 `dream_binding.json`
+        （历史部署只绑过 dream）。
+
+        ⚠️ 这个方法曾在 S12 重构中**整段丢失**：我删旧命令时用行号切掉了它，
+        而后续补丁的锚点正是被切掉的那一行 → `str.replace` 静默无操作，
+        但我看到"patched"以为成功。**结果它从未被提交**，直到用户跑 `/admin`
+        才暴露 `'PersonaAgent' object has no attribute '_admin_binding'`。
+        教训：补丁必须 **assert 锚点存在**（现在这么做了）；行号切割后要复查。
+        """
+        b = self.store.load_json("admin_binding.json", {}) or {}
+        if b.get("unified_msg_origin"):
+            return b
+        legacy = self.store.load_json("dream_binding.json", {}) or {}
+        if legacy.get("unified_msg_origin"):
+            return legacy
+        return b
+
     def _is_privileged(self, event: AstrMessageEvent) -> bool:
         """权限判定：`privileged_qq`（bootstrap）**或** admin_binding 的会话。
 
