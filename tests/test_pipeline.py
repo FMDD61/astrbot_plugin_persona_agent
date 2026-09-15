@@ -875,14 +875,17 @@ class TestSharedContextS4(unittest.TestCase):
         self.assertTrue(d.reply)
         self.assertEqual(captured["system_prompt"], "【人格提示词】正文")
         msgs = captured["messages"]
-        # S10：判定指令**上移到最前**（内容恒定 → 进缓存前缀，一次付清）。
-        # 原先它在末尾那条 user 消息里，位于 8 万 token 的 session 之后 →
-        # 每次都要跟着重算。
-        self.assertEqual(msgs[0]["role"], "system")
-        self.assertIn("不要引入任何其他维度", msgs[0]["content"])
-        # 共享前缀原样保留，紧随判定指令之后
-        self.assertEqual(msgs[1], {"role": "user", "content": "历史"})
-        # 末尾只留逐轮变化的部分
+        # 🔴 S13 回归修复：判定指令**紧贴候选消息之前**，而不是放在最前。
+        #
+        # S10 曾把它挪到最前面的 system 消息（为省 token 进缓存前缀），
+        # 结果模型不再认为自己是裁判、开始参与聊天 → 解析失败率 0%→40~60%。
+        # 现行结构：共享前缀 → [system: 判定指令] → [user: 本轮候选]
+        self.assertEqual(msgs[0], {"role": "user", "content": "历史"},
+                         "共享前缀必须原样在最前（缓存复用的前提）")
+        self.assertEqual(msgs[-2]["role"], "system")
+        self.assertIn("不要引入任何其他维度", msgs[-2]["content"])
+        # 候选消息紧随其后
+        self.assertEqual(msgs[-1]["role"], "user")
         self.assertIn("【现在要判断的这一条】", msgs[-1]["content"])
         self.assertNotIn("不要引入任何其他维度", msgs[-1]["content"])
 
