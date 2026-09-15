@@ -61,6 +61,12 @@ from .services.examples import load_examples_block, ExamplesState
 from .services.memory_store import MemoryStore, MemoryEvent
 from .services.dream_job import DreamJob
 from .services.dream import DreamMaker, persist_dream
+from .services.familiarity import (
+    CLOSENESS_CN,
+    ProposalStore,
+    decide as decide_proposal,
+    parse_indices,
+)
 from .services.conflict_detector import ConflictDetector
 
 class PersonaAgent(Star):
@@ -270,7 +276,8 @@ class PersonaAgent(Star):
         # 注释：initialize 末尾的预热任务可能早于本行执行），此处不重复赋值。
         # Test-time sleep override: "awake" / "sleep" / None(window applies);
         # in-memory only, resets on restart.
-        self._sleep_override: Optional[str] = None
+        # (类型, 小时数) 或 None；旧代码曾存字符串，故保留向后兼容的宽松判定
+        self._sleep_override = None
 
         vision_cfg = self.config.get("vision", {}) or {}
         self._vision_enabled = int(vision_cfg.get("enabled", 1)) == 1
@@ -497,8 +504,103 @@ class PersonaAgent(Star):
 
     # ----------------------------------------------------------------- commands
 
-    @filter.command("persona_status")
-    async def cmd_status(self, event: AstrMessageEvent):
+    def _apply_live_config(self) -> None:
+        """把配置开关应用到运行中的对象（原 `/reload_persona_config` 的逻辑）。
+
+        ⚠️ 这个方法的**定义**曾在 S12 重构 `/admin` 时被我误删（只留了调用点）
+        —— 静态检查查不出 `self.xxx` 这类属性缺失，只有真跑 `/admin reload`
+        才会 AttributeError。教训：删旧方法前先 grep 它的**调用点**。
+
+        7 个可编辑 JSON 靠 mtime 热重载，不需要在这里处理；
+        这里管的是 **interjection 开关**与 **rag.enabled**（后者要重建 pipeline）。
+        """
+        if self.interjection is None:
+            raise RuntimeError("插件尚未完成初始化")
+        topic_cfg = self.config.get("topic_bank", {}) or {}
+        self.interjection.update_toggles(
+            active_interjection=int(self.config.get("active_interjection", 0)),
+            reply_on_at=int(self.config.get("reply_on_at", 1)),
+            topic_bank_enabled=int(topic_cfg.get("enabled", 0)),
+        )
+        try:
+            rag_on = int((self.config.get("rag") or {}).get("enabled", 1)) == 1
+            if self.kg_provider is not None:
+                self.kg_provider.dense_enabled = rag_on
+            self._build_pipeline()
+        except Exception as e:
+            logger.warning(f"[persona_agent] reload pipeline rebuild failed: {e}")
+
+    def _is_privileged(self, event: AstrMessageEvent) -> bool:
+        """权限判定：`privileged_qq`（bootstrap）**或** admin_binding 的会话。
+
+        bootstrap 的意义：第一个 `/admin bind` 需要有人有权执行 ——
+        在那之前只认配置里的 `privileged_qq`。绑定之后，绑定会话本身即可操作。
+        """
+        sid = str(event.get_sender_id() or "")
+        if self.privileged_qq and sid == self.privileged_qq:
+            return True
+        b = self._admin_binding()
+        if not b.get("unified_msg_origin"):
+            return False
+        return str(event.unified_msg_origin or "") == str(b["unified_msg_origin"])
+
+    # --------------------------------------------------------- /admin（S12 收窄）
+
+    @filter.command("admin")
+    async def cmd_admin(self, event: AstrMessageEvent, sub: str = "", arg: str = ""):
+        """统一管理入口（用户要求：把散落的 7 个命令收窄成一个好记的入口）。
+
+        子命令：status / sleep / wake / reload / bind / dream / relations
+        权限：`privileged_qq`（bootstrap）**或** admin_binding 记录的会话。
+        绑定私聊后，推送与权限都走 `admin_binding.json`（用户要求合并）。
+        """
+        if not self._is_privileged(event):
+            yield event.plain_result("无权限。仅管理员私聊可用。")
+            return
+        sub = (sub or "").strip().lower()
+        arg = (arg or "").strip()
+        if not sub:
+            yield event.plain_result(self._admin_help_text())
+            return
+        handler = {
+            "status": self._admin_status,
+            "sleep": self._admin_sleep,
+            "wake": self._admin_wake,
+            "reload": self._admin_reload,
+            "bind": self._admin_bind,
+            "dream": self._admin_dream,
+            "relations": self._admin_relations,
+        }.get(sub)
+        if handler is None:
+            yield event.plain_result(
+                f"未知子命令 `{sub}`。可用：status / sleep / wake / reload / "
+                f"bind / dream / relations"
+            )
+            return
+        async for _r in handler(event, arg):
+            yield _r
+
+    def _admin_help_text(self) -> str:
+        """子命令一览 —— 除绑定状态外都是静态文案（便于随时记起用法）。"""
+        b = self._admin_binding()
+        bound = b.get("unified_msg_origin") or "（未绑定）"
+        return (
+            "=== persona_agent /admin ===\n"
+            "  /admin status              状态概览\n"
+            "  /admin sleep [小时]        临时睡眠（不带参数=直到醒来）\n"
+            "  /admin wake                恢复睡眠窗规则\n"
+            "  /admin reload              重载配置（开关即时生效）\n"
+            "  /admin bind                把当前私聊绑定为推送+管理会话\n"
+            "  /admin dream               立即做一次梦\n"
+            "  /admin relations           列出待批的关系提案\n"
+            "  /admin relations apply 1 3 批准（支持多个序号，不支持区间）\n"
+            "  /admin relations reject 2  驳回\n"
+            f"\n当前绑定: {bound}"
+        )
+
+    # ---- 子命令实现 ----
+
+    async def _admin_status(self, event, arg):
         cfg = self.config
         lines = [
             "=== persona_agent status ===",
@@ -507,131 +609,162 @@ class PersonaAgent(Star):
             f"style_source_qq  : {self.style_source_qq}",
             f"reply_on_at      : {cfg.get('reply_on_at')}",
             f"active_interjection : {cfg.get('active_interjection')}",
-            f"topic_bank.enabled  : {(cfg.get('topic_bank') or {}).get('enabled', 0)}",
-            f"poke.enabled        : {(cfg.get('poke') or {}).get('enabled', 0)}",
+            f"rag.score_threshold : {(cfg.get('rag') or {}).get('score_threshold')}",
+            f"interjection.min_gap: {(cfg.get('interjection') or {}).get('min_gap_sec')}",
+            f"poke.enabled        : {(cfg.get('poke') or {}).get('enabled', 0)}"
+            f"  proactive={(cfg.get('poke') or {}).get('proactive_enabled', 0)}",
+            f"sticker.enabled     : {(cfg.get('sticker') or {}).get('enabled', 0)}"
+            f"  teach={(cfg.get('sticker') or {}).get('teach', 0)}",
+            f"gate.enabled        : {(cfg.get('gate') or {}).get('enabled', 0)}",
             f"dream.enabled       : {(cfg.get('dream') or {}).get('enabled', 0)}",
-            f"summary             : weekly={(cfg.get('summary') or {}).get('weekly_enabled', 0)} monthly={(cfg.get('summary') or {}).get('monthly_enabled', 0)}",
-            f"data_dir         : {self.data_dir}",
+            f"summary             : weekly={(cfg.get('summary') or {}).get('weekly_enabled', 0)}"
+            f" monthly={(cfg.get('summary') or {}).get('monthly_enabled', 0)}"
+            f" yearly={(cfg.get('summary') or {}).get('yearly_enabled', 0)}",
         ]
         if self.interjection is not None:
             snap = self.interjection.snapshot()
-            lines.append(f"hourly_used      : {snap['hourly_used']:.2f}  hour={snap['current_hour']}")
+            lines.append(f"hourly_used      : {snap['hourly_used']:.2f}  "
+                         f"hour={snap['current_hour']}")
         if self.session_mgr is not None:
-            snap = self.session_mgr.snapshot()
-            for gid, sz in snap.items():
+            for gid, sz in (self.session_mgr.snapshot() or {}).items():
                 lines.append(f"session[{gid}]  : {sz} msgs")
         yield event.plain_result("\n".join(lines))
 
-    @filter.command("persona_wake")
-    @filter.command("persona_awake")
-    async def cmd_persona_wake(self, event: AstrMessageEvent):
-        """Test-time wake: sleep window disabled until /persona_sleep or restart."""
-        if not self._is_privileged(event):
-            yield event.plain_result("无权限。")
+    async def _admin_sleep(self, event, arg):
+        try:
+            hours = float(arg) if arg else None
+        except ValueError:
+            yield event.plain_result(f"「{arg}」不是小时数。用法：/admin sleep 2")
             return
-        self._sleep_override = "awake"
-        logger.info("[persona_agent] sleep override -> awake (manual test mode)")
-        yield event.plain_result("已唤醒（手动测试模式），睡眠窗暂不生效。退出测试可发 /persona_sleep 或重启。")
+        # 统一表达：("sleep", 到期时间戳或 None)
+        expire = (time.time() + float(hours) * 3600.0) if hours else None
+        self._sleep_override = ("sleep", expire)
+        logger.info(f"[persona_agent] privileged sleep override hours={hours}")
+        if hours:
+            until = time.strftime("%H:%M", time.localtime(expire))
+            yield event.plain_result(f"已进入临时睡眠 {hours} 小时（到 {until} 自动恢复）。")
+        else:
+            yield event.plain_result("已进入临时睡眠（直到 /admin wake）。")
 
-    @filter.command("persona_sleep")
-    async def cmd_persona_sleep(self, event: AstrMessageEvent):
-        if not self._is_privileged(event):
-            yield event.plain_result("无权限。")
-            return
+    async def _admin_wake(self, event, arg):
         self._sleep_override = None
         logger.info("[persona_agent] sleep override cleared")
         yield event.plain_result("已恢复睡眠窗规则。")
 
-    def _is_privileged(self, event: AstrMessageEvent) -> bool:
-        return bool(self.privileged_qq) and str(event.get_sender_id() or "") == self.privileged_qq
-
-    @filter.command("reload_persona_config")
-    async def cmd_reload(self, event: AstrMessageEvent):
-        """Apply config toggles to the live InterjectionManager (+ rebuild
-        pipeline for rag.enabled etc.).
-
-        The 7 editable JSON files (style profile etc.) auto-hot-reload via
-        mtime; this command rebinds interjection toggles and rebuilds the
-        shared pipeline / KG so `rag.enabled` (A7③) takes effect.
-        """
-        if self.interjection is None:
-            yield event.plain_result("插件尚未完成初始化。")
-            return
-        topic_cfg = self.config.get("topic_bank", {}) or {}
-        self.interjection.update_toggles(
-            active_interjection=int(self.config.get("active_interjection", 0)),
-            reply_on_at=int(self.config.get("reply_on_at", 1)),
-            topic_bank_enabled=int(topic_cfg.get("enabled", 0)),
-        )
-        # A7③: rag.enabled 可能变更 → 重建 KG(dense_enabled) + pipeline
+    async def _admin_reload(self, event, arg):
         try:
-            rag_cfg = self.config.get("rag", {}) or {}
-            rag_on = int(rag_cfg.get("enabled", 1)) == 1
-            if self.kg_provider is not None:
-                self.kg_provider.dense_enabled = rag_on
-            self._build_pipeline()
+            self._apply_live_config()
+            yield event.plain_result(
+                "配置已重载："
+                f"active_interjection={self.config.get('active_interjection')} "
+                f"reply_on_at={self.config.get('reply_on_at')} "
+                f"rag.score_threshold={(self.config.get('rag') or {}).get('score_threshold')}"
+            )
         except Exception as e:
-            logger.warning(f"[persona_agent] reload pipeline rebuild failed: {e}")
-        yield event.plain_result(
-            f"已重载: reply_on_at={self.config.get('reply_on_at')} "
-            f"active_interjection={self.config.get('active_interjection')} "
-            f"topic_bank.enabled={topic_cfg.get('enabled', 0)} "
-            f"rag.enabled={int((self.config.get('rag') or {}).get('enabled', 1))}"
-        )
+            yield event.plain_result(f"重载失败: {e}")
 
-    @filter.command("bind_dream")
-    async def cmd_bind_dream(self, event: AstrMessageEvent):
-        """Bind the current private-chat UMO for weekly dream delivery."""
-        gid = event.get_group_id()
-        if gid:
-            yield event.plain_result("请在私聊中执行 /bind_dream。")
-            return
-        umo = event.unified_msg_origin
-        self.store.save_json("dream_binding.json", {
-            "unified_msg_origin": umo,
-            "bound_at": int(time.time()),
-            "sender_id": str(event.get_sender_id() or ""),
-        })
-        yield event.plain_result(f"已绑定私聊会话: {umo}")
-
-    @filter.command("bind_admin")
-    async def cmd_bind_admin(self, event: AstrMessageEvent):
-        """Bind the current private-chat UMO for admin conflict notifications."""
-        gid = event.get_group_id()
-        if gid:
-            yield event.plain_result("请在私聊中执行 /bind_admin。")
-            return
-        umo = event.unified_msg_origin
+    async def _admin_bind(self, event, arg):
+        """把**当前会话**绑定为推送 + 管理会话（合并，用户要求）。"""
+        umo = str(event.unified_msg_origin or "")
+        sid = str(event.get_sender_id() or "")
         self.store.save_json("admin_binding.json", {
             "unified_msg_origin": umo,
             "bound_at": int(time.time()),
-            "sender_id": str(event.get_sender_id() or ""),
+            "sender_id": sid,
         })
-        yield event.plain_result(f"已绑定管理员通知会话: {umo}")
+        logger.info(f"[persona_agent] admin_binding → {umo} (sender={sid})")
+        yield event.plain_result(
+            f"已绑定：\n  会话 {umo}\n  身份 {sid}\n"
+            f"此后**推送**（周报/月报/年报/做梦/关系提案）与**管理权限**都走这个会话。"
+        )
 
-    @filter.command("dream_now")
-    async def cmd_dream_now(self, event: AstrMessageEvent):
-        sender_uin = str(event.get_sender_id() or "")
-        privileged = bool(self.privileged_qq) and sender_uin == self.privileged_qq
-        if int((self.config.get("dream") or {}).get("enabled", 0)) != 1 and not privileged:
+    async def _admin_dream(self, event, arg):
+        if int((self.config.get("dream") or {}).get("enabled", 0)) != 1:
             yield event.plain_result("dream.enabled=0，已禁用做梦。")
             return
-        if privileged:
-            logger.info(f"[persona_agent] privileged /dream_now from {sender_uin}")
-        if self._dream_job is None:
-            yield event.plain_result("DreamJob 尚未初始化。")
-            return
+        yield event.plain_result("开始做梦…（约 30 秒）")
         try:
-            report = await asyncio.to_thread(self._dream_job.run)
-            yield event.plain_result(
-                f"DreamJob 完成: 升级建议 {len(report.suggested_upgrades)} 人, "
-                f"降级建议 {len(report.suggested_downgrades)} 人, "
-                f"话题趋势 {len(report.topic_trends)} 个, "
-                f"分析 {report.stats.get('members_analyzed', 0)} 人."
-            )
+            await self._dream_job_runner()
+            yield event.plain_result("做梦完成，已推送（若绑定正常）。")
         except Exception as e:
-            logger.exception(f"[persona_agent] DreamJob.run() failed: {e}")
-            yield event.plain_result(f"DreamJob 失败: {e}")
+            logger.exception(f"[persona_agent] /admin dream failed: {e}")
+            yield event.plain_result(f"做梦失败: {e}")
+
+    async def _admin_relations(self, event, arg):
+        """关系提案：list / apply N [N…] / reject N [N…]"""
+        store = ProposalStore(self.data_dir)
+        batch = store.load()
+        parts = (arg or "").split(maxsplit=1)
+        action = (parts[0] if parts else "").strip().lower()
+        rest = (parts[1] if len(parts) > 1 else "").strip()
+
+        if action in ("", "list"):
+            yield event.plain_result(self._format_proposals(batch))
+            return
+        if action not in ("apply", "reject"):
+            yield event.plain_result(
+                f"未知操作 `{action}`。可用：list / apply N / reject N")
+            return
+        if not batch.proposals:
+            yield event.plain_result("当前没有提案。")
+            return
+        idxs, err = parse_indices(rest, len(batch.proposals))
+        if err:
+            yield event.plain_result(err)
+            return
+        current = self._current_closeness()
+        lines: list[str] = []
+        changed = False
+        for n in idxs:
+            ok, msg, p = decide_proposal(batch, n, "approve" if action == "apply" else "reject",
+                                current)
+            if not ok:
+                lines.append(f"✗ {msg}")
+                continue
+            if action == "apply" and p.status == "approved":
+                # 真正落到配置里（只升不降；写前再判一次）
+                if self.style is not None and self.style.set_closeness(
+                        p.uin, p.to_closeness):
+                    current[p.uin] = p.to_closeness
+                    lines.append(
+                        f"✓ #{n} {p.alias or p.uin} "
+                        f"{CLOSENESS_CN.get(p.from_closeness, p.from_closeness)}→"
+                        f"{CLOSENESS_CN.get(p.to_closeness, p.to_closeness)}"
+                        f"（{p.reason}）")
+                else:
+                    lines.append(f"✗ #{n} 写入成员表失败（可能该 uin 已不存在）")
+                changed = True
+            else:
+                lines.append(f"✓ {msg or f'#{n} 已{action}'}")
+                changed = True
+        if changed:
+            store.save(batch)
+        yield event.plain_result("\n".join(lines) or "无变化")
+
+    def _format_proposals(self, batch) -> str:
+        if not batch.proposals:
+            return "当前没有待批的关系提案。"
+        lines = [f"=== 关系提案（{batch.period or '?'}）==="]
+        for p in batch.proposals:
+            mark = {"pending": "◻", "approved": "✔", "rejected": "✘"}.get(p.status, "?")
+            lines.append(
+                f"  {mark} #{p.index} {p.alias or p.uin} "
+                f"{CLOSENESS_CN.get(p.from_closeness, p.from_closeness)}→"
+                f"{CLOSENESS_CN.get(p.to_closeness, p.to_closeness)}"
+                f"  {p.reason}")
+        lines.append("\n/admin relations apply 1 3   /admin relations reject 2")
+        return "\n".join(lines)
+
+    def _current_closeness(self) -> dict[str, str]:
+        """当前等级快照 ``{uin: closeness}``（apply 的二次校验用）。"""
+        if self.style is None:
+            return {}
+        try:
+            return {u: v for u, v in
+                    ((str(m.get("uin") or ""), str(m.get("closeness") or ""))
+                     for m in self.style._iter_members()) if u}
+        except Exception:
+            return {}
 
     # ----------------------------------------------------------------- events
 
@@ -2088,10 +2221,27 @@ class PersonaAgent(Star):
     # ------------------------------------------------------------ v3 diary/sleep
 
     def _is_sleeping(self) -> bool:
-        if self._sleep_override == "awake":
+        """是否处于睡眠（含人工覆盖）。
+
+        🔴 修一个我自己引入的 bug（S12 重构 /admin 时）：`_admin_sleep` 写的是
+        **元组** `("sleep", hours)`，而这里比的是**字符串** `"sleep"` ——
+        元组永不等于字符串 → **定时睡眠完全不生效**（静默失效，且无报错）。
+
+        统一表达：``_sleep_override`` = ``None`` | ``"awake"`` |
+        ``("sleep", None)``（直到醒来）| ``("sleep", 到期时间戳)``。
+        """
+        ov = self._sleep_override
+        if ov == "awake":
             return False
-        if self._sleep_override == "sleep":
-            return True
+        if isinstance(ov, tuple) and ov and ov[0] == "sleep":
+            expire = ov[1] if len(ov) > 1 else None
+            if expire is None:
+                return True
+            if time.time() < float(expire):
+                return True
+            # 到期 → 自动恢复（下次询问即清除，避免需要手动 /admin wake）
+            self._sleep_override = None
+            logger.info("[persona_agent] sleep override 已到期，自动恢复睡眠窗规则")
         cfg = self.config.get("sleep", {}) or {}
         if int(cfg.get("enabled", 1)) != 1:
             return False

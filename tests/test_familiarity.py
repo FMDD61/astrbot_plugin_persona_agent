@@ -335,3 +335,84 @@ class TestMigrationTool(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSetClosenessWriteGuard(unittest.TestCase):
+    """写入层的"只升不降" —— 三处共同保证中的最后一道。
+
+    1. 提案生成时过滤（`parse_proposals`）
+    2. 批准时二次校验（`decide`）
+    3. **写入配置时再判一次**（`StyleProfile.set_closeness`）—— 本测试
+    """
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _mk(self, members):
+        with open(os.path.join(self.td.name, "member_relations.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"members": members}, f, ensure_ascii=False)
+        import time as _t
+        p = os.path.join(self.td.name, "member_relations.json")
+        _t.sleep(0)
+        fut = _t.time() + random_offset()
+        os.utime(p, (fut, fut))
+        from services.style_profile import StyleProfile
+        return StyleProfile(self.td.name)
+
+    def _read(self):
+        with open(os.path.join(self.td.name, "member_relations.json"),
+                  encoding="utf-8") as f:
+            return json.load(f)["members"]
+
+    def test_upgrade_allowed(self):
+        import time as _t
+        sp = self._mk([{"uin": "1", "alias": "甲", "closeness": "new"}])
+        self.assertTrue(sp.set_closeness("1", "known"))
+        _t.sleep(0)
+        self.assertEqual(self._read()[0]["closeness"], "known")
+
+    def test_downgrade_rejected(self):
+        sp = self._mk([{"uin": "1", "alias": "甲", "closeness": "known"}])
+        self.assertFalse(sp.set_closeness("1", "new"), "降级必须被拒")
+        self.assertEqual(self._read()[0]["closeness"], "known")
+
+    def test_force_allows_downgrade_for_human_path(self):
+        """人工可绕过所有限制 —— `force=True` 是那条路径。"""
+        import time as _t
+        sp = self._mk([{"uin": "1", "alias": "甲", "closeness": "close"}])
+        self.assertTrue(sp.set_closeness("1", "new", force=True))
+        _t.sleep(0)
+        self.assertEqual(self._read()[0]["closeness"], "new")
+
+    def test_same_value_is_noop(self):
+        sp = self._mk([{"uin": "1", "alias": "甲", "closeness": "known"}])
+        self.assertFalse(sp.set_closeness("1", "known"), "同级不算改动")
+
+    def test_unknown_uin_and_invalid_level(self):
+        sp = self._mk([{"uin": "1", "alias": "甲", "closeness": "new"}])
+        self.assertFalse(sp.set_closeness("999", "close"))
+        self.assertFalse(sp.set_closeness("1", "bestie"))
+        self.assertFalse(sp.set_closeness("", "close"))
+
+    def test_other_fields_untouched(self):
+        """只改目标条目的 `closeness`，不动其他字段（尤其人工写的 notes）。"""
+        import time as _t
+        sp = self._mk([{"uin": "1", "alias": "花鱼", "closeness": "new",
+                        "notes": "人工写的描述", "other_names": ["花心"]}])
+        sp.set_closeness("1", "close")
+        _t.sleep(0)
+        m = self._read()[0]
+        self.assertEqual(m["notes"], "人工写的描述")
+        self.assertEqual(m["other_names"], ["花心"])
+        self.assertEqual(m["alias"], "花鱼")
+
+
+def random_offset() -> float:
+    """给 mtime 一个单调的小偏移 —— StyleProfile 按 mtime 热重载，
+    同一秒内写两次可能不触发重载（实测踩过）。"""
+    import time as _t
+    return 10.0 + (_t.time() % 5.0)
