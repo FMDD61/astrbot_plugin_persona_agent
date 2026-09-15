@@ -447,6 +447,23 @@
         "type": "int",
         "description": "摘要正文上限字符数",
         "default": 800
+      },
+      "yearly_enabled": {
+        "type": "int",
+        "description": "年报复总开关（1/1 02:20）",
+        "default": 1,
+        "hint": "年报读**12 篇月报**（月→年可整除、无错位）。周报是旁支不进主链 —— 周与月不可整除，强行使月报读周报会让跨月的那一周让两个月都'不完整'。"
+      },
+      "proposal_temperature": {
+        "type": "float",
+        "description": "关系提升提案的温度",
+        "default": 0.3
+      },
+      "proposal_max_tokens": {
+        "type": "int",
+        "description": "提案最大 token",
+        "default": 8192,
+        "hint": "思考 token 是重尾随机变量，预算给足无代价、给紧会截断成空（B-019）。"
       }
     }
   },

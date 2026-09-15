@@ -85,6 +85,43 @@
   GATE_JUDGE_INSTRUCTION`（后者**不在** RP 上下文里）。
 - 测试 428 → **436 全绿**（新增追加语义不变式 3 例 + 拆分 5 例）
 
+### Added (2026-09-15, S12 熟悉度体系 + /admin 收窄 + 年报)
+> 用户定稿：`/admin` 统一入口；推送与权限合并；熟悉度**只升不降**、除新成员入列外
+> 须人工批准、人工可绕过。
+
+- **`/admin` 收窄**：原 7 个散落命令（persona_status / persona_wake / persona_sleep /
+  reload_persona_config / bind_dream / bind_admin / dream_now）全部并入一个入口：
+  `status / sleep [小时] / wake / reload / bind / dream / relations`。
+- **推送与权限合并**（用户："三者是同一个 QQ…同时绑定私聊推送和管理员权限"）：
+  `_admin_binding()`（admin_binding 优先、回退 dream_binding）；
+  `_is_privileged()` = `privileged_qq`（bootstrap）**或**绑定会话。
+  好处：不会出现"能收到推送但没权限操作"。
+- **`services/familiarity.py` 熟悉度体系**：
+  - `parse_proposals`：四道过滤（uin 存在 / to 合法 / **必须升级** / 同级丢弃）；
+    `from` **取服务端真实值不采信模型**；垃圾输入返回空表绝不猜
+  - `build_proposal_prompt`：**必含旧版关系图谱**（否则会提议已是 close 的人）
+  - 候选集 = **日记里出现的人**（不做量化筛选 —— 用户"做成定量太死板"）
+  - `ProposalStore.replace()`：**新批覆盖旧批**（不拼接）⇒ 单批内序号稳定，
+    `/admin relations apply N` **不需要"序号→稳定 id"翻译层**（用户指出）
+  - `decide()`：幂等；**apply 时二次校验**（防提案生成后人工改了等级导致降级）；
+    人工已升过 → 报"无需重复提升"而非失败
+  - `parse_indices()`：支持多序号、**不支持区间**；非法输入分类报错
+- **`StyleProfile.set_closeness()`**：写入层第三道"只升不降"守卫；
+  `force=True` 给人工路径；原子写、只改 `closeness` 不动其他字段
+- **年报**：`yearly_window` = 上一个完整自然年，**读 12 篇月报**。
+  🔴 层级选择的关键是**刻度可否整除**：日→月可整除、月→年可整除，故无错位；
+  **周与月不可整除** → 周报是**旁支不进主链**（强行让月报读周报会让跨月那一周
+  令两个月都"不完整"，且误差无法在月层级修正）。
+- **字段迁移**：`notes` 让给"群友描述"，bot 标记迁到 `kind`；
+  `is_bot_member()` 双字段兼容（成员表里有 2 个 bot 账号混在真人中间，
+  漏判会把它们暴露给 LLM）；`tools/migrate_member_fields.py` dry-run 默认 + 双写。
+- 🔴 **修两个我在本次重构中自己引入的 bug**（都是"改旧代码时漏看消费方"）：
+  1. **误删 `_apply_live_config` 的定义**（只留调用点）—— 静态检查查不出
+     `self.xxx` 缺失，只有真跑 `/admin reload` 才炸
+  2. **`_sleep_override` 类型不匹配**：写元组、读字符串比较 → **定时睡眠完全不生效**
+     （静默失效无报错）。统一为 `None | "awake" | ("sleep", 到期戳|None)` + 到期自动恢复
+- 测试 471 → **524 全绿**
+
 ### Added (2026-09-14, S7 主动戳人：`[poke:名字]` → 严格解析 → group_poke)
 > 用户拍板：接口用**名字**不用 QQ 号；解析**严格**（"模型用了未收录的昵称时戳不
 > 出去"可接受）；候选池仅 `close`；同人冷却**复用被动计时器**。

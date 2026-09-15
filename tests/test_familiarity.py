@@ -416,3 +416,73 @@ def random_offset() -> float:
     同一秒内写两次可能不触发重载（实测踩过）。"""
     import time as _t
     return 10.0 + (_t.time() % 5.0)
+
+
+class TestYearlyWindow(unittest.TestCase):
+    """年报窗口与"读月报"的层级选择（用户 2026-09-15 确认）。"""
+
+    def test_yearly_window_is_previous_complete_year(self):
+        from datetime import date
+        from services.summary import yearly_window
+        start, end, label = yearly_window(date(2026, 3, 15))
+        self.assertEqual((start, end, label),
+                         (date(2025, 1, 1), date(2025, 12, 31), "2025"))
+
+    def test_weekly_and_monthly_unchanged(self):
+        from datetime import date
+        from services.summary import monthly_window, weekly_window
+        s, e, lab = monthly_window(date(2026, 3, 15))
+        self.assertEqual((s, e, lab), (date(2026, 2, 1), date(2026, 2, 28), "2026-02"))
+        # 周窗口是"最近 7 天（不含今天）"，与 ISO 周无关
+        s2, e2, lab2 = weekly_window(date(2026, 3, 15))
+        self.assertEqual((e2 - s2).days, 6)
+
+    def test_yearly_reads_monthlies_not_diaries(self):
+        """🔴 年报必须读**月报**（月→年可整除），不是日日记。"""
+        import tempfile as _tf
+        from datetime import date
+        from services.summary import SummaryService
+        with _tf.TemporaryDirectory() as td:
+            p = Path(td) / "monthly_summary.jsonl"
+            rows = [{"kind": "monthly", "group_id": "g1", "period": f"2025-{m:02d}",
+                     "summary": f"{m}月的事"} for m in range(1, 13)]
+            rows.append({"kind": "monthly", "group_id": "g1", "period": "2024-12",
+                         "summary": "去年的，不该被选中"})
+            p.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+                         encoding="utf-8")
+            svc = SummaryService(td)
+            got = svc.collect("yearly", "g1", today=date(2026, 3, 15))
+            self.assertEqual(got["kind"], "yearly")
+            self.assertEqual(got["n_diaries"], 12, "应取到该年 12 篇月报")
+            self.assertEqual([r["period"] for r in got["monthlies"]][0], "2025-01")
+            self.assertNotIn("去年的", str(got["monthlies"]))
+            self.assertEqual(got["diaries"], [], "年报不读日日记")
+
+    def test_yearly_tolerates_missing_monthlies(self):
+        """不足 12 个月也照做（用户明确"或不到十二个"）。"""
+        import tempfile as _tf
+        from datetime import date
+        from services.summary import SummaryService
+        with _tf.TemporaryDirectory() as td:
+            Path(td, "monthly_summary.jsonl").write_text(
+                json.dumps({"kind": "monthly", "group_id": "g1",
+                            "period": "2025-06", "summary": "只有一个月"},
+                           ensure_ascii=False) + "\n", encoding="utf-8")
+            got = SummaryService(td).collect("yearly", "g1", today=date(2026, 3, 15))
+            self.assertEqual(got["n_diaries"], 1)
+
+    def test_yearly_prompt_uses_monthlies(self):
+        from services.summary import build_prompt
+        p = build_prompt("yearly", "g1", "2025", [], [],
+                         monthlies=[{"period": "2025-01", "summary": "一月的"}])
+        self.assertIn("各月月记", p)
+        self.assertIn("一月的", p)
+        self.assertIn("不要逐月罗列", p)
+        self.assertNotIn("【日日记】", p)
+
+    def test_yearly_output_path(self):
+        import tempfile as _tf
+        from services.summary import SummaryService
+        with _tf.TemporaryDirectory() as td:
+            p = SummaryService(td).output_path("yearly")
+            self.assertEqual(p.name, "yearly_summary.jsonl")

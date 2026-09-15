@@ -63,9 +63,12 @@ from .services.dream_job import DreamJob
 from .services.dream import DreamMaker, persist_dream
 from .services.familiarity import (
     CLOSENESS_CN,
+    PROPOSAL_SYSTEM,
     ProposalStore,
+    build_proposal_prompt,
     decide as decide_proposal,
     parse_indices,
+    parse_proposals,
 )
 from .services.conflict_detector import ConflictDetector
 
@@ -325,6 +328,17 @@ class PersonaAgent(Star):
                     persistent=False,
                 )
                 logger.info("[persona_agent] monthly summary cron registered (1st 02:15 CST)")
+            if int(summary_cfg.get("yearly_enabled", 0)) == 1:
+                await self.context.cron_manager.add_basic_job(
+                    name="persona_yearly_summary",
+                    cron_expression="20 2 1 1 *",
+                    handler=self._yearly_summary_job,
+                    description="Yearly summary over the 12 monthly summaries (S12)",
+                    timezone="Asia/Shanghai",
+                    enabled=True,
+                    persistent=False,
+                )
+                logger.info("[persona_agent] yearly summary cron registered (Jan 1 02:20 CST)")
         else:
             logger.warning("[persona_agent] cron_manager not available; summary crons NOT registered")
 
@@ -2417,8 +2431,90 @@ class PersonaAgent(Star):
         await self._period_summary("weekly")
 
     async def _monthly_summary_job(self) -> None:
-        """Cron: 1st 02:15 — monthly pyramid summary over daily diaries."""
+        """Cron: 1st 02:15 — monthly summary over daily diaries."""
         await self._period_summary("monthly")
+
+    async def _yearly_summary_job(self) -> None:
+        """Cron: 1/1 02:20 — yearly summary over the 12 monthly summaries.
+
+        **月→年可整除**（每年 12 个自然月）故无错位；周报是旁支不进主链
+        （周与月不可整除）。理由见 `services/summary.py: yearly_window`。
+        """
+        await self._period_summary("yearly")
+
+    async def _propose_relations(self, kind: str, gid: str,
+                                 diaries: list[dict], period: str) -> None:
+        """周报任务内的**关系提升提案**（S12，用户要求嵌在这里）。
+
+        输入 = **旧版群友关系图谱**（用户明确要求）+ 本周日记。
+        **不做量化筛选** —— 用户："做成定量有点死板了"，且"日记里出现的人"
+        本身就是 LLM 做的定性筛选（"这周谁在我眼里有分量"）。
+
+        产出**整体覆盖**上一批（`ProposalStore.replace`，不拼接）→ 单批内序号稳定，
+        `/admin relations apply N` 不需要"序号→稳定 id"翻译层。
+
+        ⚠️ **依赖日记质量**（用户自己指出的耦合）：日记若总只写那几张老面孔，
+        新人的熟悉度永远提不上去。提案量长期偏低时应回头查日记，而非怀疑本模块。
+
+        失败只 warning —— 提案是周报的附加产物，不能因它拖垮周报。
+        """
+        if self.style is None or not diaries:
+            return
+        try:
+            current = self._current_closeness()
+            if not current:
+                logger.info("[persona_agent] 关系提案跳过：成员表为空")
+                return
+            provider = await self._resolve_provider_id()
+            if not provider:
+                logger.warning("[persona_agent] 关系提案跳过：无可用 provider")
+                return
+            prompt = build_proposal_prompt(self.style.relations_block(),
+                                           diaries, current)
+            scfg = self.config.get("summary", {}) or {}
+            _rv = reasoning_value(scfg.get("reasoning_effort", "low"))
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider,
+                prompt=prompt,
+                system_prompt=PROPOSAL_SYSTEM,
+                temperature=float(scfg.get("proposal_temperature", 0.3)),
+                # 预算给足：思考 token 是重尾随机变量（见 B-019 与 measurements §2b）
+                max_tokens=int(scfg.get("proposal_max_tokens", 8192)),
+                **({"reasoning_effort": _rv} if _rv else {}),
+            )
+            raw = (getattr(resp, "completion_text", "") or "").strip()
+            proposals = parse_proposals(raw, current)
+            batch = ProposalStore(self.data_dir).replace(proposals, period=period)
+            logger.info(
+                f"[persona_agent] 关系提案已生成：{len(proposals)} 条"
+                f"（周期 {period}，替换旧批）"
+            )
+            if proposals:
+                lines = ["\n【关系提案】（需你批准，回复 /admin relations apply 序号）"]
+                for p in batch.proposals:
+                    lines.append(
+                        f"  #{p.index} {p.alias or p.uin} "
+                        f"{CLOSENESS_CN.get(p.from_closeness, p.from_closeness)}→"
+                        f"{CLOSENESS_CN.get(p.to_closeness, p.to_closeness)}"
+                        f"  {p.reason}")
+                await self._push_text("".join(lines))
+        except Exception as e:
+            logger.warning(f"[persona_agent] 关系提案失败（不影响周报）: "
+                           f"{type(e).__name__}: {e}")
+
+    async def _push_text(self, text: str) -> bool:
+        """把一段文本推送到 admin_binding 会话（失败只 warning）。"""
+        try:
+            b = self._admin_binding()
+            umo = b.get("unified_msg_origin")
+            if not umo:
+                logger.info("[persona_agent] 未绑定 admin_binding，跳过推送")
+                return False
+            await self.context.send_message(umo, MessageChain().message(text))
+            return True
+        except Exception as e:
+            logger.warning(f"[persona_agent] 推送失败: {e}")
+            return False
 
     async def _dream_job_runner(self) -> None:
         """做梦 cron 的**真正入口**：生成 → 落盘 → **推送**。
@@ -2503,7 +2599,10 @@ class PersonaAgent(Star):
                 logger.warning(f"[persona_agent] {kind} summary skipped: no provider id")
                 continue
             prompt = build_prompt(
-                kind, gid, collected["label"], collected["diaries"], collected["samples"],
+                kind, gid, collected["label"], collected["diaries"],
+                collected["samples"],
+                **({"monthlies": collected.get("monthlies") or []}
+                   if kind == "yearly" else {}),
             )
             sys_prompt = self.style.system_prompt()
             try:
@@ -2546,18 +2645,17 @@ class PersonaAgent(Star):
                 f"period={record['period']} n_diaries={record['n_diaries']} "
                 f"n_samples={record['n_samples']}"
             )
-            # G13 extra: push the summary to the bound dream private chat
-            binding = self.store.load_json("dream_binding.json", {}) or {}
-            umo = binding.get("unified_msg_origin")
-            pushed = False
-            if umo:
-                try:
-                    head = "周记" if kind == "weekly" else "月记"
-                    chain = MessageChain().message(f"【{record['period']} {head}】\n{record['summary']}")
-                    await self.context.send_message(umo, chain)
-                    pushed = True
-                except Exception as ex:
-                    logger.warning(f"[persona_agent] {kind} summary push failed: {ex}")
+            # 推送到**合并后的** admin_binding（S12：推送目标 = 权限来源）
+            head = {"weekly": "周记", "monthly": "月记",
+                    "yearly": "年记"}.get(kind, kind)
+            pushed = await self._push_text(
+                f"【{record['period']} {head}】\n{record['summary']}")
+
+            # S12: 周报任务内顺带产出**关系提升提案**（用户要求嵌在这里）。
+            # ⚠️ 放在推送之后 —— 提案是附加产物，不能拖慢/拖垮周报本身。
+            if kind == "weekly":
+                await self._propose_relations(
+                    kind, gid, collected.get("diaries") or [], collected["label"])
             self._log_decision({
                 "action": f"{kind}_summary",
                 "trigger": "cron",
