@@ -217,7 +217,18 @@ class ABRuntime:
             if isinstance(p, dict) and p.get("enable", True) is not False:
                 pid = str(p.get("id") or "")
                 break
-        self._model = self.model_override or pid or "deepseek/deepseek-v4.1-flash"
+        # 🔴 AstrBot 的 provider id 形如 `<source_id>/<model>`（如
+        # `commandcode/deepseek/deepseek-v4.1-flash`），而网关要的是**纯 model id**
+        # （`deepseek/deepseek-v4.1-flash`）。直接把 provider id 发过去会得到
+        # HTTP 400 `unsupported_model`（实测）。
+        # 剥法：去掉与 provider_sources 的 id 相同的首段。
+        model = pid
+        for s_ in (cfg.get("provider_sources") or []):
+            sid = str(s_.get("id") or "")
+            if sid and model.startswith(sid + "/"):
+                model = model[len(sid) + 1:]
+                break
+        self._model = self.model_override or model or "deepseek/deepseek-v4.1-flash"
 
     def build_services(self) -> None:
         from services.style_profile import StyleProfile
