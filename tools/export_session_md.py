@@ -60,21 +60,42 @@ INTERNAL_LABEL = {
 }
 
 
-def render_message(m: dict, index: int, *, max_reasoning: int = 0) -> str:
+def load_alias_map(data_dir: str | Path | None) -> dict[str, str]:
+    """``uin → alias``。用于回填**旧格式条目**的发言人（它们没有前缀、name 也丢过）。
+
+    实测生产里 1313 条属于这种：只有 `_uin`，人工看只有一串 QQ 号，无法阅读。
+    """
+    if not data_dir:
+        return {}
+    try:
+        p = Path(data_dir) / "member_relations.json"
+        ms = json.loads(p.read_text(encoding="utf-8")).get("members") or []
+        return {str(m.get("uin")): str(m.get("alias") or "")
+                for m in ms if m.get("uin") and m.get("alias")}
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+
+
+def render_message(m: dict, index: int, *, max_reasoning: int = 0,
+                   alias_map: dict | None = None) -> str:
     """把一条消息渲染成 markdown 小节。
 
     ``max_reasoning>0`` 时截断思维链（默认 0 = 全文，用户要求"完整思维链"）。
+    ``alias_map`` 用于把 `_uin` 回填成人名（旧格式条目没有发言人前缀）。
     """
     if not isinstance(m, dict):
         return f"### [{index}] （非法条目）\n\n```\n{m!r}\n```\n"
     role = str(m.get("role") or "unknown")
     label = ROLE_LABEL.get(role, role)
     name = m.get("name")
+    # 回填：旧格式条目被 S15 丢过 name，只能用 _uin 反查
+    if not name and alias_map:
+        name = alias_map.get(str(m.get("_uin") or "")) or ""
     head = f"### [{index}] {role}"
     if label != role:
         head += f"（{label}）"
     if name:
-        head += f" · {name}"
+        head += f" · **{name}**"
 
     lines = [head, ""]
     content = str(m.get("content") or "")
@@ -106,7 +127,8 @@ def render_message(m: dict, index: int, *, max_reasoning: int = 0) -> str:
 
 def export_markdown(session_path: Path, out_path: Path, *,
                     tail: int = 0, extra: dict | None = None,
-                    max_reasoning: int = 0) -> dict:
+                    max_reasoning: int = 0,
+                    alias_map: dict | None = None) -> dict:
     """导出一个 session JSON → markdown。返回统计。**绝不抛**。"""
     stats: dict = {"source": str(session_path), "out": str(out_path)}
     try:
@@ -170,7 +192,8 @@ def export_markdown(session_path: Path, out_path: Path, *,
 
     reasoning_chars = 0
     for i, m in enumerate(shown):
-        parts.append(render_message(m, start_idx + i, max_reasoning=max_reasoning))
+        parts.append(render_message(m, start_idx + i, max_reasoning=max_reasoning,
+                                    alias_map=alias_map))
         reasoning_chars += len(str(m.get("_reasoning") or ""))
 
     try:
@@ -227,6 +250,8 @@ def main(argv=None) -> int:
                     help="思维链截断长度（0=完整，用户要求默认完整）")
     ap.add_argument("--extra-from-trace", default="",
                     help="从 trace_log.jsonl 补充 KG/RAG 上下文")
+    ap.add_argument("--data-dir", default="",
+                    help="插件数据目录（用于把 _uin 回填成人名；旧格式条目不填很难读）")
     args = ap.parse_args(argv)
 
     extra = {}
@@ -234,10 +259,15 @@ def main(argv=None) -> int:
         extra = _load_trace_extra(Path(args.extra_from_trace))
         print(f"额外上下文: {list(extra) or '（未取到）'}")
 
+    alias_map = load_alias_map(args.data_dir)
+    if alias_map:
+        print(f"别名表: {len(alias_map)} 人（用于回填旧格式条目的发言人）")
+
     if args.session:
         out = Path(args.out or (Path(args.session).with_suffix(".md")))
         st = export_markdown(Path(args.session), out, tail=args.tail,
-                             extra=extra, max_reasoning=args.max_reasoning)
+                             extra=extra, max_reasoning=args.max_reasoning,
+                             alias_map=alias_map)
         if st.get("error"):
             print(f"❌ {st['error']}", file=sys.stderr)
             return 1
@@ -254,7 +284,8 @@ def main(argv=None) -> int:
     ok = 0
     for f in files:
         st = export_markdown(f, out_dir / (f.stem + ".md"), tail=args.tail,
-                             extra=extra, max_reasoning=args.max_reasoning)
+                             extra=extra, max_reasoning=args.max_reasoning,
+                             alias_map=alias_map)
         if st.get("error"):
             print(f"❌ {f.name}: {st['error']}", file=sys.stderr)
         else:
