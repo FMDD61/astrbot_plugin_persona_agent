@@ -456,7 +456,7 @@
 - **`tools/llbot_config.py`**：从 AstrBot `cmd_config.json` 推导 LLBot v8 的 OneBot11 反向 WS 配置（`ws://<host>:<port>/ws` + `messageFormat=array`），支持打印（token 掩码）/ `--out` 片段导出（0600）/ `--merge-into` 就地 upsert（备份 + 原子写 + 保留其它 connect 条目）/ `--check` 一致性校验。BOM 兼容读取；token 绝不回显
 - **`_conf_schema.json` 新增 `poke.protocol`**（默认空 = 自动）：适配器名恒为 `aiocqhttp`，无法自动识别协议端，需人工声明 llbot/napcat 以跳过注定被丢弃的段通道
 - 测试 171 → **225 全绿**（`test_protocol_compat.py` 23 例 + `test_llbot_config.py` 31 例）
-- 迁移计划书 `docs/specs/llbot-migration-plan.md`；调研报告 `data_out/llbot_onebot11_compat_research.md`、`data_out/llbot_plugin_platform_audit.md`
+- 迁移计划书 `docs/specs/llbot-migration-plan.md`；调研报告 `docs/protocol/llbot/llbot_onebot11_compat_research.md`、`docs/protocol/llbot/llbot_plugin_platform_audit.md`
 
 ### Fixed (2026-09-10, A7④ 复盘：致命 reasoning bug + RAG 语料 + 预算)
 - **🔴 `reasoning_effort` 致命 bug（A7 上线会让 bot 全哑）**：旧实现 off→`"none"`，实测 commandcode 网关（OpenAI 兼容 `/chat/completions`）**拒绝任何非标准取值**（none/off/minimal/disabled/false 全部 HTTP 400）→ `_generate_reply` 的 try/except 吞掉 → 返回空 → 静默。修复：`reasoning_value()` 对 off/未知返回 **None（=不发送该参数）**，仅 low/medium/high/max 透传（佐证：dsh 自身配置 `reasoningEfforts: {False: None}` 即此语义）；main.py RP/Emotion/Gate 三处在 None 时跳过 kwarg；`tools/replay_scene._chat` 同步
@@ -522,7 +522,7 @@
 - **A1 生产切换（test_mode=0）**: 目标群 123456789 接管，测试群不再由插件处理；ready 日志验证 + cache_probe 全部落在生产群；02:00 后核心兜底「LLM 响应错误」广播 0 次（含图片消息路径）
 - **A2 配置同步工具**: 新增 `tools/sync_config.py` — 按 `_conf_schema.json` 默认值只补缺失键、保留现有值（红线 #3）；UTF-8 BOM 兼容读写；写入前自动备份 `.bak.<ts>`；原子写（.tmp → rename）；默认 check 模式，`--write` 生效；12 例单测。桌面配置实测 in-sync（22 顶层键全含，added=0）
 - **G11 Poke 戳一戳响应**: `services/poke.py` + `on_other` 接线 — OneBot notify/poke 解码；仅目标群 + target=bot 才考虑；同人 300s 冷却（`poke.cooldown_sec` 可配）、全局小时配额 4、未知关系成员默认不回戳、`conflict_keywords.json` 命中抑制（mtime 热重载，严肃上下文不回戳）、`poke_log.jsonl` 留痕；`poke.enabled=0` 全静默（Day4 按 DEPLOYMENT_GUIDE 开启）
-- **G12 TopicBank 主动话题**: `services/topic_bank.py` + ACTION_TOPIC 接线 — IMPLEMENTATION_PLAN §10 评分（0.45·silence + 0.25·priority + 0.20·context_hints + 0.10·freshness）；`topic_bank.json` mtime_ns 热加载；发送后归档 `topic_sent.json`（追加、原子写）；无可发话题绝对沉默；冷场触发走 `llm.temperature.cold_start=1.1` LLM 改写 + `context.send_message` 主动发送（group UMO）；决策日志 extra.topic_id/sent；建议稿 `data_out/topic_bank.json`（8 条，人工可改，历史坏例置 enabled=false 即规避）；`topic_bank.enabled=0` 不触发（Day3 开启）
+- **G12 TopicBank 主动话题**: `services/topic_bank.py` + ACTION_TOPIC 接线 — IMPLEMENTATION_PLAN §10 评分（0.45·silence + 0.25·priority + 0.20·context_hints + 0.10·freshness）；`topic_bank.json` mtime_ns 热加载；发送后归档 `topic_sent.json`（追加、原子写）；无可发话题绝对沉默；冷场触发走 `llm.temperature.cold_start=1.1` LLM 改写 + `context.send_message` 主动发送（group UMO）；决策日志 extra.topic_id/sent；建议稿 `生产插件数据目录（**生产是唯一真身**）`（8 条，人工可改，历史坏例置 enabled=false 即规避）；`topic_bank.enabled=0` 不触发（Day3 开启）
 - **G13 周/月摘要金字塔**: `services/summary.py` + cron（周一 02:10 / 月首 02:15 CST）— 聚合日日记 `daily_diary.jsonl`，每个归档日从 session_<group>_<day>.json 抽样 ≤6 条 user 原文防失真；输出 `weekly_summary.jsonl` / `monthly_summary.jsonl`（UTF-8 原子追加）并通过 dream_binding 私聊推送（未绑定仅落盘）；`summary.{weekly_enabled,monthly_enabled,max_sample_messages,max_summary_chars}` 可配（默认关，本次部署已开）
 - **G16 插话质量门**: 60 条生产消息真实 RAG 实播（chroma+BGE）：p50=0.436 / p75=0.504 / p90=0.573 / p95=0.676 / max=0.698 → 阈值定 0.65（≈5% 触发率）；`active_interjection=1` + `rag.score_threshold=0.65` 已生效（02:42 重启加载）；决策日志全分支落盘 `extra.top_rag_score` + `emotion_multiplier`（阈值可数据驱动调优）
 - **G17 dream 启用**: DreamJob 直跑验收（等价 /dream_now 特权路径）：90 天 800 edges / 21 成员分析 / 10 话题趋势 → `style_drift_report.json`（3.7KB）；`dream.enabled=1` + 周一 03:00 cron 已注册；`dream_binding.json` 预绑定 `aiocqhttp:FriendMessage:234567`（等效 /bind_dream，运行时可改）
@@ -549,7 +549,7 @@
 ### Fixed
 - **G14 A/B 首轮实证精修（2026-08-24）**: 注入块头部加「规则A/B」——口癖甲 仅限肯定/恍然大悟（Phase1 实测泛滥至 4/10 次）；谐音问候仅整词触发（实测“鸡没醒”被误回早上好~）
 ### Added
-- **G14 静态注入落地（2026-08-24）**: `services/examples.py`（纳秒 mtime 热重载，A/B=改文件名零重启）；注入位置=会话与 KG 尾之间（内容恒定，前缀缓存稳定）；`examples.{enabled,max_entries}` 可配；终稿示例 13 条（人工评审 v2 全量并入：极简单发/暴力萌/胡言乱语/无括号动作），文件 `data_out/example_dialogs.json`（旧版已备份 .bak.20260824）；测试 +4（46 全绿）
+- **G14 静态注入落地（2026-08-24）**: `services/examples.py`（纳秒 mtime 热重载，A/B=改文件名零重启）；注入位置=会话与 KG 尾之间（内容恒定，前缀缓存稳定）；`examples.{enabled,max_entries}` 可配；终稿示例 13 条（人工评审 v2 全量并入：极简单发/暴力萌/胡言乱语/无括号动作），文件 `生产插件数据目录（**生产是唯一真身**）`（旧版已备份 .bak.20260824）；测试 +4（46 全绿）
 ### Added
 - **G15 识图能力（2026-08-23 全量实现）**:
   - `services/vision.py`：图片/gif 表情 → 视觉模型（默认 mimo-v2.5，同网关同 key，懒解析不落密钥）→ ≤120 字中文描述；三源解析（convert_to_file_path 统一处理本地/url/base64 + 手动兜底）；gif/jpeg/png/webp mime 嗅探；30s 同图 hash 缓存；15s 超时与失败降级（不影响回复链路）
