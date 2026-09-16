@@ -1645,7 +1645,8 @@ class PersonaAgent(Star):
                 else str(self._probe_group_id or "")
             )
             if gid:
-                self._log_llm_probe(event, contexts, sys_prompt, provider_id, resp, local_hour, group_id=gid)
+                self._log_llm_probe(event, contexts, sys_prompt, provider_id, resp,
+                                    local_hour, group_id=gid, kind="rp")
 
         text = (getattr(resp, "completion_text", "") or "").strip()
         if self._is_error_response(text):
@@ -2184,6 +2185,18 @@ class PersonaAgent(Star):
             **({"reasoning_effort": _grv} if _grv else {}),
             **kwargs,
         )
+        # S15: Gate 也落探针（kind="gate"）—— 否则 Gate 的缓存命中完全不可见，
+        # 而 RP/Gate 现在是两条独立前缀，必须分别观测（用户要求"区分开"）。
+        if int((self.config.get("llm") or {}).get("cache_probe_enabled", 1)) == 1:
+            try:
+                _ctx = kwargs.get("contexts") or []
+                _gid = str(self._probe_group_id or "")
+                if _gid and _ctx:
+                    self._log_llm_probe(None, _ctx, sys_p, provider, resp,
+                                        self._local_hour(), group_id=_gid,
+                                        kind="gate")
+            except Exception as _e:
+                logger.warning(f"[persona_agent] gate probe log failed: {_e}")
         return (getattr(resp, "completion_text", "") or "").strip()
 
     def _log_llm_probe(
@@ -2195,8 +2208,13 @@ class PersonaAgent(Star):
         resp: object,
         local_hour: int,
         group_id: str = "",
+        kind: str = "rp",
     ) -> None:
         """Observability probe: session continuity + provider KV/prefix-cache usage.
+
+        S15：``kind`` 区分 LLM 用途（``rp``/``gate``）—— 用户要求"LLM 日志内的
+        session ID 也区分开"。RP 与 Gate 现在是**两条不同前缀**（共用历史、
+        各用各的 system），混记就无法归属命中/未命中。
 
         Appends one record to llm_cache_probe.jsonl per generation. Never
         raises; failures only warn. Exists for the 2026-08 evaluation round.
@@ -2230,9 +2248,30 @@ class PersonaAgent(Star):
                         raw_usage = u.model_dump() if hasattr(u, "model_dump") else u
                 except Exception:
                     raw_usage = None
+            # S15：精确 token 对账 —— 保存上次同 lineage 请求，算公共前导，
+            # 与网关 cached 交叉验证。**唯一无歧义的信号**：前缀没动却 cached=0
+            # → 网关侧丢缓存（见 services/token_accounting.py 的说明）。
+            try:
+                from .services.token_accounting import record_and_compare
+                acct = record_and_compare(
+                    self.data_dir, kind=kind, group_id=gid, messages=contexts,
+                    cached_tokens=(usage_d.get("input_cached")
+                                   if isinstance(usage_d.get("input_cached"), int) else None),
+                    prompt_tokens=(
+                        (usage_d.get("input_cached") or 0)
+                        + (usage_d.get("input_other") or 0)
+                        if isinstance(usage_d.get("input_cached"), int) else None),
+                )
+            except Exception as e:
+                acct = {"accounting_error": f"{type(e).__name__}: {e}"}
+
             record = {
                 "ts": time.time(),
                 "group_id": gid,
+                # S15: session ID —— RP/Gate 分开（用户要求）
+                "kind": kind,
+                "session_id": acct.get("lineage") or f"{kind}:{gid}",
+                "accounting": acct,
                 "session_size_before": session_size,
                 "contexts_len": len(contexts),
                 "contexts_chars": total_chars,
