@@ -642,9 +642,24 @@ class PersonaPipeline:
             else None
         )
         trace["temperature"] = temperature
-        reply_text = await self._generate(
-            text, contexts, emotion_state, temperature, inp.sender_uin, inp.umo or None
-        )
+        # S16: 用**元数据字典**把"思维链"从 generate 里带出来（不改 callback 的
+        # 返回类型，避免动 pipeline 协议）。main 侧写入，这里读走落进 trace，
+        # 最终由 session.append(..., reasoning=…) 存进会话（**不进 LLM 上下文**）。
+        llm_meta: dict = {}
+        try:
+            reply_text = await self._generate(
+                text, contexts, emotion_state, temperature, inp.sender_uin,
+                inp.umo or None, llm_meta,
+            )
+        except TypeError:
+            # 兼容只有 6 参的 generate 实现（离线测试台/旧接线）。
+            # 新签名多一个可变 meta dict；老实现不接受它。
+            reply_text = await self._generate(
+                text, contexts, emotion_state, temperature, inp.sender_uin,
+                inp.umo or None,
+            )
+        if llm_meta.get("reasoning"):
+            trace["reasoning"] = str(llm_meta["reasoning"])[:4000]
         if not reply_text:
             return SendIntent(
                 action="silent",

@@ -57,6 +57,7 @@ class Session:
         *,
         message_id: str = "",
         sender_uin: str = "",
+        reasoning: str = "",
     ) -> None:
         # 🔴 S15（用户 2026-09-15）：**发言人写进 content，不再用 name 字段**。
         #
@@ -85,6 +86,12 @@ class Session:
             msg["_mid"] = str(message_id)
         if sender_uin and role == "user":
             msg["_uin"] = str(sender_uin)
+        # S16：**思维链留存**（用户要求"保留完整思维链"供人工查看）。
+        # 用内部键 `_reasoning` → 被 `_public` 自动剥离 → **存进 session、
+        # 但不进 LLM 上下文**。理由：Context Rot（信噪比退化）+ 推理链不忠实
+        # （长而详尽的推理链未必如实反映决策）。
+        if reasoning and str(reasoning).strip():
+            msg["_reasoning"] = str(reasoning)
         # 🔴 S14：deque 满时，**先驱逐最老的真消息**，别把可变块标记挤掉。
         # 契约（docstring 早已写明）：保留 system + 最近 N 条 ——
         # 纯靠 deque(maxlen) 会连标记一起 FIFO 掉，且在"下一个 append"时才
@@ -176,6 +183,25 @@ class Session:
         bid = m.get(_BLOCK_MARK)
         return {"role": "system", "content": str(self.sys_blocks.get(bid) or "")}
 
+    def raw_messages(self) -> list[dict]:
+        """**原始条目**（含内部元数据与思维链）—— 仅供导出/排查，**不得发 LLM**。
+
+        与 ``get_messages()`` 的区别：不做 ``_public`` 剥离。导出工具要用它，
+        因为人工排查**需要看到 LLM 看不到的东西**（思维链、_mid/_uin）。
+        """
+        out: list[dict] = []
+        if self.system_prompt:
+            out.append({"role": "system", "content": self.system_prompt})
+        for m in self.messages:
+            if _BLOCK_MARK in m:
+                mm = self._materialize(m)
+                if mm["content"]:
+                    out.append(mm)
+                continue
+            if _has_content(m) or m.get("_reasoning"):
+                out.append(dict(m))
+        return out
+
     def get_messages(self) -> list[dict]:
         """公开条目（剥离内部键 + 丢弃空 content）。
 
@@ -194,7 +220,7 @@ class Session:
                     out.append(mm)
                 continue
             if _has_content(m):
-                out.append(_public(m))
+                out.append(_wire(m))
         return out
 
     def quote_entries(self) -> list[tuple[str, str, str]]:
@@ -236,13 +262,21 @@ _INTERNAL_PREFIX = "_"
 
 
 def _public(msg: dict) -> dict:
-    """对外出口：剥掉内部元数据（``_mid``/``_uin``）**与 ``name`` 字段**。
+    """剥掉**内部元数据**（``_mid``/``_uin``/``_reasoning``）。
 
-    S15：发言人已固化进 ``content`` 前缀（``张三：内容``），再带 ``name``
-    就是重复标识，而重复标识正是"指向错人"的温床。``name`` 仅供内部/工具使用。
+    ⚠️ **保留 `name`** —— 它是存储的一部分：
+      - 旧格式条目（R5 之前）内容**没有前缀**，name 是其唯一发言人标识
+      - 落盘时丢掉它就永久丢了（S15 就是这么丢的 1313 条的 name）
+    发 LLM 时才剥 name（见 ``_wire``），因为那时发言人已在前缀里、重复标识
+    反而是"指向错人"的温床。
     """
-    out = {k: v for k, v in msg.items()
-           if not k.startswith(_INTERNAL_PREFIX) and k != "name"}
+    return {k: v for k, v in msg.items() if not k.startswith(_INTERNAL_PREFIX)}
+
+
+def _wire(msg: dict) -> dict:
+    """**发 LLM 用**：在 `_public` 基础上再剥 `name`（发言人已在前缀里）。"""
+    out = _public(msg)
+    out.pop("name", None)
     return out
 
 
@@ -302,11 +336,13 @@ class SessionManager:
         *,
         message_id: str = "",
         sender_uin: str = "",
+        reasoning: str = "",
     ) -> None:
         with self._lock:
             sess = self._get_or_create(group_id)
         sess.append(
-            role, content, name=name, message_id=message_id, sender_uin=sender_uin
+            role, content, name=name, message_id=message_id,
+            sender_uin=sender_uin, reasoning=reasoning,
         )
         self._maybe_save(group_id)
 
@@ -361,6 +397,13 @@ class SessionManager:
                 return "noop"
             wrapped = ("［设定更新］以下为最新设定，与此冲突之处以此为准：\n" + c)
             return "update" if sess.append_system_update(wrapped) else "noop"
+
+    def raw_messages(self, group_id: str) -> list[dict]:
+        """原始条目（含思维链与内部元数据）—— 供导出/排查。**不得发 LLM**。"""
+        with self._lock:
+            sess = self._get_or_create(group_id)
+        with self._lock:
+            return sess.raw_messages()
 
     def get_contexts(self, group_id: str, *, drop_leading_system: bool = False) -> list[dict]:
         """会话历史（含首条 system prompt）。
@@ -591,8 +634,13 @@ class SessionManager:
                 return _has_content(m) and m.get("role") in ("user", "assistant")
 
             cleaned = [
+                # 🔴 必须保留 `name`！S15 漏了它 → `_public` 已剥 name，恢复时
+                # 不再补回 → **save_all() 落盘时 name 永久丢失**。
+                # 而旧格式条目（R5 之前写入的）**内容里没有前缀**，`name` 是它们
+                # 唯一的发言人标识 → 丢 name 等于让那些条目"没有主"。
                 _public(m) | {
-                    k: m[k] for k in ("_mid", "_uin") if m.get(k)
+                    k: m[k] for k in ("_mid", "_uin", "_reasoning", "name")
+                    if m.get(k)
                 }
                 for m in msgs if _keep(m)
             ]

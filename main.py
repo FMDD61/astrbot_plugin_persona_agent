@@ -1078,7 +1078,12 @@ class PersonaAgent(Star):
             trigger=trigger,
             sender_uin=sender_uin,
         )
-        self.session_mgr.append(group_id, "assistant", reply_text)
+        # S16: 思维链**存进 session**（供人工查看），但 `_reasoning` 是内部键
+        # → 被 `_public` 剥离 → **不进 LLM 上下文**（避免信噪比退化）。
+        self.session_mgr.append(
+            group_id, "assistant", reply_text,
+            reasoning=str((trace or {}).get("reasoning") or ""),
+        )
         if self.buffer is not None:
             self.buffer.add(
                 ts=time.time(),
@@ -1301,6 +1306,7 @@ class PersonaAgent(Star):
             chain = MessageChain().message(reply_text)
             await self.context.send_message(event.unified_msg_origin, chain)
             self._topic_bank.mark_sent(topic, reason="cold_start", group_id=group_id)
+            # S16: 冷场话题回复同样留存思维链（该路径现走的不是 pipeline，无 trace）
             self.session_mgr.append(group_id, "assistant", reply_text)
             if self.buffer is not None:
                 self.buffer.add(
@@ -1548,6 +1554,7 @@ class PersonaAgent(Star):
         *,
         speaker_uin: Optional[str] = None,
         umo: Optional[str] = None,
+        meta: Optional[dict] = None,
     ) -> str:
         """Generate a reply via LLM.
 
@@ -1648,6 +1655,12 @@ class PersonaAgent(Star):
                 self._log_llm_probe(event, contexts, sys_prompt, provider_id, resp,
                                     local_hour, group_id=gid, kind="rp")
 
+        # S16: 思维链回传（**不进上下文**，只供落 session + 人工查看）
+        if meta is not None:
+            try:
+                meta["reasoning"] = str(getattr(resp, "reasoning_content", "") or "")
+            except Exception:
+                pass
         text = (getattr(resp, "completion_text", "") or "").strip()
         if self._is_error_response(text):
             logger.warning(f"[persona_agent] llm returned error response, suppressed ({len(text)} chars)")
@@ -1819,8 +1832,12 @@ class PersonaAgent(Star):
         temperature: Optional[float],
         sender_uin: str,
         umo: Optional[str],
+        meta: Optional[dict] = None,
     ) -> str:
         """Pipeline generate callback: standalone LLM call (no event object).
+
+        ``meta``（S16）：可变字典，用于把**思维链**回传给 pipeline。
+        思维链**不进 LLM 上下文**，只存进 session 供人工查看（用户要求）。
 
         Reuses _generate_reply in standalone mode (event=None + explicit
         speaker_uin/umo).
@@ -1841,6 +1858,7 @@ class PersonaAgent(Star):
                 temperature,
                 speaker_uin=sender_uin,
                 umo=umo,
+                meta=meta,
             )
         except Exception as e:
             logger.exception(f"[persona_agent] pipeline generate failed: {e}")
@@ -2265,8 +2283,16 @@ class PersonaAgent(Star):
             except Exception as e:
                 acct = {"accounting_error": f"{type(e).__name__}: {e}"}
 
+            # S16：**落思维链摘要** —— 用于排查"回复指向错人"（Q1）。
+            # 用户判断："可能是突然提出来（和不相关的人名从 2500 条里被捞出来
+            # 一样），要进思维链去找原因"。没有它就无法验证该假设。
+            # 只存前 1500 字符（reasoning 常是 content 的 3~5 倍，全存会让
+            # 探针文件迅速膨胀；排查指向问题前 1500 字足够）。
+            reasoning = str(getattr(resp, "reasoning_content", "") or "")
             record = {
                 "ts": time.time(),
+                "reasoning_chars": len(reasoning),
+                "reasoning_excerpt": reasoning[:1500],
                 "group_id": gid,
                 # S15: session ID —— RP/Gate 分开（用户要求）
                 "kind": kind,
