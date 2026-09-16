@@ -58,9 +58,27 @@ class Session:
         message_id: str = "",
         sender_uin: str = "",
     ) -> None:
-        msg: dict = {"role": role, "content": content}
-        if name and role == "user":
-            msg["name"] = name
+        # 🔴 S15（用户 2026-09-15）：**发言人写进 content，不再用 name 字段**。
+        #
+        # 为什么改（有据可依，非风格偏好）：
+        #   1. OpenAI 官方社区的明确结论：**`name` 字段无法用于多用户归属** ——
+        #      最后那条待补全的 assistant 位置无法标注名字，且多用户场景语义模糊
+        #      （见 https://community.openai.com/t/clarification-on-missing-name-field-in-responses-api-and-handling-multi-persona-multi-user-dialogues/1365804）
+        #   2. 通行做法是**在内容里加发送者前缀**（`[Joe] ...`）
+        #   3. 实测我们因此出现"指向错人"：把"租房白嫖"错挂到一个前 10 条里
+        #      **根本没出现过**的人名上
+        #
+        # 实现：写入时**就把前缀固化进 content**（不改历史 = 不破坏已缓存前缀）。
+        # `name` 字段**保留**（内部/工具用），但发送路径会剥掉它（见 `_public`）。
+        text = str(content)
+        # ⚠️ **空内容不得加前缀** —— 否则 "" 会变成 "脏："，
+        # 而 `_has_content()` 判据是"content 非空白"，于是空条目不再被识别、
+        # B-002 的自愈失效 → 脏条目进入引用编号基 → `[r:-N]` 整体偏移。
+        # （这条由 `test_empty_entries_do_not_shift_numbering` 抓到）
+        if name and role == "user" and text.strip():
+            msg: dict = {"role": role, "content": f"{name}：{text}", "name": name}
+        else:
+            msg = {"role": role, "content": text}
         # B-001: 内部元数据。仅用于 ``[r:-N]`` 引用目标解析（编号基与 LLM 所见
         # 一致），**绝不进 LLM 请求** —— 所有对外出口都经 ``_public`` 剥离。
         if message_id:
@@ -218,10 +236,14 @@ _INTERNAL_PREFIX = "_"
 
 
 def _public(msg: dict) -> dict:
-    """抹掉内部元数据键（``_mid``/``_uin``）。无元数据时原样返回。"""
-    if not any(k.startswith(_INTERNAL_PREFIX) for k in msg):
-        return msg
-    return {k: v for k, v in msg.items() if not k.startswith(_INTERNAL_PREFIX)}
+    """对外出口：剥掉内部元数据（``_mid``/``_uin``）**与 ``name`` 字段**。
+
+    S15：发言人已固化进 ``content`` 前缀（``张三：内容``），再带 ``name``
+    就是重复标识，而重复标识正是"指向错人"的温床。``name`` 仅供内部/工具使用。
+    """
+    out = {k: v for k, v in msg.items()
+           if not k.startswith(_INTERNAL_PREFIX) and k != "name"}
+    return out
 
 
 def _has_content(msg) -> bool:

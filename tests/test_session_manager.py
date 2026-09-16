@@ -51,8 +51,10 @@ class TestRotation(unittest.TestCase):
             restored = sm2.load_all()
             self.assertEqual(restored.get('grp'), 2)
             ctx = sm2.get_contexts('grp')
-            self.assertEqual(ctx[0]['name'], '小明')
-            self.assertEqual(ctx[0]['content'], '早上好')
+            # S15: 发言人已固化进 content 前缀；name 与内部键都不在对外出口
+            self.assertIn('小明', str(ctx[0].get('content') or ''))
+            self.assertNotIn('name', ctx[0], "对外出口应剥掉 name（避免重复标识）")
+            self.assertIn('早上好', str(ctx[0].get('content') or ''))
 
     def test_recent_files_only_restored(self):
         with tempfile.TemporaryDirectory() as td:
@@ -156,7 +158,8 @@ class TestQuoteSnapshotMeta(unittest.TestCase):
         sm = SessionManager(data_dir=None, max_messages=None)
         sm.append('g', 'user', '你好', name='小明', message_id='m1', sender_uin='u1')
         ctx = sm.get_contexts('g')
-        self.assertEqual(ctx, [{'role': 'user', 'content': '你好', 'name': '小明'}])
+        # S15: content 带发言前缀；name 与内部键都不出现在出口
+        self.assertEqual(ctx, [{'role': 'user', 'content': '小明：你好'}])
         self.assertNotIn('_mid', ctx[0])
         self.assertNotIn('_uin', ctx[0])
 

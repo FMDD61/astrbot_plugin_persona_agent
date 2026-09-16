@@ -137,6 +137,18 @@ def _pipeline(**over):
     return p
 
 
+
+def _idx_by_substr(seq, needle):
+    """按**子串**找下标。
+
+    S15 起 session content 带发言前缀（``甲：历史甲``），精确 ``.index('历史甲')``
+    会失败；断言本意是"位置关系"，用子串查找即可，且对格式变化免疫。
+    """
+    for i, x in enumerate(seq):
+        if needle in str(x):
+            return i
+    raise ValueError(f"{needle!r} 未出现在 {seq!r}")
+
 def _async(v):
     async def _f():
         return v
@@ -550,7 +562,7 @@ class TestTurnBlockS2(unittest.TestCase):
         contents = [str(m.get("content")) for m in captured["ctx"]]
         self.assertEqual(contents[0], "【示例块】", "示例块必须是第一条（缓存前缀起点）")
         i_ex = contents.index("【示例块】")
-        i_hist = contents.index("历史一")
+        i_hist = _idx_by_substr(contents, "历史一")
         i_turn = next(i for i, c in enumerate(contents) if "【现在要回应的】" in c)
         self.assertLess(i_ex, i_hist, "示例块要在 session 之前")
         self.assertLess(i_hist, i_turn, "当前轮要在 session 之后（易变量集中尾部）")
@@ -622,7 +634,9 @@ class TestDeferredSessionAppend(unittest.TestCase):
         # ② session 段必须**在落盘前**构建 —— 即 context 里不出现"当前这条"
         #    作为独立条目（会话历史条目），它只应出现在「现在要回应的」块里。
         #    注意不能只看 user 角色：turn block 是 system 消息、内容里也含本条。
-        self.assertIn("之前的消息", [m.get("content") for m in captured["ctx"]])
+        self.assertTrue(any("之前的消息" in str(m.get("content") or "")
+                            for m in captured["ctx"]),
+                        "S15 后 content 带发言前缀，改用子串匹配")
         hist_entries = [m.get("content") for m in captured["ctx"]
                         if m.get("content") == "当前这条"]
         self.assertEqual(hist_entries, [], "当前这条不应作为会话条目出现在 context 里")
@@ -647,7 +661,9 @@ class TestDeferredSessionAppend(unittest.TestCase):
         si = _run(p.run(PipelineInput("g1", "静默也要记", False, "u1", "甲")))
         self.assertEqual(si.action, "silent")
         self.assertEqual(len(appends), 1)
-        self.assertIn("静默也要记", [m["content"] for m in sm.get_contexts("g1")])
+        self.assertTrue(any("静默也要记" in str(m.get("content") or "")
+                            for m in sm.get_contexts("g1")),
+                        "静默消息仍应入会话（S15 后 content 带发言前缀）")
         self.assertTrue(si.trace.get("session_appended"))
 
     def test_exception_path_flushes(self):
@@ -831,7 +847,8 @@ class TestSharedContextS4(unittest.TestCase):
         joined = [str(m.get("content")) for m in gate.last_contexts]
         # 共享前缀应含示例块与 session 历史
         self.assertIn("【示例块】", joined)
-        self.assertIn("历史甲", joined)
+        self.assertTrue(any("历史甲" in c for c in joined),
+                        "S15 后为 '甲：历史甲'，用子串匹配")
         self.assertIn("机器人的旧回复", joined)
 
     def test_gate_prefix_is_byte_identical_to_rp_prefix(self):
@@ -990,7 +1007,7 @@ class TestRelationsBlockSplitS9(unittest.TestCase):
         i_ts = contents.index("【工具语法】")
         i_ex = contents.index("【示例块】")
         i_rel = contents.index("【关系图谱】")
-        i_sess = contents.index("历史甲")
+        i_sess = _idx_by_substr(contents, "历史甲")
         self.assertLess(i_ts, i_ex, "工具语法应在示例块之前")
         self.assertLess(i_ex, i_rel, "示例块应在关系图谱之前")
         self.assertLess(i_rel, i_sess, "🔴 关系图谱必须在 session 之前（否则session前缀会被作废）")
@@ -1006,7 +1023,7 @@ class TestRelationsBlockSplitS9(unittest.TestCase):
         _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
         contents = [str(m.get("content")) for m in captured["ctx"]]
         self.assertNotIn("", contents)
-        self.assertIn("历史甲", contents)
+        self.assertTrue(any("历史甲" in c for c in contents))
 
     def test_system_prompt_no_longer_contains_relations(self):
         """回归：`system_prompt()` 不得再拼别名/关系块（那是拆分的要点）。"""
