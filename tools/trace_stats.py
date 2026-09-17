@@ -21,7 +21,7 @@
 | 硬闸放行 | `hard_gate.action == "reply"` |
 | 过 Gate | `gate.reply == true` |
 | 生成尝试 | `generation_attempted`（旧行退回 `raw_generation`/`final_text`） |
-| 生成失败 | 存在 `llm_error`（`empty completion` = 模型返回空；否则为异常成因） |
+| 生成未完成 | 存在 `llm_error`（空生成 / 异常 / 连 LLM 都没调成 —— 第三种**不算**生成尝试） |
 | 生成成功 | 存在 `raw_generation`（= 旧口径的"生成"） |
 
 比率：
@@ -178,7 +178,7 @@ def _fmt(st: dict) -> str:
         f"  硬闸放行    {st['hard_pass']:>7}  ({_rate(st['hard_pass'], st['inbound']):.1%} of 入站)",
         f"  过 Gate     {st['gate_pass']:>7}  ({_rate(st['gate_pass'], st['hard_pass']):.1%} of 放行)",
         f"  生成尝试    {st['gen_attempted']:>7}",
-        f"  生成失败    {st['gen_failed']:>7}  (B-028: 空生成/异常，旧口径看不见)",
+        f"  生成未完成  {st['gen_failed']:>7}  (空生成/异常/未调用 LLM；后两者不算尝试)",
         f"  生成成功    {st['generated']:>7}",
     ]
     if st["hard_pass"]:

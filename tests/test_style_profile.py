@@ -70,6 +70,17 @@ class TestFilterAlreadyAnnounced(unittest.TestCase):
         lines = ["  1: 甲  [熟人]", "  2: 乙  [新人]"]
         self.assertEqual(StyleProfile.filter_already_announced(lines, ""), lines)
 
+    def test_tolerates_format_drift_in_frozen_block(self):
+        """独立核验第三轮 1b：块里行尾/行首多空白时也必须认得出"已播报"。
+
+        否则该行会被**再播报一次**（失败方向安全，但没必要）。
+        """
+        line = "  2: 乙  [认识]"
+        for drifted in (line + "  ", "  " + line, "\t" + line + "\t"):
+            self.assertEqual(
+                StyleProfile.filter_already_announced([line], drifted), [],
+                f"格式漂移未被容忍: {drifted!r}")
+
     def test_drops_blank_lines(self):
         self.assertEqual(StyleProfile.filter_already_announced(["", "   "], "x"), [])
 
@@ -124,6 +135,35 @@ class TestPlanRelationsDelta(unittest.TestCase):
             self.assertEqual(plan.text, "", "头部已含乙 → 不得重复播报（B-032）")
             self.assertEqual(plan.known, cur_lines, "known 仍要推进到当前")
             self.assertFalse(plan.first_run)
+
+    def test_state_write_decisions_are_locked(self):
+        """独立核验第三轮：main 的接线（是否落盘 / 是否先对齐）此前无任何测试。
+
+        现在这些判断都在 plan 里，四条出口的 state 形状逐条锁住。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sp = self._sp(td, [{"uin": "1", "alias": "甲", "closeness": "close"}])
+            cur = dict(sp.relations_lines())
+            # ① 首次：要落盘 initialized_at，且必须先对齐头部
+            p1 = plan_relations_delta(sp, {}, now=1000.0)
+            self.assertEqual(sorted(p1.state), ["initialized_at", "known"])
+            self.assertTrue(p1.need_align)
+            # ② 完全无差异：不落盘（state=None），也不需要对齐
+            p2 = plan_relations_delta(sp, cur, frozen_block="", now=1000.0)
+            self.assertIsNone(p2.state, "无差异时不得写盘")
+            self.assertFalse(p2.need_align)
+            # ③ 被冻结块吸收：要落盘（推 known）但不需要对齐
+            p3 = plan_relations_delta(sp, {"1": "  1: 甲  [认识]"},
+                                      frozen_block=cur["1"], now=1000.0)
+            self.assertEqual(p3.text, "")
+            self.assertIsNotNone(p3.state, "头部已讲过也要推进 known（否则每轮重算）")
+            self.assertTrue(p3.state.get("aligned_with_frozen"))
+            self.assertFalse(p3.need_align)
+            # ④ 真变化：落盘带 added/changed 计数
+            p4 = plan_relations_delta(sp, {"1": "  1: 甲  [认识]"}, now=1000.0)
+            self.assertIn("关系/称呼有变化", p4.text)
+            self.assertEqual((p4.state["added"], p4.state["changed"]), (0, 1))
+            self.assertEqual(p4.state["updated_at"], 1000.0, "now 应可注入（确定性）")
 
     def test_alias_embedding_another_line_is_not_swallowed(self):
         """🔴 独立核验给的唯一误杀构造：某个成员的别名里**字面内嵌**另一成员的整行。
