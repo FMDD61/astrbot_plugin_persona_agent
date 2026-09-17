@@ -386,9 +386,19 @@ class InterjectionManager:
                     "last_reply_ts": usage.last_reply_ts,
                     "at_cooldowns": dict(usage.last_at_reply_by_user),
                 }
+            # 🔴 B-023（2026-09-17 生产验证）：两个分支**必须给出同一组顶层键**。
+            # 此前无 group_id 时不给 current_hour/hourly_used，而
+            # `main._admin_status` 走的正是这个分支却取 `snap['hourly_used']`
+            # → `KeyError` → 管理员跑 `/admin status` 只收到
+            # ":( 在调用插件…时出现异常：'hourly_used'"（2026-09-15 起就存在，
+            # 命令改名后缺陷跟着活了下来，且无测试覆盖）。
+            # 全局视角的标量语义 = **多群峰值**（配置/展示用；要看单群请传 group_id）。
+            usages = list(self._usage.values())
             return {
                 "active_interjection": self.active_interjection,
                 "reply_on_at": self.reply_on_at,
                 "topic_bank_enabled": self.topic_bank_enabled,
+                "current_hour": max((u.current_hour for u in usages), default=-1),
+                "hourly_used": max((u.hourly_used for u in usages), default=0.0),
                 "groups": {g: u.to_dict() for g, u in self._usage.items()},
             }
