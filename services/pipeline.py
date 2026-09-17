@@ -215,6 +215,16 @@ class PersonaPipeline:
         rel_block = (
             self._relations_block() if self._relations_block is not None else ""
         )
+        # 🔴 B-022（2026-09-17 生产验证）：图谱块必须**冻结**。
+        # 它是**活块**（随新成员入列增长，实测一天 8~11 次），又位于 session
+        # 之前 → 每变一次，其后 4–9 万 token 前缀缓存全废（实测 13 次变更吃掉
+        # 全部全价 token 的 32.6%，common_prefix_chars 恒为 793/1703）。
+        # 冻结后头部逐字节不变；变更由 main.`_relations_delta_block` 追加到会话尾部
+        # —— 这正是 S10 的设计意图，此前只实现了"尾部追加"这一半。
+        # 无该方法（离线测试台的假 session_mgr）时退化为旧行为。
+        if rel_block and self.session_mgr is not None and \
+                hasattr(self.session_mgr, "freeze_relations_block"):
+            rel_block = self.session_mgr.freeze_relations_block(group_id, rel_block)
         if rel_block:
             head.append({"role": "system", "content": rel_block})
         # 🔴 顺序：**人格（session 首条）必须在整个数组最前**，
