@@ -31,7 +31,10 @@
   （`common_prefix_chars` 恒为 793(gate)/1703(rp)，断点恰在"群友识别"块）。
   S10 的设计（"旧块留在前缀里不动 + 增量追加到尾部"）此前只实现了后半句。
   修法：`SessionManager.freeze_relations_block()` 首次冻结、之后恒返回冻结值
-  （随 session 落盘、跨重启不变；轮转即重置）；顺带修掉"同一变更被 LLM 看到两遍"
+  （随 session 落盘、跨重启不变；轮转即重置）；顺带修掉"同一变更被 LLM 看到两遍"。
+  端到端复验（管线 + 真 `SessionManager`，活块连涨两轮）：前缀里的图谱块三轮**逐字节相同**、
+  活块新内容未进前缀、相邻两轮 messages 公共前缀 4/4。
+  ⚠️ **已知取舍**：`relations_delta()` 不上报**删除**，故人工删行的效果会延迟到下一次轮转（≤24h）
 - **🔴 `/admin status` 必崩（B-023，`5ea0214`）**：`snapshot()` 有**两个形状**的返回值，
   无 group_id 分支不含 `hourly_used`/`current_hour`，而 `_admin_status` 正的正是它
   → `KeyError: 'hourly_used'` → 管理员只收到 `:( 在调用插件…时出现异常`（09-15 起存在，

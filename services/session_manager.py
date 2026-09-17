@@ -393,6 +393,13 @@ class SessionManager:
         - 空串不冻结（未启用/无图谱时不占位，返回空串）
         - 跨重启存活（随 session 文件落盘）
         - 轮转即重置（新一天的会话前缀本来就要重建）
+
+        ⚠️ **已知取舍**：`style_profile.relations_delta()` 只上报**新增**与**行文本变化**，
+        **不上报删除**（它遍历的是当前行）。所以人工从 `member_relations.json`
+        **删掉**一行时，冻结块里那行会留到下一次轮转（≤24h）——
+        换来的是这段时间内前缀不失效。成员表按设计是"只升不降 + 人工批准"，
+        删除属罕见操作；如确需立即生效，改完重启 AstrBot 或等 02:00 轮转即可
+        （改一行文本 = `changed`，会被正常追加到尾部）。
         """
         with self._lock:
             sess = self._get_or_create(group_id)
