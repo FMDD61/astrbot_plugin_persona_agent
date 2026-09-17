@@ -152,6 +152,9 @@ class TestPlanRelationsDelta(unittest.TestCase):
             p2 = plan_relations_delta(sp, cur, frozen_block="", now=1000.0)
             self.assertIsNone(p2.state, "无差异时不得写盘")
             self.assertFalse(p2.need_align)
+            self.assertEqual(p2.known, {},
+                             "state=None 时 known 返回空 dict —— 它表示「无落盘需求」，"
+                             "不是「当前 known」（独立核验第四轮的 footgun 提示）")
             # ③ 被冻结块吸收：要落盘（推 known）但不需要对齐
             p3 = plan_relations_delta(sp, {"1": "  1: 甲  [认识]"},
                                       frozen_block=cur["1"], now=1000.0)
