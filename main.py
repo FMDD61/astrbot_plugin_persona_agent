@@ -658,9 +658,11 @@ class PersonaAgent(Star):
             f" yearly={(cfg.get('summary') or {}).get('yearly_enabled', 0)}",
         ]
         if self.interjection is not None:
-            snap = self.interjection.snapshot()
-            lines.append(f"hourly_used      : {snap['hourly_used']:.2f}  "
-                         f"hour={snap['current_hour']}")
+            # B-023：展示**目标群**的用量（无参分支是"多群峰值"，不适合这里；
+            # 且它此前不含这两个键 → 本命令必抛 KeyError）。
+            snap = self.interjection.snapshot(self.target_group_id)
+            lines.append(f"hourly_used[{self.target_group_id}] : "
+                         f"{snap['hourly_used']:.2f}  hour={snap['current_hour']}")
         if self.session_mgr is not None:
             for gid, sz in (self.session_mgr.snapshot() or {}).items():
                 lines.append(f"session[{gid}]  : {sz} msgs")

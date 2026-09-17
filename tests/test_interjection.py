@@ -211,5 +211,33 @@ class TestRegressionSemantics(unittest.TestCase):
         self.assertIn("A", global_snap["groups"])
 
 
+    def test_snapshot_key_contract_is_uniform(self):
+        """🔴 B-023（2026-09-17 验证）：`snapshot()` 两分支的键集必须兼容。
+
+        生产事故：`main._admin_status` 调 `snapshot()`（**不传 group_id**）
+        然后取 `snap['hourly_used']` → `KeyError` → 管理员跑 `/admin status`
+        只会收到 `:( 在调用插件…时出现异常：'hourly_used'`。
+        两个分支返回**结构不同**的 dict 是根因（footgun），所以在这里把契约钉死：
+        无论传不传 group_id，`current_hour` / `hourly_used` 都必须可读。
+        """
+        now = self.now
+        self.mgr.register_reply(group_id="A", now_utc=now, trigger=TRIGGER_RAG)
+        for snap in (self.mgr.snapshot(), self.mgr.snapshot("A")):
+            self.assertIn("current_hour", snap,
+                          "snapshot() 必须给 current_hour（否则调用方 KeyError）")
+            self.assertIn("hourly_used", snap,
+                          "snapshot() 必须给 hourly_used（B-023）")
+        # 无 group_id = 全局视角：标量取"多群峰值"，并保留 groups 明细
+        g = self.mgr.snapshot()
+        self.assertEqual(g["hourly_used"], 1.0)
+        self.assertIn("groups", g)
+
+    def test_snapshot_global_without_any_usage(self):
+        """一个群都没登记时也不能崩（`/admin status` 在冷启动后就会这样）。"""
+        snap = self.mgr.snapshot()
+        self.assertEqual(snap["hourly_used"], 0.0)
+        self.assertIn("current_hour", snap)
+
+
 if __name__ == "__main__":
     unittest.main()
