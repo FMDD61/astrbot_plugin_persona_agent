@@ -96,6 +96,127 @@ class TestRotation(unittest.TestCase):
             self.assertEqual(os.listdir(td), [])
 
 
+class ArchivePayloadTests(unittest.TestCase):
+    """B-025（2026-09-17 验证）：轮转归档必须带上会话状态。
+
+    \`_save()\` 写 8 键（含 S14 新增的 system_prompt / sys_blocks / next_block_id），
+    而 \`rotate_if_day_changed()\` 只写 5 键 → 归档日**人格整条消失**：
+    实测同一导出工具，归档文件命中人格标记 0 次、在写文件 1 次。
+    可变块标记（\`__sys_block__\`）也会因缺 \`sys_blocks\` 而还原不出内容。
+    """
+
+    def _pin(self, iso):
+        orig = time.time
+        time.time = lambda: cst(iso)
+        return orig
+
+    def test_rotation_archive_keeps_session_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            sm = SessionManager(data_dir=td, max_messages=None,
+                                rotation_hour=2, tz_offset_hours=8)
+            prompt = "你是这个 QQ 群里的一名活跃群员，模仿某群友的风格说话。"
+            orig = self._pin("2026-08-23 10:00")
+            try:
+                sm.ensure_system_prompt('grp', prompt)
+                sm.append_system_update('grp', "［设定更新］以此为准：新口癖")
+                sm.append('grp', 'user', '早上好', name='小明')
+            finally:
+                time.time = orig
+            orig = self._pin("2026-08-24 03:00")
+            try:
+                old = sm.rotate_if_day_changed('grp')
+            finally:
+                time.time = orig
+            self.assertEqual(len(old), 2)
+            path = os.path.join(td, 'session_grp_2026-08-23.json')
+            payload = json.load(open(path, encoding='utf-8'))
+            self.assertEqual(payload.get("system_prompt"), prompt,
+                             "归档缺 system_prompt → 导出历史日人格消失（B-025）")
+            self.assertTrue(payload.get("sys_blocks"),
+                            "归档缺 sys_blocks → 可变块内容还原不出（B-025）")
+            self.assertIn("next_block_id", payload)
+
+    def test_rotation_archive_round_trips_through_load_all(self):
+        """归档 → 重新 load_all 后，可变块仍能还原成 system 消息。"""
+        with tempfile.TemporaryDirectory() as td:
+            sm = SessionManager(data_dir=td, max_messages=None,
+                                rotation_hour=2, tz_offset_hours=8)
+            orig = self._pin("2026-08-23 10:00")
+            try:
+                sm.ensure_system_prompt('grp', "人格正文")
+                sm.append_system_update('grp', "［设定更新］以此为准：块正文")
+                sm.append('grp', 'user', '历史')
+            finally:
+                time.time = orig
+            orig = self._pin("2026-08-24 03:00")
+            try:
+                sm.rotate_if_day_changed('grp')
+            finally:
+                time.time = orig
+            # 归档文件是"那一天"的内容；load_all 取最新 day 文件 = 归档日
+            sm2 = SessionManager(data_dir=td, max_messages=None,
+                                 rotation_hour=2, tz_offset_hours=8)
+            sm2.load_all()
+            ctx = [str(m.get("content") or "") for m in sm2.get_contexts('grp')]
+            self.assertIn("人格正文", ctx, "恢复后 system prompt 丢失（B-025）")
+            self.assertTrue(any("块正文" in c for c in ctx),
+                            "恢复后可变块内容丢失（B-025）")
+
+
+class RelationsBlockFreezeTests(unittest.TestCase):
+    """B-022（2026-09-17 验证）：关系图谱头部块必须**冻结**。
+
+    生产实测 13 次「图谱块变更」把整段会话前缀（4–9 万 token）打成全价，
+    占全部全价 token 的 32.6% —— 因为 \`_assemble_base\` 每轮现算活块，
+    而 S10 的"旧块留在前缀里不动"只做到了"往尾部追加增量"。
+    """
+
+    def test_freeze_returns_first_content(self):
+        sm = SessionManager(data_dir=None, max_messages=None)
+        first = sm.freeze_relations_block("g1", "【关系图谱】v1")
+        second = sm.freeze_relations_block("g1", "【关系图谱】v2 新成员")
+        self.assertEqual(first, "【关系图谱】v1")
+        self.assertEqual(second, "【关系图谱】v1",
+                         "冻结后不得再返回新内容（否则前缀失效 → B-022）")
+
+    def test_freeze_with_empty_content_is_noop(self):
+        sm = SessionManager(data_dir=None, max_messages=None)
+        self.assertEqual(sm.freeze_relations_block("g1", ""), "")
+        self.assertEqual(sm.freeze_relations_block("g1", "【关系图谱】v1"), "【关系图谱】v1")
+
+    def test_frozen_block_survives_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            sm = SessionManager(data_dir=td, max_messages=None,
+                                rotation_hour=2, tz_offset_hours=8)
+            sm.freeze_relations_block("g1", "【关系图谱】v1")
+            sm.append("g1", "user", "历史")
+            sm._save("g1")
+            sm2 = SessionManager(data_dir=td, max_messages=None,
+                                 rotation_hour=2, tz_offset_hours=8)
+            sm2.load_all()
+            self.assertEqual(sm2.freeze_relations_block("g1", "【关系图谱】v2"),
+                             "【关系图谱】v1", "重启后冻结块丢失 → 前缀失效（B-022）")
+
+    def test_rotation_resets_frozen_block(self):
+        with tempfile.TemporaryDirectory() as td:
+            sm = SessionManager(data_dir=td, max_messages=None,
+                                rotation_hour=2, tz_offset_hours=8)
+            orig = time.time
+            time.time = lambda: cst("2026-08-23 10:00")
+            try:
+                sm.freeze_relations_block("g1", "【关系图谱】v1")
+                sm.append("g1", "user", "历史")
+            finally:
+                time.time = orig
+            time.time = lambda: cst("2026-08-24 03:00")
+            try:
+                sm.rotate_if_day_changed("g1")
+            finally:
+                time.time = orig
+            self.assertEqual(sm.freeze_relations_block("g1", "【关系图谱】v2"),
+                             "【关系图谱】v2", "轮转 = 新会话，冻结块应重置")
+
+
 class TestEmptyContentSelfHeal(unittest.TestCase):
     """B-002：会话里的空 content 条目曾让 LLM 请求 400 → 永久静默不回复。
 
