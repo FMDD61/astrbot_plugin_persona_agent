@@ -1423,6 +1423,43 @@ class PersonaAgent(Star):
 
     _REL_STATE = "relations_block_state.json"
 
+    def _active_group_id(self) -> str:
+        """当前生效的群（test_mode=1 时是测试群）—— 会话级状态都按它取。"""
+        return self.test_group_id if int(self.test_mode or 0) == 1 else self.target_group_id
+
+    def _frozen_relations_block_text(self) -> str:
+        """取会话里冻结的关系图谱块（无则空串；绝不抛）。"""
+        try:
+            if self.session_mgr is not None and hasattr(
+                    self.session_mgr, "frozen_relations_block"):
+                return self.session_mgr.frozen_relations_block(self._active_group_id())
+        except Exception:
+            pass
+        return ""
+
+    def _align_frozen_relations_block(self) -> None:
+        """B-032 修复态：增量状态缺失时把头部冻结块重冻成当前图谱。
+
+        为什么必须做：`_relations_delta_block` 的"首次运行"会把 known 设成当前全部行，
+        而头部块可能还停在更早的冻结值 → 两者之间的差异**永远不会被追加**，
+        对 LLM 永久不可见（静默）。重冻会破一次前缀缓存，故留一条 warning。
+        """
+        if self.style is None or self.session_mgr is None:
+            return
+        if not hasattr(self.session_mgr, "freeze_relations_block"):
+            return
+        try:
+            before = self._frozen_relations_block_text()
+            after = self.session_mgr.freeze_relations_block(
+                self._active_group_id(), self.style.relations_block(), force=True)
+            if before and before != after:
+                logger.warning(
+                    "[persona_agent] 关系图谱增量状态缺失 → 头部冻结块已重冻为当前图谱"
+                    "（B-032 修复态；本次会破一次前缀缓存）"
+                )
+        except Exception as e:
+            logger.warning(f"[persona_agent] 冻结块对齐失败（不影响运行）: {e}")
+
     def _relations_delta_block(self) -> str:
         """算出需要追加的"群友识别更新"文本；无变化返回空串。
 
@@ -1455,11 +1492,29 @@ class PersonaAgent(Star):
         known = state.get("known") or {}
         if not known:
             # 首次：登记全部，不追加（初始块已在恒定前缀里）
+            # 🔴 B-032（2026-09-17 独立核验）：状态被删/重置时，"头部冻结块"可能
+            # 与即将写入的 known 不一致 —— 那段差异对 LLM **永久不可见**（静默）。
+            # 修复态：把头部重冻成当前图谱，让两边对齐（会破一次前缀缓存，留痕）。
+            self._align_frozen_relations_block()
             self.store.save_json(self._REL_STATE,
                                  {"known": cur, "initialized_at": time.time()})
             return ""
         new_lines, changed = self.style.relations_delta(known)
+        # 🔴 B-032：会话边界上头部块是用**当时活的**图谱冻结的（已含新成员），
+        # 而增量仍按 known 算 → 同一变更 head 与 tail 各讲一遍，且尾部那条会
+        # 留在会话里一整天。头部已经写着的行不必再追加。
+        _frozen = self._frozen_relations_block_text()
+        if _frozen:
+            new_lines = self.style.filter_already_announced(new_lines, _frozen)
+            changed = self.style.filter_already_announced(changed, _frozen)
         if not new_lines and not changed:
+            if cur != known:
+                # 有变化但头部已经讲过 → 仍要推进 known，否则每轮重算同一差集
+                # （只在真有差异时写盘，避免每轮一次无谓的文件写）
+                self.store.save_json(
+                    self._REL_STATE,
+                    {"known": cur, "updated_at": time.time(),
+                     "added": 0, "changed": 0, "aligned_with_frozen": True})
             return ""
         parts: list[str] = ["［群友识别更新］"]
         if new_lines:
@@ -1613,6 +1668,10 @@ class PersonaAgent(Star):
         )
         if not provider_id:
             logger.warning("[persona_agent] no LLM provider available")
+            # B-032（独立核验反例 4）：这条路径**根本没调 LLM**，
+            # 不能与"模型返回空"混为一谈 —— 否则 trace 把尝试/失败都记高、成因记错
+            if meta is not None:
+                meta["error"] = "no provider available (LLM not called)"
             return ""
 
         gen_kwargs = {}
@@ -1677,6 +1736,9 @@ class PersonaAgent(Star):
         text = (getattr(resp, "completion_text", "") or "").strip()
         if self._is_error_response(text):
             logger.warning(f"[persona_agent] llm returned error response, suppressed ({len(text)} chars)")
+            # B-032：与"空生成"分开记 —— 这是模型**回了错误文本**后被抑制
+            if meta is not None:
+                meta["error"] = f"llm error response suppressed: {text[:80]}"
             return ""
         return text
 

@@ -256,6 +256,22 @@ class StyleProfile:
                 changed.append(line)
         return new_lines, changed
 
+    @staticmethod
+    def filter_already_announced(lines: list[str], frozen_block: str) -> list[str]:
+        """丢掉**头部冻结块里已经写着**的行（B-032，2026-09-17 独立核验发现）。
+
+        会话边界（日轮转后新会话的首轮）上，头部块用**当时活的**图谱冻结 ——
+        它已经含了新成员；而增量仍按 `known` 算 → 同一变更 head 与 tail **各讲一遍**，
+        且尾部那条会留在会话里一整天（每轮都被 LLM 看两次）。
+
+        头部已经写着的行不必再追加。判据是**逐行子串**：两处用的都是
+        `relations_lines()` 的同一份行文本，故可直接比对。
+        空行剔除；`frozen_block` 为空时原样返回（未冻结/未启用时不改变行为）。
+        """
+        if not frozen_block:
+            return list(lines)
+        return [ln for ln in lines if ln and ln.strip() and ln not in frozen_block]
+
     def relations_block(self) -> str:
         """关系图谱（**独立块**，与人格分离）。
 

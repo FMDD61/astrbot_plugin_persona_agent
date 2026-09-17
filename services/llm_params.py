@@ -34,16 +34,21 @@ _VALID = ("low", "medium", "high", "max")
 def extract_reasoning(resp) -> str:
     """从 LLM 响应里取出**思维链文本**（取不到返回空串，绝不抛）。
 
-    🔴 B-029（2026-09-17 实测）：
-      - AstrBot 的 LLMResponse.reasoning_content 是标准字段，但
-        openai_chat_completion 源码里**从不给它赋值**（只有 anthropic_source 会）
-      - 而 commandcode 网关（OpenAI 兼容端点）回的是**非标准字段**
-        message.reasoning（str）与 message.reasoning_details（list）
+    🔴 B-029（2026-09-17 实测；根因表述经独立核验更正）：
+      - AstrBot 的 openai_chat_completion **确实会**给
+        LLMResponse.reasoning_content 赋值（源码 :876-878，流式 :672），
+        但它只按 `self.reasoning_key`（默认 "reasoning_content"，源码 :399）
+        去取属性 —— 见 `_extract_reasoning_content`（:700-724）
+      - 而 commandcode 网关（OpenAI 兼容端点）把思维链放在**非标准字段**
+        message.reasoning（str）+ message.reasoning_details（list），
+        标准属性名 `reasoning_content` 取不到 → LLMResponse 里恒为 None
 
-    实测同一模型同一参数：reasoning_content=None 而 reasoning 非空、
-    usage.reasoning_tokens=27。于是 S16 的"思维链留存"**从未生效**
-    （401/401 次 reasoning_chars=0），导出永远显示"思维链：无"，
-    看起来像"模型没思考"——而计费里明明有 60,482 个 reasoning token。
+    实测同一模型同一参数：`reasoning_content=None` 而 `reasoning` 非空
+    （140 字符）、`usage.reasoning_tokens` 44（不同调用 27–58 波动）。
+    于是 S16 的"思维链留存"**从未生效**（401/401 次 reasoning_chars=0），
+    导出永远显示"思维链：无"，看起来像"模型没思考"——而计费里明明有
+    60,482 个 reasoning token。
+    ⚠️ 本函数与 AstrBot 版本无关：即使上游改了 `reasoning_key`，这里也能兜住。
 
     取值优先级：标准字段 → 网关 reasoning → reasoning_details[].text。
     只读、不写、不改响应对象；任何异常都吞掉返回空串（观测不该拖垮主链）。

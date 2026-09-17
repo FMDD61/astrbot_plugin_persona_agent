@@ -378,7 +378,14 @@ class SessionManager:
         with self._lock:
             return sess.ensure_system_prompt(content)
 
-    def freeze_relations_block(self, group_id: str, content: str) -> str:
+    def frozen_relations_block(self, group_id: str) -> str:
+        """当前会话里冻结的关系图谱块（未冻结/无会话 → 空串）。"""
+        with self._lock:
+            sess = self._sessions.get(str(group_id))
+            return sess.relations_block if sess is not None else ""
+
+    def freeze_relations_block(self, group_id: str, content: str, *,
+                               force: bool = False) -> str:
         """关系图谱头部块：**首次调用冻结，之后恒返回冻结值**（B-022）。
 
         背景（2026-09-17 生产验证）：`_assemble_base` 每轮现算活块，而该块位于
@@ -398,12 +405,18 @@ class SessionManager:
         **不上报删除**（它遍历的是当前行）。所以人工从 `member_relations.json`
         **删掉**一行时，冻结块里那行会留到下一次轮转（≤24h）——
         换来的是这段时间内前缀不失效。成员表按设计是"只升不降 + 人工批准"，
-        删除属罕见操作；如确需立即生效，改完重启 AstrBot 或等 02:00 轮转即可
-        （改一行文本 = `changed`，会被正常追加到尾部）。
+        删除属罕见操作。**注意：重启 AstrBot 不会让它生效** —— `load_all` 会把冻结块
+        一起恢复（`test_frozen_block_survives_restart` 锁定的就是这一点）；
+        只有 02:00 日轮转（或 `force=True` 的修复态）才会重新冻结。
+        改一行**文本** = `changed`，会被正常追加到尾部，不受此限。
+
+        `force=True` 用于**修复态**：增量状态被删/重置时，必须让"头部块"与
+        "已透露状态 known"重新对齐，否则两者之间的差异对 LLM **永久不可见**
+        （2026-09-17 独立核验发现的静默回归点）。
         """
         with self._lock:
             sess = self._get_or_create(group_id)
-            if not sess.relations_block and content:
+            if content and (force or not sess.relations_block):
                 sess.relations_block = str(content)
             return sess.relations_block
 
