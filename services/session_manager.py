@@ -39,6 +39,14 @@ class Session:
     day: str = ""
     """Session day key (rotation window), empty until first use."""
     messages: deque[dict] = field(default_factory=lambda: deque(maxlen=600))
+    #: 🔴 B-022（2026-09-17 生产验证）：**关系图谱头部块的冻结副本**。
+    #: 为什么不每轮现算：图谱会随新成员入列增长（实测一天 8~11 次），
+    #: 而它位于**会话历史之前** → 每变一次，其后 4–9 万 token 前缀缓存全废
+    #: （实测 13 次变更事件吃掉全部全价 token 的 32.6%）。
+    #: 冻结后：头部逐字节不变，变更改由 `_relations_delta_block` 以一条
+    #: system 消息**追加到会话尾部**（S10 的设计意图，此前只做了一半）。
+    #: 与 `system_prompt` 同样**不放进 deque**（deque 有 maxlen 会被挤掉）。
+    relations_block: str = ""
     #: 会话开卷时的 system prompt（**不放进 deque**）。
     #: 🔴 为什么不放 deque：deque 有 maxlen，容量压力下它会被**静默挤掉**
     #: （测试抓到：max_messages=10 灌 50 条后 prompt 消失）→ 下次构建又会
@@ -255,6 +263,8 @@ class Session:
         self.system_prompt = ""
         self.sys_blocks.clear()
         self._next_block_id = 0
+        # B-022: 轮转 = 新会话 → 冻结块也重置（下一天按当时的图谱重新冻结）
+        self.relations_block = ""
 
 
 # 内部元数据键前缀：绝不进 LLM 请求/对外 API
@@ -352,6 +362,28 @@ class SessionManager:
             sess = self._get_or_create(group_id)
         with self._lock:
             return sess.ensure_system_prompt(content)
+
+    def freeze_relations_block(self, group_id: str, content: str) -> str:
+        """关系图谱头部块：**首次调用冻结，之后恒返回冻结值**（B-022）。
+
+        背景（2026-09-17 生产验证）：`_assemble_base` 每轮现算活块，而该块位于
+        会话历史**之前** → 图谱随新成员入列增长时，其后 4–9 万 token 前缀缓存
+        全部作废。实测 13 次变更事件吃掉**全部全价 token 的 32.6%**
+        （`common_prefix_chars` 恒为 793(gate)/1703(rp)，断点恰在"群友识别"块）。
+
+        S10 的设计意图是"旧块留在前缀里不动，更新以新块追加到上下文尾部" ——
+        此处补上前半句：块一旦进前缀就不再变；变更由
+        `main._relations_delta_block` 以一条 system 消息追加到会话尾部。
+
+        - 空串不冻结（未启用/无图谱时不占位，返回空串）
+        - 跨重启存活（随 session 文件落盘）
+        - 轮转即重置（新一天的会话前缀本来就要重建）
+        """
+        with self._lock:
+            sess = self._get_or_create(group_id)
+            if not sess.relations_block and content:
+                sess.relations_block = str(content)
+            return sess.relations_block
 
     def append_system_update(self, group_id: str, content: str) -> bool:
         """prompt 变更 → 追加更新块。返回是否真的追加。
@@ -498,6 +530,15 @@ class SessionManager:
                 sess.day = key
                 return None
             old_day = sess.day
+            # 🔴 B-025（2026-09-17 生产验证）：归档 payload 此前**只写 5 键**，
+            # 漏了 system_prompt / sys_blocks / next_block_id（_save 写 8 键）
+            # → 归档日 session 的导出/离线复核里**人格整条消失**（实测同一导出
+            # 工具：归档文件命中人格标记 0 次、在写文件 1 次），可变块也还原不出。
+            # 必须在 clear() **之前**取走 —— clear 会把这些字段清空。
+            old_sys_prompt = sess.system_prompt
+            old_blocks = {str(k): v for k, v in sess.sys_blocks.items()}
+            old_nbid = sess._next_block_id
+            old_rel_block = sess.relations_block
             # 轮转 = 新会话：system prompt 与可变块都要重置，
             # 否则新一天会继续用旧设定、且不写入最新的 prompt。
             sess.clear()
@@ -512,6 +553,11 @@ class SessionManager:
                     "day": old_day,
                     "saved_at": time.time(),
                     "messages": old_msgs,
+                    # B-025: 会话状态随归档一起留存（与 _save 的键保持一致）
+                    "system_prompt": old_sys_prompt,
+                    "sys_blocks": old_blocks,
+                    "next_block_id": old_nbid,
+                    "relations_block": old_rel_block,
                 }
                 path = self._session_path(group_id, old_day)
                 tmp = path.with_suffix(path.suffix + ".tmp")
@@ -553,6 +599,8 @@ class SessionManager:
                 "system_prompt": sess.system_prompt,
                 "sys_blocks": {str(k): v for k, v in sess.sys_blocks.items()},
                 "next_block_id": sess._next_block_id,
+                # B-022: 冻结的关系图谱块（重启后前缀仍需逐字节不变）
+                "relations_block": sess.relations_block,
             }
             path = self._session_path(group_id, sess.day or None)
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -633,17 +681,28 @@ class SessionManager:
                     return _has_content(m)          # system prompt
                 return _has_content(m) and m.get("role") in ("user", "assistant")
 
-            cleaned = [
-                # 🔴 必须保留 `name`！S15 漏了它 → `_public` 已剥 name，恢复时
-                # 不再补回 → **save_all() 落盘时 name 永久丢失**。
-                # 而旧格式条目（R5 之前写入的）**内容里没有前缀**，`name` 是它们
-                # 唯一的发言人标识 → 丢 name 等于让那些条目"没有主"。
-                _public(m) | {
+            def _clean(m: dict) -> dict:
+                """恢复时的条目清洗：剥内部键，但**必须保住存储性键**。
+
+                🔴 必须保留 `name`！S15 漏了它 → `_public` 已剥 name，恢复时
+                不再补回 → **save_all() 落盘时 name 永久丢失**。
+                而旧格式条目（R5 之前写入的）**内容里没有前缀**，`name` 是它们
+                唯一的发言人标识 → 丢 name 等于让那些条目"没有主"。
+
+                🔴 B-031（2026-09-17 随 B-025 的往返测试发现）：可变块标记
+                `__sys_block__` 也是"下划线开头的内部键" → 被 `_public` 一并剥掉，
+                于是内容留在 `sys_blocks` 里却**无人引用** → **每次重启静默丢掉
+                所有［设定更新］块**。标记本身是存储结构，必须原样保留。
+                """
+                base = _public(m) | {
                     k: m[k] for k in ("_mid", "_uin", "_reasoning", "name")
                     if m.get(k)
                 }
-                for m in msgs if _keep(m)
-            ]
+                if _BLOCK_MARK in m:
+                    base[_BLOCK_MARK] = m[_BLOCK_MARK]
+                return base
+
+            cleaned = [_clean(m) for m in msgs if _keep(m)]
             dropped = sum(
                 1 for m in msgs
                 if isinstance(m, dict)
@@ -654,6 +713,8 @@ class SessionManager:
             sys_prompt = str(payload.get("system_prompt") or "")
             blocks = payload.get("sys_blocks") or {}
             nbid = int(payload.get("next_block_id") or 0)
+            # B-022: 冻结的关系图谱块（缺键 = 旧文件 → 留空，下轮重新冻结）
+            rel_frozen = str(payload.get("relations_block") or "")
             with self._lock:
                 if dropped:
                     self._empty_dropped[gid] = self._empty_dropped.get(gid, 0) + dropped
@@ -671,6 +732,7 @@ class SessionManager:
                 sess.sys_blocks = {int(k): str(v) for k, v in blocks.items()
                                    if int(k) in live}
                 sess._next_block_id = max([nbid] + [k + 1 for k in live] or [0])
+                sess.relations_block = rel_frozen
                 sess.day = day
                 self._last_save[gid] = time.time()
                 self._saved_at_count[gid] = len(sess.messages)
