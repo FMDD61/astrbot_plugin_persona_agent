@@ -126,5 +126,89 @@ class CollectTests(unittest.TestCase):
         self.assertEqual(c["n_samples"], 0)
 
 
+class DiarySourceTests(unittest.TestCase):
+    """B-024（2026-09-17）：周/月报必须读**现行**日记路径。
+
+    日记自 `e566116`（2026-09-08）起写在 `logs/<gid>/daily_diary.jsonl`，
+    而 `collect()` 一直读数据根目录的同名文件（停在 2026-08-29）→
+    生产周报 `n_diaries` 恒为 0，且 `_propose_relations` 的 `not diaries`
+    守卫让**关系提升提案永久不产出**。
+    """
+
+    GID = "100000001"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write(self, rel: str, recs: list[dict]) -> Path:
+        p = self.dir / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in recs) + "\n",
+            encoding="utf-8")
+        return p
+
+    def _collect(self) -> dict:
+        return SummaryService(str(self.dir)).collect(
+            "weekly", self.GID, today=date(2026, 9, 14))  # 窗口 09-07~09-13
+
+    def test_collect_reads_per_group_diary(self) -> None:
+        """只在 `logs/<gid>/` 有日记时也必须收集到（现行路径）。"""
+        self._write(f"logs/{self.GID}/daily_diary.jsonl", [
+            {"day": "2026-09-11", "group_id": self.GID, "summary": "十一号", "n_messages": 46},
+            {"day": "2026-09-13", "group_id": self.GID, "summary": "十三号", "n_messages": 1518},
+        ])
+        c = self._collect()
+        self.assertEqual(c["n_diaries"], 2, "未读到 logs/<gid>/ 下的日记（B-024 未修）")
+        self.assertEqual([d["day"] for d in c["diaries"]],
+                         ["2026-09-11", "2026-09-13"])
+
+    def test_collect_legacy_root_path_compatible(self) -> None:
+        """旧根目录路径仍需兼容（历史部署只有它）。"""
+        self._write("daily_diary.jsonl", [
+            {"day": "2026-09-13", "group_id": self.GID, "summary": "旧路径", "n_messages": 10},
+        ])
+        c = self._collect()
+        self.assertEqual(c["n_diaries"], 1)
+        self.assertEqual(c["diaries"][0]["summary"], "旧路径")
+
+    def test_collect_merges_both_paths_preferring_per_group(self) -> None:
+        """两条路径同一天都有 → 只留一条，且**现行路径**优先。"""
+        self._write("daily_diary.jsonl", [
+            {"day": "2026-09-13", "group_id": self.GID, "summary": "旧的", "n_messages": 1},
+        ])
+        self._write(f"logs/{self.GID}/daily_diary.jsonl", [
+            {"day": "2026-09-13", "group_id": self.GID, "summary": "现行的", "n_messages": 2},
+        ])
+        c = self._collect()
+        self.assertEqual(c["n_diaries"], 1)
+        self.assertEqual(c["diaries"][0]["summary"], "现行的")
+
+    def test_collect_dedups_same_day_within_file(self) -> None:
+        """同一文件内同一天多条（B-018 遗留重复）→ 取最新一条。"""
+        self._write(f"logs/{self.GID}/daily_diary.jsonl", [
+            {"day": "2026-09-13", "group_id": self.GID, "summary": "第一条", "n_messages": 1},
+            {"day": "2026-09-13", "group_id": self.GID, "summary": "第二条", "n_messages": 2},
+            {"day": "2026-09-13", "group_id": self.GID, "summary": "第三条", "n_messages": 3},
+        ])
+        c = self._collect()
+        self.assertEqual(c["n_diaries"], 1)
+        self.assertEqual(c["diaries"][0]["summary"], "第三条")
+
+    def test_collect_ignores_other_group_and_out_of_window(self) -> None:
+        self._write(f"logs/{self.GID}/daily_diary.jsonl", [
+            {"day": "2026-09-13", "group_id": self.GID, "summary": "命中", "n_messages": 1},
+            {"day": "2026-09-13", "group_id": "other", "summary": "别群", "n_messages": 1},
+            {"day": "2026-08-01", "group_id": self.GID, "summary": "窗口外", "n_messages": 1},
+        ])
+        c = self._collect()
+        self.assertEqual(c["n_diaries"], 1)
+        self.assertEqual(c["diaries"][0]["summary"], "命中")
+
+
 if __name__ == "__main__":
     unittest.main()
