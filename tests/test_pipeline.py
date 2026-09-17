@@ -1044,6 +1044,68 @@ class TestRelationsBlockSplitS9(unittest.TestCase):
             self.assertIn("我是焦糖", sp.system_prompt())
 
 
+    def test_relations_block_is_frozen_after_first_use(self):
+        """🔴 B-022：同一会话内图谱块变更**不得**改变已发送的前缀。
+
+        生产实测：`_assemble_base` 每轮现算活块且位于 session 之前 →
+        13 次变更事件把 4–9 万 token 的前缀打成全价（占全部全价 token 32.6%）。
+        冻结后头部逐字节不变，变更只走 `_relations_delta_block` 的尾部追加。
+        """
+        from services.session_manager import SessionManager
+        sm = SessionManager(data_dir=None, max_messages=None)
+        sm.append("g1", "user", "历史甲", name="甲", message_id="m1", sender_uin="u1")
+        state = {"text": "【关系图谱】v1"}
+        captured = {}
+
+        def gen(t, c, e, temp, su, umo):
+            captured["ctx"] = [dict(m) for m in c]
+            return _async("好")
+
+        p = _pipeline(
+            session=sm, generate=gen, session_append=lambda *a: None,
+            examples_block=lambda: "【示例块】",
+            tool_syntax_block=lambda: "【工具语法】",
+            relations_block=lambda: state["text"],
+            turn_block=lambda l, c: "【现在要回应的】",
+        )
+        _run(p.run(PipelineInput("g1", "第一条", False, "u3", "丙")))
+        self.assertIn("【关系图谱】v1",
+                      [str(m.get("content")) for m in captured["ctx"]])
+
+        # 图谱增长（新成员入列）——活块变了，但前缀必须不变
+        state["text"] = "【关系图谱】v1\n  9999999: 新来的  [新人]"
+        _run(p.run(PipelineInput("g1", "第二条", False, "u4", "丁")))
+        contents = [str(m.get("content")) for m in captured["ctx"]]
+        self.assertIn("【关系图谱】v1", contents,
+                      "B-022：已进前缀的图谱块应保持冻结")
+        self.assertNotIn("9999999", "".join(contents),
+                         "🔴 B-022：活块内容不得进缓存前缀（否则整段 session 前缀全废）")
+
+    def test_new_session_refreezes_relations_block(self):
+        """轮转 = 新会话 → 允许用最新图谱重新冻结（新前缀本来就要重建）。"""
+        from services.session_manager import SessionManager
+        sm = SessionManager(data_dir=None, max_messages=None)
+        sm.append("g1", "user", "历史甲", name="甲")
+        state = {"text": "【关系图谱】v1"}
+        captured = {}
+
+        def gen(t, c, e, temp, su, umo):
+            captured["ctx"] = [dict(m) for m in c]
+            return _async("好")
+
+        p = _pipeline(session=sm, generate=gen, session_append=lambda *a: None,
+                      examples_block=lambda: "【示例块】",
+                      tool_syntax_block=lambda: "【工具语法】",
+                      relations_block=lambda: state["text"],
+                      turn_block=lambda l, c: "【现在要回应的】")
+        _run(p.run(PipelineInput("g1", "第一条", False, "u3", "丙")))
+        sm.clear("g1")                     # 模拟日轮换
+        state["text"] = "【关系图谱】v2"
+        _run(p.run(PipelineInput("g1", "第二条", False, "u4", "丁")))
+        self.assertIn("【关系图谱】v2",
+                      [str(m.get("content")) for m in captured["ctx"]])
+
+
 class TestRelationsBlockAppendOnly(unittest.TestCase):
     """S9：关系块必须"只在尾部追加"（用户要的 skill-catalog 语义）。
 
