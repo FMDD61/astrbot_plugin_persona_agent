@@ -132,6 +132,59 @@ class TestEndToEnd(unittest.TestCase):
         days = [d["day"] for d in daily]
         self.assertEqual(len(days), len(set(days)), "日汇总不得出现重复日期")
 
+    def test_incremental_is_idempotent_with_fractional_ts(self):
+        """🔴 B-027（2026-09-17 验证）：水位取整回退不得把上一行再算一遍。
+
+        生产实证：cache_stats.jsonl **367 行只有 363 个唯一 ts**（4 行重复），
+        state.count 同样虚增。根因：compact() 把 ts 存成 round(ts,1)，
+        增量筛选却用**原始 ts** 与它比 → 凡原始 ts 第二位小数 ∈1..4，
+        上次最后一行仍满足 raw > last，被再写一遍（**没新数据也每次 +1**）。
+        """
+        self._run("--rebuild")
+        with open(self.probe, "a", encoding="utf-8") as f:
+            f.write(json.dumps(probe_row(200000.94, 70000, 100)) + "\n")
+        self._run()
+        n1 = len(C.read_jsonl(self.gdir / C.STATS_FILE))
+        self.assertEqual(n1, 11)
+        self._run()          # 无新数据
+        self._run()          # 再来一次
+        n2 = len(C.read_jsonl(self.gdir / C.STATS_FILE))
+        self.assertEqual(n1, n2, "无新数据时不得再写一行（水位取整回退 → B-027）")
+
+    def test_watermark_stores_raw_ts(self):
+        """水位必须存**原始** ts（存 round(ts,1) 就会回退 → 重复计数）。"""
+        with open(self.probe, "a", encoding="utf-8") as f:
+            f.write(json.dumps(probe_row(200000.94, 70000, 100)) + "\n")
+        self._run()
+        state = json.loads((self.gdir / C.STATE_FILE).read_text(encoding="utf-8"))
+        self.assertAlmostEqual(float(state["last_ts"]), 200000.94, places=2,
+                               msg="水位必须等于探针原始 ts（B-027）")
+
+    def test_stale_watermark_does_not_duplicate(self):
+        """水位被回退（或 state 丢失）时，按 ts 去重兜底，不得重复计数。"""
+        self._run("--rebuild")
+        state_path = self.gdir / C.STATE_FILE
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["last_ts"] = 100002.0          # 人为回退到中间
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        before = len(C.read_jsonl(self.gdir / C.STATS_FILE))
+        self._run()
+        self.assertEqual(len(C.read_jsonl(self.gdir / C.STATS_FILE)), before,
+                         "水位回退后重算的行必须按 ts 去重（B-027 兜底）")
+        # 汇总也不得被重复行污染
+        daily = {d["day"]: d for d in C.read_jsonl(self.gdir / C.DAILY_FILE)}
+        self.assertEqual(sum(d["calls"] for d in daily.values()), before)
+
+    def test_kind_is_carried_through(self):
+        """RP / Gate 是两条不同前缀，聚合行必须保留 kind 才能分线统计。"""
+        with open(self.probe, "a", encoding="utf-8") as f:
+            row = probe_row(300000.0, 70000, 100)
+            row["kind"] = "gate"
+            f.write(json.dumps(row) + "\n")
+        self._run()
+        stats = C.read_jsonl(self.gdir / C.STATS_FILE)
+        self.assertEqual(stats[-1].get("kind"), "gate")
+
     def test_tolerates_corrupt_lines(self):
         with open(self.probe, "a", encoding="utf-8") as f:
             f.write("{not json\n\n")
