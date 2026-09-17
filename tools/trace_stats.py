@@ -20,7 +20,9 @@
 | 入站 | trace 条数 |
 | 硬闸放行 | `hard_gate.action == "reply"` |
 | 过 Gate | `gate.reply == true` |
-| 生成 | 存在 `raw_generation` |
+| 生成尝试 | `generation_attempted`（旧行退回 `raw_generation`/`final_text`） |
+| 生成失败 | 存在 `llm_error`（`empty completion` = 模型返回空；否则为异常成因） |
+| 生成成功 | 存在 `raw_generation`（= 旧口径的"生成"） |
 
 比率：
 
@@ -107,7 +109,8 @@ def load_alias_map(data_dir: str | Path) -> dict[str, str]:
 def compute_stats(rows: list[dict], *, alias_map: dict | None = None) -> dict:
     """按上表口径算统计。**绝不抛**（观测工具不该拖垮分析）。"""
     st: dict = {"inbound": len(rows), "hard_pass": 0, "gate_pass": 0,
-                "generated": 0, "parse_failed": 0, "triggers": {}}
+                "generated": 0, "gen_attempted": 0, "gen_failed": 0,
+                "parse_failed": 0, "triggers": {}}
     cached_sum = other_sum = 0
     per_call: list[float] = []
     gen_with_name = 0
@@ -128,6 +131,12 @@ def compute_stats(rows: list[dict], *, alias_map: dict | None = None) -> dict:
         if isinstance(g, dict) and "parse failed" in str(g.get("reason") or ""):
             st["parse_failed"] += 1
         text = str(r.get("final_text") or "")
+        # 🔴 B-028：生成尝试 / 失败必须与"没走到生成"分开
+        #   （旧口径只看 raw_generation → 空生成完全无痕，实测少算 3/86）
+        if r.get("generation_attempted") or r.get("raw_generation") or text:
+            st["gen_attempted"] += 1
+        if r.get("llm_error"):
+            st["gen_failed"] += 1
         if r.get("raw_generation") or text:
             st["generated"] += 1
             if names:
@@ -168,7 +177,9 @@ def _fmt(st: dict) -> str:
         f"  入站        {st['inbound']:>7}",
         f"  硬闸放行    {st['hard_pass']:>7}  ({_rate(st['hard_pass'], st['inbound']):.1%} of 入站)",
         f"  过 Gate     {st['gate_pass']:>7}  ({_rate(st['gate_pass'], st['hard_pass']):.1%} of 放行)",
-        f"  生成        {st['generated']:>7}",
+        f"  生成尝试    {st['gen_attempted']:>7}",
+        f"  生成失败    {st['gen_failed']:>7}  (B-028: 空生成/异常，旧口径看不见)",
+        f"  生成成功    {st['generated']:>7}",
     ]
     if st["hard_pass"]:
         L += [

@@ -178,5 +178,40 @@ class TestCacheStats(unittest.TestCase):
         self.assertNotIn("cache_hit_total", st)
 
 
+class TestGenerationAttemptsS28(unittest.TestCase):
+    """🔴 B-028：漏斗必须能区分「生成尝试」「生成失败」「成功生成」。
+
+    旧口径"生成 = 有 raw_generation"把**失败**与**没走到生成**混为一谈：
+    实测 86 次 Gate 放行只数出 83 次生成，缺的 3 次是空生成（无痕）。
+    """
+
+    def test_attempt_and_failure_are_counted(self):
+        rows = [
+            # 1) 正常生成
+            {"hard_gate": {"action": "reply"}, "gate": {"reply": True},
+             "generation_attempted": True, "raw_generation": "好呀", "final_text": "好呀"},
+            # 2) 生成失败（空生成）—— 旧口径完全看不见
+            {"hard_gate": {"action": "reply"}, "gate": {"reply": True},
+             "generation_attempted": True, "llm_error": "empty completion"},
+            # 3) Gate 拒绝：根本没走到生成
+            {"hard_gate": {"action": "reply"}, "gate": {"reply": False}},
+        ]
+        st = compute_stats(rows)
+        self.assertEqual(st["hard_pass"], 3)
+        self.assertEqual(st["gate_pass"], 2)
+        self.assertEqual(st["gen_attempted"], 2, "尝试过生成的次数（B-028）")
+        self.assertEqual(st["gen_failed"], 1, "失败次数必须可见（B-028）")
+        self.assertEqual(st["generated"], 1, "成功生成仍是 1")
+
+    def test_legacy_rows_without_marker_still_counted(self):
+        """旧 trace 没有 generation_attempted → 退回按 raw_generation 计数。"""
+        rows = [{"hard_gate": {"action": "reply"}, "gate": {"reply": True},
+                 "raw_generation": "旧", "final_text": "旧"}]
+        st = compute_stats(rows)
+        self.assertEqual(st["gen_attempted"], 1)
+        self.assertEqual(st["gen_failed"], 0)
+
+
+
 if __name__ == "__main__":
     unittest.main()

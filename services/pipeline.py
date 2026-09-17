@@ -668,9 +668,19 @@ class PersonaPipeline:
                 text, contexts, emotion_state, temperature, inp.sender_uin,
                 inp.umo or None,
             )
+        # 🔴 B-028（2026-09-17 验证）：**尝试过就必须留痕**。
+        # 此前空生成只写进 SendIntent.silent_reason（不进 trace），而 main 侧的
+        # except 又在探针之前 return —— 于是 86 次 Gate 放行里有 3 次在 trace 里
+        # "什么都没有"（gate.reply=True 却无 raw_generation / 无 error），
+        # trace_stats 只能报"生成 83"而不是"尝试 86、失败 3"。
+        trace["generation_attempted"] = True
+        if llm_meta.get("error"):
+            # main 捕获到的真实成因（异常类名+消息）经 llm_meta 回传
+            trace["llm_error"] = str(llm_meta["error"])[:300]
         if llm_meta.get("reasoning"):
             trace["reasoning"] = str(llm_meta["reasoning"])[:4000]
         if not reply_text:
+            trace.setdefault("llm_error", "empty completion")
             return SendIntent(
                 action="silent",
                 silent_reason="empty generation",

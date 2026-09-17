@@ -1330,3 +1330,49 @@ class TestRelationsDeltaState(unittest.TestCase):
             known = dict(sp.relations_lines())
             sp2 = self._sp(td, members)
             self.assertEqual(sp2.relations_delta(known), ([], []))
+
+
+class TestGenerationTraceS28(unittest.TestCase):
+    """🔴 B-028（2026-09-17 验证）：**尝试过生成就必须留痕**。
+
+    实测：86 次 Gate 放行只有 83 次能在 trace/探针里对上，缺失的 3 次
+    （2026-09-15T17:27:15Z / 09-16T01:34:35Z / 09-16T11:08:48Z）在 trace 里
+    gate.reply=True 却**无 raw_generation、无 error、无 silent_reason** →
+    trace_stats 报"生成 83"而不是"尝试 86、失败 3"。
+    """
+
+    def _one(self, gen, **over):
+        over.setdefault("session_append", lambda *a: None)
+        p = _pipeline(generate=gen, **over)
+        return _run(p.run(PipelineInput("g1", "hi", False, "u1", "甲")))
+
+    def test_empty_generation_is_visible_in_trace(self):
+        async def gen(t, c, e, temp, su, umo, meta=None):
+            return ""
+        intent = self._one(gen)
+        self.assertEqual(intent.action, "silent")
+        self.assertEqual(intent.silent_reason, "empty generation")
+        self.assertTrue(intent.trace.get("generation_attempted"),
+                        "尝试过的生成必须留痕（B-028）")
+        self.assertEqual(intent.trace.get("llm_error"), "empty completion",
+                         "空生成必须写明原因（B-028）")
+
+    def test_generate_exception_reason_reaches_trace(self):
+        """main 侧捕获的异常成因经 llm_meta 回传 → trace 记下真实原因。"""
+        async def gen(t, c, e, temp, su, umo, meta=None):
+            if meta is not None:
+                meta["error"] = "EmptyModelOutputError: no usable output"
+            return ""
+        intent = self._one(gen)
+        self.assertEqual(intent.trace.get("llm_error"),
+                         "EmptyModelOutputError: no usable output",
+                         "异常成因必须透传进 trace（B-028）")
+
+    def test_successful_generation_marks_attempt_without_error(self):
+        async def gen(t, c, e, temp, su, umo, meta=None):
+            return "好呀"
+        intent = self._one(gen)
+        self.assertTrue(intent.trace.get("generation_attempted"))
+        self.assertNotIn("llm_error", intent.trace)
+        self.assertEqual(intent.trace.get("raw_generation"), "好呀")
+

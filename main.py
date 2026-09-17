@@ -1641,6 +1641,13 @@ class PersonaAgent(Star):
             )
         except Exception as e:
             logger.exception(f"[persona_agent] llm_generate raised: {e}")
+            # B-028: 把成因回传给 pipeline（参数名 meta），落进 trace.llm_error ——
+            # 否则"失败"在 trace 里与"没走到生成"完全不可区分。
+            # ⚠️ 这个变量名第一次写成了 pipeline 侧的 llm_meta，
+            # tests/test_static_checks.py 的未定义名检查当场拦下（main 不被导入，
+            # 只有静态检查能兜住这类错）。
+            if meta is not None:
+                meta["error"] = f"{type(e).__name__}: {e}"
             return ""
 
         if int((self.config.get("llm") or {}).get("cache_probe_enabled", 1)) == 1:
