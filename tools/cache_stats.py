@@ -21,7 +21,12 @@ usage 与上下文长度）。它有两个问题：
 
 ## 关键指标
 
+**口径提醒（B-027 附带核清）**：`day` 用 **UTC**（`gmtime`）而 `hour` 用**本地**
+（`local_hour`，CST）—— 两者不可直接对齐，跨日分析请统一口径。
+历史文件里的重复行可用 `--rebuild` 一次性修掉（重建会清空两个产物）。
+
 - `hit_rate` = `input_cached / prompt_tokens` —— 缓存命中率（**核心**）
+- `kind` = `rp` / `gate` —— **必须分线看**：两者前缀不同，混合命中率无意义
 - `input_other` —— 走全价的那部分。它才是真实成本，`hit_rate` 高不代表 `other` 小
   （实测：hit 99.6% 但 `other=318` token 仍要全价）
 - `sys_prompt_hash16` —— system prompt 的稳定性。**它一变，整段前缀缓存全废**，
@@ -99,6 +104,18 @@ def write_json_atomic(path: Path, data: dict) -> None:
 
 # ---------------------------------------------------------------- 压缩
 
+def _raw_last_ts(raw_rows) -> float:
+    """探针**原始** ts 的最大值 —— 增量水位必须用它。
+
+    🔴 B-027（2026-09-17 生产验证）：水位此前取 compact() 的 `round(ts,1)`，
+    而筛选用的是**原始 ts**（`raw["ts"] > last`）→ 凡原始 ts 第二位小数 ∈1..4，
+    上次最后一行仍满足 `>` → 被重复写入；**没有新数据时每跑一次也多一行**。
+    生产实证：`cache_stats.jsonl` 367 行只有 363 个唯一 ts（4 行重复），
+    `state.count` 同样虚增。
+    """
+    return max((float(r.get("ts") or 0.0) for r in raw_rows), default=0.0)
+
+
 def compact(row: dict) -> dict:
     """把一条探针明细压成紧凑记录（只留可分析的量）。"""
     u = row.get("usage") or {}
@@ -106,8 +123,13 @@ def compact(row: dict) -> dict:
     other = int(u.get("input_other") or 0)
     total = cached + other
     return {
+        # ⚠️ 存的是 round(ts,1)：仅供**展示/分析**用紧凑值；
+        # **水位绝不能取它** —— B-027 就是这么产生的（见 main() 的说明与
+        # _raw_last_ts()）。
         "ts": round(float(row.get("ts") or 0.0), 1),
         "day": time.strftime("%Y-%m-%d", time.gmtime(float(row.get("ts") or 0.0))),
+        # RP / Gate 是**两条不同前缀**（各用各的 system），必须能分线统计
+        "kind": str(row.get("kind") or ""),
         "sess": int(row.get("session_size_before") or 0),
         "ctx_chars": int(row.get("contexts_chars") or 0),
         "sys_len": int(row.get("sys_prompt_len") or 0),
@@ -213,7 +235,7 @@ def main(argv=None) -> int:
         append_jsonl(stats_path, rows)
         daily = rebuild_daily(rows)
         append_jsonl(daily_path, daily)
-        write_json_atomic(state_path, {"last_ts": rows[-1]["ts"] if rows else 0,
+        write_json_atomic(state_path, {"last_ts": _raw_last_ts(raw),
                                        "count": len(rows), "rebuilt_at": time.time()})
         print(f"全量重算：{len(rows)} 次调用 → {len(daily)} 天")
         _print_report(daily[-args.limit:])
@@ -229,6 +251,11 @@ def main(argv=None) -> int:
     last = float(state.get("last_ts") or 0.0)
     fresh = [r for r in raw if float(r.get("ts") or 0) > last]
     rows = [r for r in (compact(x) for x in fresh) if r["ts"] > 0]
+    # B-027 兜底：水位若被回退（state 被删/手工改/更早版本的取整水位），
+    # 重算出来的行按 ts 去重，绝不重复计数。
+    if rows:
+        seen = {r["ts"] for r in read_jsonl(stats_path)}
+        rows = [r for r in rows if r["ts"] not in seen]
     if not rows:
         print("无新数据")
         existing = read_jsonl(daily_path)
@@ -250,8 +277,10 @@ def main(argv=None) -> int:
         for d in merged:
             f.write(json.dumps(d, ensure_ascii=False) + "\n")
     os.replace(tmp, daily_path)
-    write_json_atomic(state_path, {"last_ts": rows[-1]["ts"], "count":
-                                   int(state.get("count") or 0) + len(rows)})
+    # 水位取**原始** ts（不得用 round 值 —— 否则下次又回退重复一行）
+    write_json_atomic(state_path,
+                      {"last_ts": max(_raw_last_ts(fresh), last),
+                       "count": int(state.get("count") or 0) + len(rows)})
     print(f"增量：+{len(rows)} 次调用，重算 {len(touched)} 天")
     _print_report(merged[-args.limit:])
     return 0
