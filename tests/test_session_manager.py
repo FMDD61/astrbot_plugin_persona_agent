@@ -99,10 +99,10 @@ class TestRotation(unittest.TestCase):
 class ArchivePayloadTests(unittest.TestCase):
     """B-025（2026-09-17 验证）：轮转归档必须带上会话状态。
 
-    \`_save()\` 写 8 键（含 S14 新增的 system_prompt / sys_blocks / next_block_id），
-    而 \`rotate_if_day_changed()\` 只写 5 键 → 归档日**人格整条消失**：
+    `_save()` 写 8 键（含 S14 新增的 system_prompt / sys_blocks / next_block_id），
+    而 `rotate_if_day_changed()` 只写 5 键 → 归档日**人格整条消失**：
     实测同一导出工具，归档文件命中人格标记 0 次、在写文件 1 次。
-    可变块标记（\`__sys_block__\`）也会因缺 \`sys_blocks\` 而还原不出内容。
+    可变块标记（`__sys_block__`）也会因缺 `sys_blocks` 而还原不出内容。
     """
 
     def _pin(self, iso):
@@ -167,7 +167,7 @@ class RelationsBlockFreezeTests(unittest.TestCase):
     """B-022（2026-09-17 验证）：关系图谱头部块必须**冻结**。
 
     生产实测 13 次「图谱块变更」把整段会话前缀（4–9 万 token）打成全价，
-    占全部全价 token 的 32.6% —— 因为 \`_assemble_base\` 每轮现算活块，
+    占全部全价 token 的 32.6% —— 因为 `_assemble_base` 每轮现算活块，
     而 S10 的"旧块留在前缀里不动"只做到了"往尾部追加增量"。
     """
 
@@ -307,6 +307,29 @@ class TestQuoteSnapshotMeta(unittest.TestCase):
         self.assertEqual(len(qi), len(sm.get_contexts('g')))
         self.assertEqual(qi.resolve(1).message_id, 'm2')
         self.assertEqual(qi.resolve(2).message_id, 'm1')
+
+    def test_quote_snapshot_aligns_when_system_block_present(self):
+        """🔴 B-026（2026-09-17 验证）：可变块（［设定更新］）也必须占一个编号位。
+
+        块会被 `get_contexts()` 物化成一条 system 消息（LLM 看得见），
+        而 `quote_entries()` 此前把它跳过 → 编号基比 LLM 所见**少一条** →
+        `[r:-N]`（N≥2）整体偏移一位 → **静默引用错人**。
+        生产上没炸只是因为当前的关系增量是以普通 system 条目追加的；
+        一旦走 `append_system_update`（人格提示词变更就会走），偏移立刻生效。
+        """
+        sm = SessionManager(data_dir=None, max_messages=None)
+        sm.ensure_system_prompt('g', '人格')       # 首条 system 单独传参，不占编号
+        sm.append('g', 'user', 'a', name='甲', message_id='m1', sender_uin='u1')
+        sm.append_system_update('g', '［设定更新］以此为准：新设定')
+        sm.append('g', 'user', 'b', name='乙', message_id='m2', sender_uin='u2')
+        ctx = sm.get_contexts('g')
+        qi = sm.quote_snapshot('g')
+        self.assertEqual(len(qi), len(ctx) - 1,
+                         "编号基必须与 LLM 所见逐条对齐（块也要占位）—— B-026")
+        self.assertEqual(qi.resolve(1).message_id, 'm2')
+        self.assertIsNone(qi.resolve(2))           # 块占位：不可引用（既有设计）
+        self.assertEqual(qi.resolve(3).message_id, 'm1',
+                         "块之后的老消息编号不得塌陷（否则静默引用错人）")
 
     def test_metadata_survives_rotation_archive(self):
         with tempfile.TemporaryDirectory() as td:
