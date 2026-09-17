@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import NamedTuple, Optional
 
@@ -275,8 +276,12 @@ class StyleProfile:
         """
         if not frozen_block:
             return list(lines)
-        frozen_lines = {ln for ln in str(frozen_block).splitlines() if ln}
-        return [ln for ln in lines if ln and ln.strip() and ln not in frozen_lines]
+        # 两侧都 strip 后比对：容忍"格式漂移"（行尾/行首多余空白、人工编辑过的 session）。
+        # 独立核验第三轮指出：只做整行严格比对时，块里行尾多一个空格就会漏判 →
+        # 该行被**再播报一次**（失败方向安全、每条变更最多一次，但没有必要）。
+        # strip 不引入误杀面：行内容（uin/别名/亲疏）不会因首尾空白而变得相同。
+        frozen_lines = {ln.strip() for ln in str(frozen_block).splitlines() if ln.strip()}
+        return [ln for ln in lines if ln.strip() and ln.strip() not in frozen_lines]
 
     def relations_block(self) -> str:
         """关系图谱（**独立块**，与人格分离）。
@@ -535,40 +540,66 @@ class StyleProfile:
 # ---------------------------------------------------------------------------
 
 class RelationsDeltaPlan(NamedTuple):
-    """一次关系增量的决策结果。"""
+    """一次关系增量的**完整决策**（连"要不要落盘/要不要对齐"都在里面）。
+
+    为什么把落盘决策也放进来（独立核验第三轮）：抽走纯函数后，main 里那 15 行
+    接线仍无任何测试 —— 把 main.py 整个回退，四个模块 155 项**全绿**。
+    而项目自己注释里写着"踩过四次：测试绿但接线漏了"。
+    现在 main 只剩"照 plan 执行"的平铺动作，所有条件判断都在本对象里、可离线单测。
+    """
 
     text: str
     """要追加到会话尾部的 system 文本；空串 = 本轮不追加。"""
-    known: dict
-    """应写入状态的"已透露"快照（调用方据此决定是否落盘）。"""
+    state: Optional[dict]
+    """要写入 `relations_block_state.json` 的记录；**None = 本轮不落盘**。"""
     added: int
     changed: int
-    first_run: bool
-    """True = 状态为空（首次运行或状态被删/重置）→ 调用方需做头部对齐。"""
+    need_align: bool
+    """True = 首次运行/状态被重置 → 调用方必须先把头部冻结块与 known 对齐（B-032）。"""
+
+    @property
+    def known(self) -> dict:
+        """本次要落盘的"已透露"快照（无落盘需求时为空 dict）。"""
+        return dict((self.state or {}).get("known") or {})
+
+    @property
+    def first_run(self) -> bool:
+        return self.need_align
 
 
-def plan_relations_delta(style, known: dict, frozen_block: str = "") -> RelationsDeltaPlan:
-    """决定"这一轮要不要往会话尾部追加关系增量、追加什么"（纯函数，可离线单测）。
+def plan_relations_delta(style, known: dict, frozen_block: str = "",
+                         *, now: Optional[float] = None) -> RelationsDeltaPlan:
+    """决定"这一轮要不要往会话尾部追加关系增量、追加什么、要不要落盘"（纯函数）。
 
     为什么要抽出来（2026-09-17 独立核验建议）：这段决策此前整个埋在
     `main._relations_delta_block()` 里，而 **main.py 不被任何测试导入** ——
-    核验者只能靠 AST 抽取才验到。下沉后 `test_style_profile.py` 能直接锁住四条出口。
+    核验者只能靠 AST 抽取才验到。下沉后 `test_style_profile.py` 能直接锁住每条出口
+    （含"是否落盘"与"是否要先对齐"这两个此前只在 main 里的判断）。
 
     四条出口：
-      ① `known` 为空（首次/状态被重置）→ 不追加，`first_run=True`（调用方需对齐头部块）
-      ② 变化全被头部冻结块吸收（B-032）→ 不追加，但仍返回新的 `known`
-      ③ 有新增 → 追加"新加入或新认识的群友"段
-      ④ 有行文本变化 → 追加"关系/称呼有变化"段
+      ① `known` 为空（首次/状态被重置）→ 不追加，`need_align=True`，落盘 initialized_at
+      ② 变化全被头部冻结块吸收（B-032）→ 不追加，但仍落盘新 known（标 aligned_with_frozen）
+      ③ 与 known 完全无差异 → 什么都不做（`state=None`，**不写盘**）
+      ④ 有新增/行文本变化 → 返回追加文本 + 落盘 added/changed 计数
     """
+    ts = time.time() if now is None else float(now)
     cur = {str(uin): line for uin, line in style.relations_lines()}
     if not known:
-        return RelationsDeltaPlan("", cur, 0, 0, first_run=True)
+        return RelationsDeltaPlan("", {"known": cur, "initialized_at": ts},
+                                  0, 0, need_align=True)
     new_lines, changed = style.relations_delta(known)
     # 🔴 B-032：头部冻结块里已经写着的行不再往尾部讲一遍
     new_lines = style.filter_already_announced(new_lines, frozen_block)
     changed = style.filter_already_announced(changed, frozen_block)
     if not new_lines and not changed:
-        return RelationsDeltaPlan("", cur, 0, 0, first_run=False)
+        if cur == known:
+            return RelationsDeltaPlan("", None, 0, 0, need_align=False)
+        # 有变化但头部已经讲过 → 仍要推进 known，否则每轮重算同一差集
+        return RelationsDeltaPlan(
+            "",
+            {"known": cur, "updated_at": ts, "added": 0, "changed": 0,
+             "aligned_with_frozen": True},
+            0, 0, need_align=False)
     parts: list[str] = ["［群友识别更新］"]
     if new_lines:
         parts.append("新加入或新认识的群友：")
@@ -576,5 +607,8 @@ def plan_relations_delta(style, known: dict, frozen_block: str = "") -> Relation
     if changed:
         parts.append("以下群友的关系/称呼有变化（以本行为准）：")
         parts.extend(changed)
-    return RelationsDeltaPlan("\n".join(parts), cur, len(new_lines), len(changed),
-                              first_run=False)
+    return RelationsDeltaPlan(
+        "\n".join(parts),
+        {"known": cur, "updated_at": ts,
+         "added": len(new_lines), "changed": len(changed)},
+        len(new_lines), len(changed), need_align=False)

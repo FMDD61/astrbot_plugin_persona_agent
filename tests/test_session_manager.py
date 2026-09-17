@@ -236,6 +236,25 @@ class RelationsBlockFreezeTests(unittest.TestCase):
             self.assertTrue(any("块正文" in c for c in ctx), "合法块必须仍能还原")
             self.assertEqual(sm.frozen_relations_block("g"), "【图谱】")
 
+    def test_freeze_is_persisted_on_next_append(self):
+        """独立核验第三轮残留 ②：冻结值要**尽快**落盘。
+
+        原本只在下一次 _save（_persist_step=50 / _persist_interval=300）落盘 →
+        该窗口内重启会按**活块**重冻，白破一次前缀缓存。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sm = SessionManager(data_dir=td, max_messages=None,
+                                rotation_hour=2, tz_offset_hours=8)
+            sm.append("g1", "user", "先有一条")
+            sm._save("g1")                       # 模拟"刚恢复过/刚存过"（水位=now）
+            sm.freeze_relations_block("g1", "【图谱】v1")
+            sm.append("g1", "user", "紧随其后的首条消息")
+            files = [f for f in os.listdir(td) if f.startswith("session_g1")]
+            self.assertTrue(files)
+            payload = json.load(open(os.path.join(td, files[0]), encoding="utf-8"))
+            self.assertEqual(payload.get("relations_block"), "【图谱】v1",
+                             "冻结值没有及时落盘 → 窗口内重启会重冻")
+
     def test_rotation_resets_frozen_block(self):
         with tempfile.TemporaryDirectory() as td:
             sm = SessionManager(data_dir=td, max_messages=None,

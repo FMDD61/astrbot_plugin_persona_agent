@@ -1494,35 +1494,23 @@ class PersonaAgent(Star):
         # 仍要推进 known，否则每轮重算同一差集。
         plan = plan_relations_delta(self.style, known,
                                     self._frozen_relations_block_text())
-        if plan.first_run:
-            # 首次：登记全部，不追加（初始块已在恒定前缀里）
-            # 🔴 B-032（2026-09-17 独立核验）：状态被删/重置时，"头部冻结块"可能
-            # 与即将写入的 known 不一致 —— 那段差异对 LLM **永久不可见**（静默）。
-            # 修复态：把头部重冻成当前图谱，让两边对齐（会破一次前缀缓存，留痕）。
+        # 下面只剩"照 plan 执行"的平铺动作 —— 所有判断（是否追加 / 是否落盘 /
+        # 是否先对齐头部）都在 plan 里，且已被 test_style_profile 的用例锁住。
+        # 独立核验第三轮指出：此前这 15 行接线把 main.py 整个回退都测不出问题。
+        if plan.need_align:
+            # 首次/状态被重置：把头部冻结块重冻成当前图谱，让"头部 == known"
+            # 否则两者之间的差异对 LLM 永久不可见（B-032 修复态；会破一次缓存，留痕）
             self._align_frozen_relations_block()
-            self.store.save_json(self._REL_STATE,
-                                 {"known": plan.known, "initialized_at": time.time()})
-            return ""
-        if not plan.text:
-            if plan.known != known:
-                # 只在真有差异时写盘（避免每轮一次无谓的文件写）
-                self.store.save_json(
-                    self._REL_STATE,
-                    {"known": plan.known, "updated_at": time.time(),
-                     "added": 0, "changed": 0, "aligned_with_frozen": True})
-            return ""
-        # 落盘新状态（原子写；失败也不影响本轮，下轮会重算同样的增量）
-        try:
-            self.store.save_json(
-                self._REL_STATE,
-                {"known": plan.known, "updated_at": time.time(),
-                 "added": plan.added, "changed": plan.changed})
-        except Exception as e:
-            logger.warning(f"[persona_agent] 关系增量状态落盘失败: {e}")
-        logger.info(
-            f"[persona_agent] 群友识别更新：新增 {plan.added} 人、"
-            f"变化 {plan.changed} 人 → 追加到会话尾部"
-        )
+        if plan.state is not None:
+            try:
+                self.store.save_json(self._REL_STATE, plan.state)
+            except Exception as e:
+                logger.warning(f"[persona_agent] 关系增量状态落盘失败: {e}")
+        if plan.text:
+            logger.info(
+                f"[persona_agent] 群友识别更新：新增 {plan.added} 人、"
+                f"变化 {plan.changed} 人 → 追加到会话尾部"
+            )
         return plan.text
 
     def _tool_syntax_block(self) -> str:

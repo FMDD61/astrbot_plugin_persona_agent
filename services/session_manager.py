@@ -418,6 +418,11 @@ class SessionManager:
             sess = self._get_or_create(group_id)
             if content and (force or not sess.relations_block):
                 sess.relations_block = str(content)
+                # 独立核验第三轮残留 ②：冻结值原本只在下一次 _save 落盘
+                # （_persist_step=50 / _persist_interval=300）→ 该窗口内重启会按**活块**
+                # 重冻，白破一次前缀缓存。把水位清零，下一次 _maybe_save（通常就是
+                # 紧随其后的首条消息）立刻写盘。
+                self._last_save[group_id] = 0.0
             return sess.relations_block
 
     def append_system_update(self, group_id: str, content: str) -> bool:
