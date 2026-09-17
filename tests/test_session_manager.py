@@ -209,6 +209,33 @@ class RelationsBlockFreezeTests(unittest.TestCase):
                          "force=True 必须覆盖（修复态）")
         self.assertEqual(sm.frozen_relations_block("g1"), "v2")
 
+    def test_load_all_tolerates_dirty_block_keys(self):
+        """B-031 之后 sys_blocks 非空成为常态 → 脏 key 不得让 load_all 整体抛错。
+
+        独立核验回归风险 3：`int(k)` 与 `int(next_block_id)` 不在 per-file try 内，
+        一份写坏的 session 文件（非数字 key）会让**整个**恢复流程失败。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            payload = {"version": 2, "group_id": "g", "day": "2026-09-17",
+                       "messages": [{"role": "user", "content": "你好"},
+                                    {"role": "system", "__sys_block__": 0}],
+                       "system_prompt": "人格",
+                       "sys_blocks": {"0": "［设定更新］以此为准：块正文",
+                                      "oops": "脏 key", "": "空 key"},
+                       "next_block_id": "not-a-number",
+                       "relations_block": "【图谱】"}
+            with open(os.path.join(td, "session_g_2026-09-17.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            sm = SessionManager(data_dir=td, max_messages=None,
+                                rotation_hour=2, tz_offset_hours=8)
+            restored = sm.load_all()          # 修复前：ValueError 直接冒出去
+            self.assertEqual(restored.get("g"), 2)
+            ctx = [str(m.get("content") or "") for m in sm.get_contexts("g")]
+            self.assertIn("人格", ctx)
+            self.assertTrue(any("块正文" in c for c in ctx), "合法块必须仍能还原")
+            self.assertEqual(sm.frozen_relations_block("g"), "【图谱】")
+
     def test_rotation_resets_frozen_block(self):
         with tempfile.TemporaryDirectory() as td:
             sm = SessionManager(data_dir=td, max_messages=None,

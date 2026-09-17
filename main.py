@@ -37,7 +37,7 @@ from .services import text_style
 from .services.llm_params import (
     reasoning_value, resolve_provider_id, extract_reasoning,
 )
-from .services.style_profile import StyleProfile
+from .services.style_profile import StyleProfile, plan_relations_delta
 from .services.rag_service import RagService
 from .services.interjection import (
     InterjectionManager,
@@ -1487,55 +1487,43 @@ class PersonaAgent(Star):
             return ""
         if not lines:
             return ""
-        cur = {uin: line for uin, line in lines}
         state = self.store.load_json(self._REL_STATE, {}) or {}
         known = state.get("known") or {}
-        if not known:
+        # 🔴 B-032：决策整体下沉到纯函数（`plan_relations_delta`，可被测试锁住）——
+        # 头部冻结块里已写着的行不再往尾部讲一遍；"有变化但头部已讲过"时
+        # 仍要推进 known，否则每轮重算同一差集。
+        plan = plan_relations_delta(self.style, known,
+                                    self._frozen_relations_block_text())
+        if plan.first_run:
             # 首次：登记全部，不追加（初始块已在恒定前缀里）
             # 🔴 B-032（2026-09-17 独立核验）：状态被删/重置时，"头部冻结块"可能
             # 与即将写入的 known 不一致 —— 那段差异对 LLM **永久不可见**（静默）。
             # 修复态：把头部重冻成当前图谱，让两边对齐（会破一次前缀缓存，留痕）。
             self._align_frozen_relations_block()
             self.store.save_json(self._REL_STATE,
-                                 {"known": cur, "initialized_at": time.time()})
+                                 {"known": plan.known, "initialized_at": time.time()})
             return ""
-        new_lines, changed = self.style.relations_delta(known)
-        # 🔴 B-032：会话边界上头部块是用**当时活的**图谱冻结的（已含新成员），
-        # 而增量仍按 known 算 → 同一变更 head 与 tail 各讲一遍，且尾部那条会
-        # 留在会话里一整天。头部已经写着的行不必再追加。
-        _frozen = self._frozen_relations_block_text()
-        if _frozen:
-            new_lines = self.style.filter_already_announced(new_lines, _frozen)
-            changed = self.style.filter_already_announced(changed, _frozen)
-        if not new_lines and not changed:
-            if cur != known:
-                # 有变化但头部已经讲过 → 仍要推进 known，否则每轮重算同一差集
-                # （只在真有差异时写盘，避免每轮一次无谓的文件写）
+        if not plan.text:
+            if plan.known != known:
+                # 只在真有差异时写盘（避免每轮一次无谓的文件写）
                 self.store.save_json(
                     self._REL_STATE,
-                    {"known": cur, "updated_at": time.time(),
+                    {"known": plan.known, "updated_at": time.time(),
                      "added": 0, "changed": 0, "aligned_with_frozen": True})
             return ""
-        parts: list[str] = ["［群友识别更新］"]
-        if new_lines:
-            parts.append("新加入或新认识的群友：")
-            parts.extend(new_lines)
-        if changed:
-            parts.append("以下群友的关系/称呼有变化（以本行为准）：")
-            parts.extend(changed)
         # 落盘新状态（原子写；失败也不影响本轮，下轮会重算同样的增量）
         try:
             self.store.save_json(
                 self._REL_STATE,
-                {"known": cur, "updated_at": time.time(),
-                 "added": len(new_lines), "changed": len(changed)})
+                {"known": plan.known, "updated_at": time.time(),
+                 "added": plan.added, "changed": plan.changed})
         except Exception as e:
             logger.warning(f"[persona_agent] 关系增量状态落盘失败: {e}")
         logger.info(
-            f"[persona_agent] 群友识别更新：新增 {len(new_lines)} 人、"
-            f"变化 {len(changed)} 人 → 追加到会话尾部"
+            f"[persona_agent] 群友识别更新：新增 {plan.added} 人、"
+            f"变化 {plan.changed} 人 → 追加到会话尾部"
         )
-        return "\n".join(parts)
+        return plan.text
 
     def _tool_syntax_block(self) -> str:
         """声明可用的动作语法。**内容恒定**（按开关拼一次），进缓存前缀。
@@ -1672,6 +1660,8 @@ class PersonaAgent(Star):
             # 不能与"模型返回空"混为一谈 —— 否则 trace 把尝试/失败都记高、成因记错
             if meta is not None:
                 meta["error"] = "no provider available (LLM not called)"
+                # 独立核验：这条路径没调 LLM → 让 pipeline 别把它算成"生成尝试"
+                meta["llm_not_called"] = True
             return ""
 
         gen_kwargs = {}

@@ -673,7 +673,14 @@ class PersonaPipeline:
         # except 又在探针之前 return —— 于是 86 次 Gate 放行里有 3 次在 trace 里
         # "什么都没有"（gate.reply=True 却无 raw_generation / 无 error），
         # trace_stats 只能报"生成 83"而不是"尝试 86、失败 3"。
-        trace["generation_attempted"] = True
+        if llm_meta.get("llm_not_called"):
+            # 独立核验：provider 为空等路径**根本没调 LLM**，不能算一次"生成尝试"
+            # （否则 trace_stats 的"生成尝试"虚高一格）。成因仍留痕。
+            trace["generation_attempted"] = False
+            trace["generation_skipped"] = str(
+                llm_meta.get("error") or "llm not called")[:200]
+        else:
+            trace["generation_attempted"] = True
         if llm_meta.get("error"):
             # main 捕获到的真实成因（异常类名+消息）经 llm_meta 回传
             trace["llm_error"] = str(llm_meta["error"])[:300]

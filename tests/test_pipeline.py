@@ -1368,6 +1368,26 @@ class TestGenerationTraceS28(unittest.TestCase):
                          "EmptyModelOutputError: no usable output",
                          "异常成因必须透传进 trace（B-028）")
 
+    def test_llm_not_called_is_not_counted_as_attempt(self):
+        """独立核验：provider 为空的路径**根本没调 LLM**，不该算一次"生成尝试"。
+
+        口径：`generation_attempted` 表示"真的调用过生成"。没调时置 False 并记
+        `generation_skipped`；`trace_stats` 的"生成尝试"据此不再虚高。
+        """
+        async def gen(t, c, e, temp, su, umo, meta=None):
+            if meta is not None:
+                meta["llm_not_called"] = True
+                meta["error"] = "no provider available (LLM not called)"
+            return ""
+        intent = self._one(gen)
+        tr = intent.trace
+        self.assertFalse(tr.get("generation_attempted"),
+                         "没调 LLM 就不能算生成尝试")
+        self.assertEqual(tr.get("generation_skipped"),
+                         "no provider available (LLM not called)")
+        self.assertEqual(tr.get("llm_error"),
+                         "no provider available (LLM not called)")
+
     def test_successful_generation_marks_attempt_without_error(self):
         async def gen(t, c, e, temp, su, umo, meta=None):
             return "好呀"

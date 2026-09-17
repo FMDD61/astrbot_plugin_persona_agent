@@ -48,7 +48,7 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 _FILES = (
     "my_style_profile.json",
@@ -264,13 +264,19 @@ class StyleProfile:
         它已经含了新成员；而增量仍按 `known` 算 → 同一变更 head 与 tail **各讲一遍**，
         且尾部那条会留在会话里一整天（每轮都被 LLM 看两次）。
 
-        头部已经写着的行不必再追加。判据是**逐行子串**：两处用的都是
-        `relations_lines()` 的同一份行文本，故可直接比对。
+        头部已经写着的行不必再追加。判据是**整行精确匹配**（把冻结块按行切开做集合）：
+        两处都是 `relations_lines()` 的同一份行文本，故可直接比对。
+
+        ⚠️ 为什么不用子串比对（独立核验指出）：别名里若字面内嵌另一个成员的整行
+        （如 alias = `甲  2: 乙  [认识]`），子串判据会把成员 2 的**真实新行**误判成
+        "已播报"而丢掉。整行集合比对没有这个误杀面。
+
         空行剔除；`frozen_block` 为空时原样返回（未冻结/未启用时不改变行为）。
         """
         if not frozen_block:
             return list(lines)
-        return [ln for ln in lines if ln and ln.strip() and ln not in frozen_block]
+        frozen_lines = {ln for ln in str(frozen_block).splitlines() if ln}
+        return [ln for ln in lines if ln and ln.strip() and ln not in frozen_lines]
 
     def relations_block(self) -> str:
         """关系图谱（**独立块**，与人格分离）。
@@ -522,3 +528,53 @@ class StyleProfile:
 
     def snapshot(self) -> dict[str, dict]:
         return {name: self._get(name) for name in _FILES}
+
+
+# ---------------------------------------------------------------------------
+# 关系增量决策（B-032 收口）：从 main 下沉为**可导入的纯函数**
+# ---------------------------------------------------------------------------
+
+class RelationsDeltaPlan(NamedTuple):
+    """一次关系增量的决策结果。"""
+
+    text: str
+    """要追加到会话尾部的 system 文本；空串 = 本轮不追加。"""
+    known: dict
+    """应写入状态的"已透露"快照（调用方据此决定是否落盘）。"""
+    added: int
+    changed: int
+    first_run: bool
+    """True = 状态为空（首次运行或状态被删/重置）→ 调用方需做头部对齐。"""
+
+
+def plan_relations_delta(style, known: dict, frozen_block: str = "") -> RelationsDeltaPlan:
+    """决定"这一轮要不要往会话尾部追加关系增量、追加什么"（纯函数，可离线单测）。
+
+    为什么要抽出来（2026-09-17 独立核验建议）：这段决策此前整个埋在
+    `main._relations_delta_block()` 里，而 **main.py 不被任何测试导入** ——
+    核验者只能靠 AST 抽取才验到。下沉后 `test_style_profile.py` 能直接锁住四条出口。
+
+    四条出口：
+      ① `known` 为空（首次/状态被重置）→ 不追加，`first_run=True`（调用方需对齐头部块）
+      ② 变化全被头部冻结块吸收（B-032）→ 不追加，但仍返回新的 `known`
+      ③ 有新增 → 追加"新加入或新认识的群友"段
+      ④ 有行文本变化 → 追加"关系/称呼有变化"段
+    """
+    cur = {str(uin): line for uin, line in style.relations_lines()}
+    if not known:
+        return RelationsDeltaPlan("", cur, 0, 0, first_run=True)
+    new_lines, changed = style.relations_delta(known)
+    # 🔴 B-032：头部冻结块里已经写着的行不再往尾部讲一遍
+    new_lines = style.filter_already_announced(new_lines, frozen_block)
+    changed = style.filter_already_announced(changed, frozen_block)
+    if not new_lines and not changed:
+        return RelationsDeltaPlan("", cur, 0, 0, first_run=False)
+    parts: list[str] = ["［群友识别更新］"]
+    if new_lines:
+        parts.append("新加入或新认识的群友：")
+        parts.extend(new_lines)
+    if changed:
+        parts.append("以下群友的关系/称呼有变化（以本行为准）：")
+        parts.extend(changed)
+    return RelationsDeltaPlan("\n".join(parts), cur, len(new_lines), len(changed),
+                              first_run=False)

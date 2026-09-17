@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from services.style_profile import StyleProfile
+from services.style_profile import StyleProfile, plan_relations_delta  # noqa: E402
 
 REL = {"members": [{"uin": "1", "alias": "已知", "closeness": "close"}]}
 
@@ -72,6 +72,82 @@ class TestFilterAlreadyAnnounced(unittest.TestCase):
 
     def test_drops_blank_lines(self):
         self.assertEqual(StyleProfile.filter_already_announced(["", "   "], "x"), [])
+
+
+class TestPlanRelationsDelta(unittest.TestCase):
+    """B-032 收口后，增量决策下沉为纯函数 `plan_relations_delta`（可离线单测）。
+
+    独立核验指出：此前这段决策埋在 main 里，而 main.py 不被任何测试导入 ——
+    它只能靠 AST 抽取才验到。这里把四条出口全锁住。
+    """
+
+    @staticmethod
+    def _sp(td, members):
+        with open(os.path.join(td, "member_relations.json"), "w", encoding="utf-8") as f:
+            json.dump({"members": members}, f, ensure_ascii=False)
+        return StyleProfile(td)
+
+    def test_first_run_registers_all_without_announcing(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = self._sp(td, [{"uin": "1", "alias": "甲", "closeness": "close"}])
+            plan = plan_relations_delta(sp, {}, frozen_block="")
+            self.assertTrue(plan.first_run)
+            self.assertEqual(plan.text, "", "首次不得追加（初始块已在前缀里）")
+            self.assertEqual(list(plan.known), ["1"])
+
+    def test_new_member_is_announced(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = self._sp(td, [{"uin": "1", "alias": "甲", "closeness": "close"},
+                               {"uin": "2", "alias": "乙", "closeness": "new"}])
+            plan = plan_relations_delta(sp, {"1": sp.relations_lines()[0][1]},
+                                        frozen_block="")
+            self.assertFalse(plan.first_run)
+            self.assertIn("新加入或新认识的群友", plan.text)
+            self.assertIn("乙", plan.text)
+            self.assertEqual(plan.added, 1)
+
+    def test_change_is_announced(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = self._sp(td, [{"uin": "1", "alias": "甲", "closeness": "close"}])
+            plan = plan_relations_delta(sp, {"1": "  1: 甲  [认识]"}, frozen_block="")
+            self.assertIn("关系/称呼有变化", plan.text)
+            self.assertEqual(plan.changed, 1)
+
+    def test_frozen_block_absorbs_change_without_announcing(self):
+        """🔴 B-032：头部冻结块里已写着的行不再往尾部讲一遍（但仍推进 known）。"""
+        with tempfile.TemporaryDirectory() as td:
+            sp = self._sp(td, [{"uin": "1", "alias": "甲", "closeness": "close"},
+                               {"uin": "2", "alias": "乙", "closeness": "new"}])
+            cur_lines = dict(sp.relations_lines())
+            plan = plan_relations_delta(sp, {"1": cur_lines["1"]},
+                                        frozen_block="\n".join(cur_lines.values()))
+            self.assertEqual(plan.text, "", "头部已含乙 → 不得重复播报（B-032）")
+            self.assertEqual(plan.known, cur_lines, "known 仍要推进到当前")
+            self.assertFalse(plan.first_run)
+
+    def test_alias_embedding_another_line_is_not_swallowed(self):
+        """🔴 独立核验给的唯一误杀构造：某个成员的别名里**字面内嵌**另一成员的整行。
+
+        子串判据会把成员 2 的真实新行当成"已播报"丢掉；**整行集合**判据不会。
+        用例用旧判据会红、用新判据会绿 —— 这条就是那次改进的守卫。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            # 先建"只有成员 2"的表，拿到它的**真实行文本**（含中文亲疏标签）
+            line2 = dict(self._sp(td, [
+                {"uin": "2", "alias": "乙", "closeness": "known"},
+            ]).relations_lines())["2"]
+            # 再把成员 1 的别名设成"字面内嵌 line2"
+            sp = self._sp(td, [
+                {"uin": "1", "alias": "甲" + line2, "closeness": "close"},
+                {"uin": "2", "alias": "乙", "closeness": "known"},
+            ])
+            cur = dict(sp.relations_lines())
+            self.assertIn(line2, cur["1"], "构造前提：成员 1 的行里内嵌成员 2 的整行")
+            # frozen = 成员 1 的行；known 只有成员 1 → 成员 2 属"新增"
+            plan = plan_relations_delta(sp, {"1": cur["1"]}, frozen_block=cur["1"])
+            self.assertIn(cur["2"], plan.text,
+                          "成员 2 的真实新行被误判成已播报（子串判据的坑）")
+
 
 
 class TestCacheStableSystemPrompt(unittest.TestCase):

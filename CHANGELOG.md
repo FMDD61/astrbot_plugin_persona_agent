@@ -101,6 +101,28 @@
 - 说明：原 B-028「探针再落一条 failed=true」**刻意不做** —— 探针行会被 cache_stats 当成一次调用
   （cached=0/other=0 → cold=1），会污染命中率统计；失败留痕由 trace 承担（职责分开）
 
+### Fixed (2026-09-17, V1 独立核验跟进·第二轮：B-036 + 三处加固)
+> 核验者对 c776d6f 做**窄范围复核**：4 条收口全部有效、无新反例，但给出 4 条加固建议。
+> 本轮全部落地，测试 658 → **667 全绿**。
+
+- **脏 session 文件可让整个恢复流程抛错（B-036）**：`load_all` 的
+  `int(k)`（`sys_blocks` 键）与 `int(next_block_id)` 不在 per-file try 内 →
+  一份写坏的文件让**所有群**的会话都恢复不了（B-031 之后该路径更常被走到）。
+  修法：逐键容错 + 非 dict 兜底 + `next_block_id` 解析失败回退 0
+- **`filter_already_announced` 判据由"子串"改为"整行精确匹配"**：核验者构造出唯一误杀面
+  （某成员别名里字面内嵌另一成员整行 → 子串判据会把真实新行当"已播报"丢掉）。
+  改为按行切开做集合比对；新增用例锁住该构造（退回子串判据 → 用例变红）
+- **关系增量决策下沉为纯函数** `style_profile.plan_relations_delta()` →
+  `RelationsDeltaPlan(text, known, added, changed, first_run)`。核验者指出
+  "B-032 的 main 侧接线没有任何测试（main.py 不被测试导入，只能靠 AST 抽取才验到）"
+  —— 下沉后四条出口全部可离线单测（+5 例）
+- **"没调 LLM"不再算一次生成尝试**：`provider 为空` 路径同时写 `meta["llm_not_called"]`，
+  pipeline 记 `generation_attempted=False` + `generation_skipped=<成因>`
+  （成因仍可见，只是 `trace_stats` 的"生成尝试"不再虚高）
+- **无参 `snapshot()` 优先"当小时内"的群**：核验者指出本方法不 roll hour →
+  陈旧群的大用量会胜出（实测返回 hour=3 的陈旧值）。现在只在 `current_hour == 当前小时`
+  的群里挑，没有才回退全局最大
+
 ### Changed (2026-09-17, 同批次）
 - **装配顺序文档对齐代码（B-030，`159652b`）**：真实顺序是
   `system prompt → 工具语法 → 示例块 → 关系图谱 → session → **本轮块** → KG 尾注`
