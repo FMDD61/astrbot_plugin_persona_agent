@@ -559,7 +559,13 @@ class RelationsDeltaPlan(NamedTuple):
 
     @property
     def known(self) -> dict:
-        """本次要落盘的"已透露"快照（无落盘需求时为空 dict）。"""
+        """本次**要落盘**的"已透露"快照。
+
+        ⚠️ 独立核验第四轮点出的 footgun：`state is None`（本轮无需落盘）时这里返回
+        **空 dict** —— **不要**把它当成"当前的 known"（当前 known 从
+        `relations_block_state.json` 读）。本属性只描述"要写什么"。
+        保留它仅为测试可读；生产代码只用 `state` / `need_align` / `text`。
+        """
         return dict((self.state or {}).get("known") or {})
 
     @property
