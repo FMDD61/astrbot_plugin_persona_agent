@@ -34,7 +34,9 @@ from .services.text_style import (
     RE_REPLY_MARKER,
 )
 from .services import text_style
-from .services.llm_params import reasoning_value, resolve_provider_id
+from .services.llm_params import (
+    reasoning_value, resolve_provider_id, extract_reasoning,
+)
 from .services.style_profile import StyleProfile
 from .services.rag_service import RagService
 from .services.interjection import (
@@ -1665,9 +1667,11 @@ class PersonaAgent(Star):
                                     local_hour, group_id=gid, kind="rp")
 
         # S16: 思维链回传（**不进上下文**，只供落 session + 人工查看）
+        # B-029: 走 extract_reasoning —— 直接读 reasoning_content 永远拿到空串
+        # （AstrBot 的 openai 源从不给它赋值，网关实际回的是 reasoning 字段）
         if meta is not None:
             try:
-                meta["reasoning"] = str(getattr(resp, "reasoning_content", "") or "")
+                meta["reasoning"] = extract_reasoning(resp)
             except Exception:
                 pass
         text = (getattr(resp, "completion_text", "") or "").strip()
@@ -2297,7 +2301,8 @@ class PersonaAgent(Star):
             # 一样），要进思维链去找原因"。没有它就无法验证该假设。
             # 只存前 1500 字符（reasoning 常是 content 的 3~5 倍，全存会让
             # 探针文件迅速膨胀；排查指向问题前 1500 字足够）。
-            reasoning = str(getattr(resp, "reasoning_content", "") or "")
+            # B-029: 同上一处 —— 网关字段名是 reasoning，不是 reasoning_content
+            reasoning = extract_reasoning(resp)
             record = {
                 "ts": time.time(),
                 "reasoning_chars": len(reasoning),

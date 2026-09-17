@@ -1,4 +1,8 @@
-"""llm_params — A7④ LLM 参数工具（纯函数，可离线单测）。
+"""llm_params — A7④ LLM 参数与响应取值工具（纯函数，可离线单测）。
+
+本模块两份职责：
+  1. **请求侧**：reasoning_value（reasoning_effort 容错映射）、resolve_provider_id
+  2. **响应侧**：extract_reasoning（B-029：网关把思维链放在非标准字段）
 
 reasoning_effort 容错映射（2026-09-10 实测修正）：
 
@@ -21,6 +25,72 @@ from typing import Optional
 
 # 网关（OpenAI 兼容端点）明确接受的档位；"none"/"minimal"/"off" 会 400
 _VALID = ("low", "medium", "high", "max")
+
+
+# ---------------------------------------------------------------------------
+# 思维链取值（B-029）：网关字段名与 AstrBot 标准字段名不一致
+# ---------------------------------------------------------------------------
+
+def extract_reasoning(resp) -> str:
+    """从 LLM 响应里取出**思维链文本**（取不到返回空串，绝不抛）。
+
+    🔴 B-029（2026-09-17 实测）：
+      - AstrBot 的 LLMResponse.reasoning_content 是标准字段，但
+        openai_chat_completion 源码里**从不给它赋值**（只有 anthropic_source 会）
+      - 而 commandcode 网关（OpenAI 兼容端点）回的是**非标准字段**
+        message.reasoning（str）与 message.reasoning_details（list）
+
+    实测同一模型同一参数：reasoning_content=None 而 reasoning 非空、
+    usage.reasoning_tokens=27。于是 S16 的"思维链留存"**从未生效**
+    （401/401 次 reasoning_chars=0），导出永远显示"思维链：无"，
+    看起来像"模型没思考"——而计费里明明有 60,482 个 reasoning token。
+
+    取值优先级：标准字段 → 网关 reasoning → reasoning_details[].text。
+    只读、不写、不改响应对象；任何异常都吞掉返回空串（观测不该拖垮主链）。
+    """
+    try:
+        std = str(getattr(resp, "reasoning_content", "") or "").strip()
+        if std:
+            return std
+    except Exception:
+        pass
+    try:
+        msg = _raw_message(getattr(resp, "raw_completion", None))
+        if msg is None:
+            return ""
+        # 网关非标准字段 1：reasoning（str）
+        val = (msg.get("reasoning") if isinstance(msg, dict)
+               else getattr(msg, "reasoning", None))
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        # 网关非标准字段 2：reasoning_details（[{"type": "reasoning.text", "text": ...}]）
+        det = (msg.get("reasoning_details") if isinstance(msg, dict)
+               else getattr(msg, "reasoning_details", None))
+        if isinstance(det, list):
+            parts = []
+            for d in det:
+                t = d.get("text") if isinstance(d, dict) else getattr(d, "text", None)
+                if isinstance(t, str) and t.strip():
+                    parts.append(t.strip())
+            if parts:
+                return "\n".join(parts)
+    except Exception:
+        pass
+    return ""
+
+
+def _raw_message(raw):
+    """从 raw_completion 里取出 message（兼容对象与 dict；取不到返回 None）。"""
+    try:
+        choices = (raw.get("choices") if isinstance(raw, dict)
+                   else getattr(raw, "choices", None))
+        if not choices:
+            return None
+        first = choices[0]
+        return (first.get("message") if isinstance(first, dict)
+                else getattr(first, "message", None))
+    except Exception:
+        return None
 
 
 def reasoning_value(val) -> Optional[str]:
