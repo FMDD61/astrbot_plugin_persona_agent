@@ -10,7 +10,9 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from services.llm_params import reasoning_value, resolve_provider_id
+from services.llm_params import (  # noqa: E402
+    reasoning_value, resolve_provider_id, extract_reasoning,
+)
 
 
 class TestReasoningValue(unittest.TestCase):
@@ -76,6 +78,76 @@ class TestResolveProviderId(unittest.TestCase):
         for args in (("", None, None, None), ("  ", "", "", False),
                      ("typo", "", "", False)):
             self.assertFalse(resolve_provider_id(*args))
+
+
+class TestExtractReasoning(unittest.TestCase):
+    """🔴 B-029（2026-09-17 实测）：网关把思维链放在 **reasoning** 字段。
+
+    AstrBot 的 openai_chat_completion 只认标准字段 reasoning_content（且**从不**
+    给它赋值 —— 只有 anthropic_source 会），而 commandcode 网关（OpenAI 兼容）
+    回的是非标准字段 reasoning（str）+ reasoning_details（list）。
+
+    实测（2026-09-17，同一模型同一参数）：
+      message 字段 = [..., 'reasoning', 'reasoning_details', ...]
+      reasoning_content → None；reasoning → '我们需要回答用户中文…'（非空）
+      usage.reasoning_tokens = 27
+
+    后果：S16 的"思维链留存"从未生效（401/401 次 reasoning_chars=0，6 个 session
+    文件的 _reasoning 全为 0），导出恒显示"思维链：无"，而同一批调用被计费
+    reasoning_tokens 合计 60,482 —— **看起来像"模型没思考"**。
+    """
+
+    @staticmethod
+    def _resp(reasoning_content=None, raw=None):
+        import types
+        return types.SimpleNamespace(reasoning_content=reasoning_content,
+                                     raw_completion=raw)
+
+    @staticmethod
+    def _raw(message_attrs: dict):
+        import types
+        msg = types.SimpleNamespace(**message_attrs)
+        choice = types.SimpleNamespace(message=msg)
+        return types.SimpleNamespace(choices=[choice])
+
+    def test_standard_field_takes_precedence(self):
+        r = self._resp("标准字段", self._raw({"reasoning": "网关字段"}))
+        self.assertEqual(extract_reasoning(r), "标准字段")
+
+    def test_gateway_reasoning_field(self):
+        r = self._resp(None, self._raw({"content": "2", "reasoning": "先算加法"}))
+        self.assertEqual(extract_reasoning(r), "先算加法")
+
+    def test_reasoning_details_list_fallback(self):
+        r = self._resp(None, self._raw({"reasoning_details": [
+            {"type": "reasoning.text", "text": "第一段"},
+            {"type": "reasoning.text", "text": "第二段"},
+        ]}))
+        self.assertEqual(extract_reasoning(r), "第一段\n第二段")
+
+    def test_dict_shaped_message(self):
+        """兼容 raw 是 dict（不同 SDK/版本）的情况。"""
+        r = self._resp(None, {"choices": [{"message": {"reasoning": "字典形状"}}]})
+        self.assertEqual(extract_reasoning(r), "字典形状")
+
+    def test_missing_everything_returns_empty(self):
+        self.assertEqual(extract_reasoning(self._resp(None, self._raw({"content": "2"}))), "")
+        self.assertEqual(extract_reasoning(self._resp()), "")
+        self.assertEqual(extract_reasoning(None), "")
+
+    def test_never_raises_on_weird_objects(self):
+        class Boom:
+            @property
+            def reasoning_content(self):
+                raise RuntimeError("boom")
+
+            @property
+            def raw_completion(self):
+                raise RuntimeError("boom")
+
+        self.assertEqual(extract_reasoning(Boom()), "")
+        self.assertEqual(extract_reasoning(object()), "")
+
 
 
 if __name__ == "__main__":
