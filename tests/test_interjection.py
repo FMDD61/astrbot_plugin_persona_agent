@@ -232,6 +232,25 @@ class TestRegressionSemantics(unittest.TestCase):
         self.assertEqual(g["hourly_used"], 1.0)
         self.assertIn("groups", g)
 
+    def test_snapshot_global_pair_comes_from_one_group(self):
+        """🔴 独立核验反例 5：无参分支的两个数必须来自**同一个群**。
+
+        此前 current_hour 与 hourly_used 各自独立取 max → 实测可返回
+        hour=20（G1）配 hourly_used=9.0（另一个陈旧群），两个数不同源、语义错误。
+        正确语义 = 取"当前小时用量最大"的那个群**成对**返回。
+        """
+        from services.interjection import TRIGGER_RAG
+        now = self.now
+        # 陈旧群：17 小时前登记（hour 不同），用量 9
+        for _ in range(9):
+            self.mgr.register_reply(group_id="STALE", now_utc=now - 17 * 3600,
+                                    trigger=TRIGGER_RAG)
+        self.mgr.register_reply(group_id="G1", now_utc=now, trigger=TRIGGER_RAG)
+        snap = self.mgr.snapshot()
+        pairs = {(u.current_hour, u.hourly_used) for u in self.mgr._usage.values()}
+        self.assertIn((snap["current_hour"], snap["hourly_used"]), pairs,
+                      "current_hour 与 hourly_used 必须同源（独立核验反例 5）")
+
     def test_snapshot_global_without_any_usage(self):
         """一个群都没登记时也不能崩（`/admin status` 在冷启动后就会这样）。"""
         snap = self.mgr.snapshot()

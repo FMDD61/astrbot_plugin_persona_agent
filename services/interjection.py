@@ -393,12 +393,18 @@ class InterjectionManager:
             # ":( 在调用插件…时出现异常：'hourly_used'"（2026-09-15 起就存在，
             # 命令改名后缺陷跟着活了下来，且无测试覆盖）。
             # 全局视角的标量语义 = **多群峰值**（配置/展示用；要看单群请传 group_id）。
-            usages = list(self._usage.values())
+            # 🔴 独立核验反例 5：两个数必须**同源**。
+            # 此前 current_hour 与 hourly_used 各自取 max → 实测返回
+            # hour=20（G1）配 hourly_used=9.0（另一个陈旧群），是拼出来的假状态。
+            # 现语义：取"当前小时用量最大"的那个群，**成对**返回它的两个值；
+            # 一个群都没有时给 (-1, 0.0)。单群仍应传 group_id（那是精确语义）。
+            busiest = max(self._usage.values(),
+                          key=lambda u: u.hourly_used, default=None)
             return {
                 "active_interjection": self.active_interjection,
                 "reply_on_at": self.reply_on_at,
                 "topic_bank_enabled": self.topic_bank_enabled,
-                "current_hour": max((u.current_hour for u in usages), default=-1),
-                "hourly_used": max((u.hourly_used for u in usages), default=0.0),
+                "current_hour": busiest.current_hour if busiest is not None else -1,
+                "hourly_used": busiest.hourly_used if busiest is not None else 0.0,
                 "groups": {g: u.to_dict() for g, u in self._usage.items()},
             }

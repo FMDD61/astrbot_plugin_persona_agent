@@ -50,6 +50,30 @@ class TestAddNewMember(unittest.TestCase):
             self.assertEqual(sp.preferred_alias("77"), "群友77")
 
 
+class TestFilterAlreadyAnnounced(unittest.TestCase):
+    """🔴 B-032（2026-09-17 独立核验反例 1）：头部冻结块里已写着的行不得再追加。
+
+    会话边界（日轮转后首轮）头部块用**当时活的**图谱冻结 —— 已含新成员；
+    而增量仍按 `known` 算 → 同一变更 head 与 tail 各讲一遍，且尾部那条会留一整天。
+    """
+
+    def test_drops_lines_already_in_frozen_block(self):
+        frozen = "【熟人】\n  2: 乙  [新人]\n  1: 甲  [熟人]"
+        self.assertEqual(
+            StyleProfile.filter_already_announced(["  2: 乙  [新人]"], frozen), [])
+        self.assertEqual(
+            StyleProfile.filter_already_announced(
+                ["  2: 乙  [新人]", "  9: 己  [新人]"], frozen),
+            ["  9: 己  [新人]"], "只有冻块里没有的行才留下")
+
+    def test_empty_frozen_block_is_noop(self):
+        lines = ["  1: 甲  [熟人]", "  2: 乙  [新人]"]
+        self.assertEqual(StyleProfile.filter_already_announced(lines, ""), lines)
+
+    def test_drops_blank_lines(self):
+        self.assertEqual(StyleProfile.filter_already_announced(["", "   "], "x"), [])
+
+
 class TestCacheStableSystemPrompt(unittest.TestCase):
     """2026-09-13 缓存重排：system prompt 必须**逐轮完全恒定**。
 

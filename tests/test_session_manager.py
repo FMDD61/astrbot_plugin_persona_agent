@@ -197,6 +197,18 @@ class RelationsBlockFreezeTests(unittest.TestCase):
             self.assertEqual(sm2.freeze_relations_block("g1", "【关系图谱】v2"),
                              "【关系图谱】v1", "重启后冻结块丢失 → 前缀失效（B-022）")
 
+    def test_frozen_getter_and_force_refreeze(self):
+        """B-032：force=True 用于修复态（状态被删时让头部与 known 对齐）。"""
+        sm = SessionManager(data_dir=None, max_messages=None)
+        self.assertEqual(sm.frozen_relations_block("g1"), "", "无会话时返回空串")
+        self.assertEqual(sm.freeze_relations_block("g1", "v1"), "v1")
+        self.assertEqual(sm.frozen_relations_block("g1"), "v1")
+        self.assertEqual(sm.freeze_relations_block("g1", "v2"), "v1",
+                         "默认不覆盖（冻结语义）")
+        self.assertEqual(sm.freeze_relations_block("g1", "v2", force=True), "v2",
+                         "force=True 必须覆盖（修复态）")
+        self.assertEqual(sm.frozen_relations_block("g1"), "v2")
+
     def test_rotation_resets_frozen_block(self):
         with tempfile.TemporaryDirectory() as td:
             sm = SessionManager(data_dir=td, max_messages=None,

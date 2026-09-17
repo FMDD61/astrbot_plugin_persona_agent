@@ -16,7 +16,8 @@
 > 验证窗口 2026-09-16 13:38 → 09-17 19:34（当前进程生命周期）；部署 `05981a2` 与开发机 HEAD 的
 > 全部 `.py` / `_conf_schema.json` **逐字节相同**、620 测试全绿 —— 即"代码即计划"，但行为层
 > 仍挖出 9 条缺陷。共性：**"设计写了、实现没做到"**与**"记录不到"**两类，与项目反复栽的
-> 静默失效同族。每条**先写失败测试**（TDD）再改；测试 620 → **651 全绿**。
+> 静默失效同族。每条**先写失败测试**（TDD）再改；测试 620 → **652 全绿**
+> （随后独立核验又补 6 例 → **658**，见下方跟进小节）。
 
 - **🔴 周/月报读的是废弃的根目录日记 → 关系提升提案永久失效（B-024，`525b015`）**：
   `summary.py::collect` 读 `<data>/daily_diary.jsonl`（停在 2026-08-29），而日记自 `e566116`
@@ -28,7 +29,9 @@
 - **🔴 关系图谱头部块未冻结 → 吃掉 32.6% 的全价 token（B-022，`d25d64d`）**：
   `_assemble_base` 每轮现算活块且位于 session **之前** → 图谱随新成员入列增长（实测一天 8~11 次）
   就把它后面 4–9 万 token 的前缀缓存全部作废。实测 13 次变更事件共 777,441 全价 token
-  （`common_prefix_chars` 恒为 793(gate)/1703(rp)，断点恰在"群友识别"块）。
+  （`common_prefix_chars` 恒为 793(gate)/1703(rp)，断点恰在"群友识别"块）；
+  独立核验按同一判据筛出 14 行/795,790（33.3%）—— 多出的一行是 02:55 的日轮换冷启动，
+  与图谱变更无关，两口径已对齐。
   S10 的设计（"旧块留在前缀里不动 + 增量追加到尾部"）此前只实现了后半句。
   修法：`SessionManager.freeze_relations_block()` 首次冻结、之后恒返回冻结值
   （随 session 落盘、跨重启不变；轮转即重置）；顺带修掉"同一变更被 LLM 看到两遍"。
@@ -63,14 +66,40 @@
   探针又在 main 的 except 里提前 return → 86 次 Gate 放行只有 83 次能在 trace 里对上。
   修法：`trace.generation_attempted` + `trace.llm_error`（异常成因经 meta 回传），
   `trace_stats` 漏斗拆成 生成尝试 / 生成失败 / 生成成功
-- **🔴 思维链留存从未生效（B-029，`34af53c`）**：代码读 `reasoning_content`，而
-  AstrBot 的 openai 源**从不给它赋值**、网关实际回的是非标准字段 **`reasoning`**。
-  实测同一模型同一参数：`reasoning_content=None` 而 `reasoning` 非空、`reasoning_tokens=58`。
+- **🔴 思维链留存从未生效（B-029，`34af53c`）**：代码读 `reasoning_content`，而网关把思维链
+  放在非标准字段 **`reasoning`**。AstrBot 的 openai 源确实会赋值 `reasoning_content`
+  （`:876-878`），但它只按 `self.reasoning_key`（默认 `"reasoning_content"`，`:399`）取属性
+  （`_extract_reasoning_content` `:700-724`）→ 非标准字段名永远取不到。
+  实测同一模型同一参数：`reasoning_content=None` 而 `reasoning` 非空（140 字符）、
+  `reasoning_tokens` 44（不同调用 27–58 波动）。**（根因表述已按独立核验更正）**
   后果：401/401 次探针 `reasoning_chars=0`、6 个 session 文件 `_reasoning` 全为 0，
   导出恒显示"思维链：无"—— **看起来像模型没思考**，而计费里有 60,482 个 reasoning token。
   修法：新增纯函数 `llm_params.extract_reasoning()`（标准字段 → 网关 `reasoning` →
   `reasoning_details[].text`），main 两处取值改走它；导出改为"未留存"并注明
   **不代表模型没思考**。真实响应端到端复验：0 字符 → 83 字符
+
+### Fixed (2026-09-17, V1 独立核验跟进：B-032～B-035)
+> 独立核验子代理对 B-022～B-031 逐条**证伪**，给出 6 个反例 + 5 条回归风险 + 9 处登记册不一致。
+> 其中 4 处是真缺陷，本节收口；其余为登记册表述问题（已在 `BUGS.md` 逐条更正）。
+
+- **🔴 冻结块在会话边界仍重复播报（B-032）**：日轮转后新会话首次冻结用的是**当时活的**图谱
+  （已含新成员），同一轮增量又按 `known` 追加一次 → 之后每轮 head 与 tail 各讲一遍，
+  且尾部那条留一整天。修法：新增 `StyleProfile.filter_already_announced()`，
+  头部已写着的行不再追加（"有变化但头部已讲过"时仍推进 `known`，且只在真有差异时写盘）。
+  同时修一个**静默回归点**：`relations_block_state.json` 被删/重置时，
+  头部冻结块与 `known` 之间的差异对 LLM 永久不可见 → 新增
+  `_align_frozen_relations_block()` 重冻对齐并 warning 留痕
+- **生成失败成因误标（B-033）**：`provider 为空（根本没调 LLM）` 与
+  `错误响应被抑制` 两条路径都记成 `empty completion` → 各自写自己的成因，
+  `empty completion` 只留给真正的空生成
+- **无参 `snapshot()` 两数跨群混搭（B-034）**：`current_hour` 与 `hourly_used` 各自取 max
+  → 实测返回 hour=20（G1）配 used=9.0（另一陈旧群）。改为取"用量最大那个群"**成对**返回
+- **守卫测试无牙（B-035）**：74bd848 新增的用例在修复回退后**仍然全绿**（两行都算新行，
+  去重没被触发）→ 补真反例用例（stats 已有同槽行 + 水位回退 + 同槽真实新调用），
+  并用"临时退回 ts-only 去重"验证**确实变红**
+- 测试 652 → **658 全绿**
+- 说明：原 B-028「探针再落一条 failed=true」**刻意不做** —— 探针行会被 cache_stats 当成一次调用
+  （cached=0/other=0 → cold=1），会污染命中率统计；失败留痕由 trace 承担（职责分开）
 
 ### Changed (2026-09-17, 同批次）
 - **装配顺序文档对齐代码（B-030，`159652b`）**：真实顺序是

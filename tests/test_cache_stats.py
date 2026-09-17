@@ -187,6 +187,29 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual({(r["cached"], r["other"]) for r in stats[-2:]},
                          {(70000, 100), (12345, 678)})
 
+    def test_stale_watermark_keeps_real_call_in_same_slot(self):
+        """🔴 独立核验反例 3（守卫要有牙）：stats 里已有同 0.1s 槽的行时，
+        水位回退后**新来的真实调用**不得被误删。
+
+        场景：stats 已有 ts=100000.0（原始 100000.0）；水位被人为回退到 0；
+        探针新增一次真实调用 ts=100000.04（round 后同槽）但 usage 不同。
+        - 只比 round(ts,1) 的实现 → 新调用被当成重复丢掉（本用例会红）
+        - 比 (ts, cached, other) 的实现 → 保留（本用例绿）
+        """
+        self._run("--rebuild")                      # stats 里有 ts=100000.0 那行
+        state_path = self.gdir / C.STATE_FILE
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["last_ts"] = 0.0                      # 水位回退
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        with open(self.probe, "a", encoding="utf-8") as f:
+            f.write(json.dumps(probe_row(100000.04, 70000, 100)) + "\n")
+        self._run()
+        stats = C.read_jsonl(self.gdir / C.STATS_FILE)
+        kept = [r for r in stats if r["ts"] == 100000.0 and r["cached"] == 70000]
+        self.assertEqual(len(kept), 1,
+                         "同 0.1s 槽里的真实新调用被误删（去重键不能只比 ts）")
+        self.assertEqual(len(stats), 11, "10 行旧 + 1 行新 = 11（旧行按三值键被去重）")
+
     def test_kind_is_carried_through(self):
         """RP / Gate 是两条不同前缀，聚合行必须保留 kind 才能分线统计。"""
         with open(self.probe, "a", encoding="utf-8") as f:
