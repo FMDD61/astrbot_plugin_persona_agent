@@ -1,7 +1,8 @@
 """summary — G13 周/月摘要金字塔（纯 stdlib，可离线单测）。
 
-数据流：daily_diary.jsonl（日日记，v3 已产出）→ 周（周一 02:10）/ 月
-（1 日 02:15）cron 汇总 → weekly_summary.jsonl / monthly_summary.jsonl；
+数据流：`logs/<gid>/daily_diary.jsonl`（日日记，现行路径；根目录旧路径
+仅作兼容）→ 周（周一 02:10）/ 月（1 日 02:15）cron 汇总 →
+weekly_summary.jsonl / monthly_summary.jsonl；
 防失真：每个归档日从 session_<group>_<day>.json 抽样原文
 （仅 user 消息，max_sample_messages 条/天，不抽 bot 消息）。
 
@@ -115,6 +116,29 @@ def list_diaries(path: Path, group_id: str, start: date, end: date) -> list[dict
     except OSError:
         return []
     return out
+
+
+def read_diaries(data_dir: "str | Path", group_id: str, start: date,
+                 end: date) -> list[dict]:
+    """读窗口内的日日记（**双路径** + 同日去重）。
+
+    🔴 B-024（2026-09-17 生产验证）：日记自 `e566116`（2026-09-08）起写在
+    `<data>/logs/<gid>/daily_diary.jsonl`，而本模块此前一直读**数据根目录**的
+    同名文件（内容停在 2026-08-29）→ 生产周报 `n_diaries` 恒为 0，
+    并连带让 `main._propose_relations` 的 `not diaries` 守卫永久提前返回
+    （**S12 关系提升提案从不产出**）。
+
+    口径与 `services/dream.py::gather_diaries` 一致（同一迁移，那边早已双路径）：
+    现行路径优先；同一天多条只留**较新**一条（B-018 幂等之前写下的历史重复仍在）。
+    """
+    base = Path(data_dir)
+    # 旧路径先读、现行路径后读 → 同日冲突时现行覆盖旧
+    paths = (base / DIARY_FILE, base / "logs" / str(group_id) / DIARY_FILE)
+    by_day: dict[str, dict] = {}
+    for path in paths:
+        for rec in list_diaries(path, group_id, start, end):
+            by_day[str(rec.get("day") or "")] = rec   # 同日：后者（较新）胜
+    return [by_day[d] for d in sorted(by_day) if d]
 
 
 def sample_days(data_dir: str, group_id: str, start: date, end: date,
@@ -238,7 +262,8 @@ class SummaryService:
                 "n_diaries": len(src), "n_samples": 0,
             }
 
-        diaries = list_diaries(self._dir / DIARY_FILE, group_id, start, end)
+        # B-024: 双路径（现行 logs/<gid>/ 优先，根目录旧路径兼容）
+        diaries = read_diaries(self._dir, group_id, start, end)
         samples = sample_days(str(self._dir), group_id, start, end)
         return {
             "kind": kind, "group_id": group_id, "label": label,
