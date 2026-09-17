@@ -175,6 +175,18 @@ class TestEndToEnd(unittest.TestCase):
         daily = {d["day"]: d for d in C.read_jsonl(self.gdir / C.DAILY_FILE)}
         self.assertEqual(sum(d["calls"] for d in daily.values()), before)
 
+    def test_same_rounded_ts_but_different_usage_not_deduped(self):
+        """同一 round(ts,1) 内的两次**真实**调用不得被去重误删。"""
+        self._run("--rebuild")
+        with open(self.probe, "a", encoding="utf-8") as f:
+            f.write(json.dumps(probe_row(200000.94, 70000, 100)) + "\n")
+            f.write(json.dumps(probe_row(200000.96, 12345, 678)) + "\n")   # 同 0.1s 槽
+        self._run()
+        stats = C.read_jsonl(self.gdir / C.STATS_FILE)
+        self.assertEqual(len(stats), 12, "两次真实调用都要留下")
+        self.assertEqual({(r["cached"], r["other"]) for r in stats[-2:]},
+                         {(70000, 100), (12345, 678)})
+
     def test_kind_is_carried_through(self):
         """RP / Gate 是两条不同前缀，聚合行必须保留 kind 才能分线统计。"""
         with open(self.probe, "a", encoding="utf-8") as f:

@@ -252,10 +252,13 @@ def main(argv=None) -> int:
     fresh = [r for r in raw if float(r.get("ts") or 0) > last]
     rows = [r for r in (compact(x) for x in fresh) if r["ts"] > 0]
     # B-027 兜底：水位若被回退（state 被删/手工改/更早版本的取整水位），
-    # 重算出来的行按 ts 去重，绝不重复计数。
+    # 重算出来的行绝不重复计数。
+    # 去重键用 (ts, cached, other) 而不是只比 ts：重新摄入的那一行三个值全同，
+    # 而两次**真实**调用即使落在同一个 round(ts,1) 里，usage 也不会完全相同
+    # —— 只比 ts 会把那种真实的行误删。
     if rows:
-        seen = {r["ts"] for r in read_jsonl(stats_path)}
-        rows = [r for r in rows if r["ts"] not in seen]
+        seen = {(r["ts"], r["cached"], r["other"]) for r in read_jsonl(stats_path)}
+        rows = [r for r in rows if (r["ts"], r["cached"], r["other"]) not in seen]
     if not rows:
         print("无新数据")
         existing = read_jsonl(daily_path)
