@@ -33,11 +33,12 @@ AstrBot 插件 —— 让 LLM 扮演群成员，模仿指定群友（`style_sour
 
 ```
 [system]  system prompt（会话首条，持久；变更走**追加块**）
+[system]  工具语法（恒定；库空/未教学时为空串，不进上下文）
 [system]  示例块（恒定）
-[system]  关系图谱（追加式增长）
+[system]  关系图谱（**冻结**：首次进前缀后不再变，变更走尾部追加块）
 [user/assistant]  session 全量历史（只追加）
-[system]  KG 尾注（含 RAG 命中原文）              ← 每轮变
 [system]  【现在要回应的】发话人+正文+图片+时间心情  ← 逐轮变
+[system]  KG 尾注（含 RAG 命中原文）              ← 每轮变（在最后）
 ```
 
 **恒定在前、易变在尾**：

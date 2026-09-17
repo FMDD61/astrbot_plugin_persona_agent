@@ -25,11 +25,11 @@
 | DreamMaker | services/dream.py | 做梦：7 篇日记 + 随机碎片化 → 锚点 → 生成；**不负责熟悉度**（与 DreamJob 分离）|
 | GateService | services/gate.py | A7 GateLLM 决策层+安全阀：单 prompt 双任务 `{reply, conflict, reason}`；覆盖所有 REPLY（含 @）与 TOPIC；conflict=true 强制不发言；同群节流（缓存键含 is_at）；失败保守静默并记 `last_error`/`stats` → `trace.gate_degraded`；0.2 温度 + low 思考；gate.enabled=0 默认关 |
 | PersonaPipeline | services/pipeline.py | A7 共享主链路（RAG→emotion→硬闸→Gate(含conflict)→KG→生成→quote→SendIntent+trace）；纯数据进出 + 构造注入；rag_enabled 开关；线上 main 与离线测试台共用 |
-| llm_params | services/llm_params.py | A7④ reasoning_effort 映射：**off/未知 → None（不发送该参数）**，仅 low/medium/high/max 透传（网关拒 none/off 会 HTTP 400 → 空回复；2026-09-10 致命 bug 修复）；纯函数可单测 |
+| llm_params | services/llm_params.py | 请求侧：reasoning_effort 映射 —— **off/未知 → None（不发送该参数）**，仅 low/medium/high/max 透传（网关拒 none/off 会 HTTP 400 → 空回复；2026-09-10 致命 bug 修复）。响应侧：`extract_reasoning()` 取思维链 —— 网关字段是 **`reasoning`**（非标准），AstrBot 的 `reasoning_content` 恒为 None（B-029）。纯函数可单测 |
 | JsonStore | services/json_store.py | 原子 JSON/JSONL 读写；save_json/append_jsonl 自动建子目录（usages/、logs/<gid>/） |
 
 ### Design decisions (locked)
-- **Session reuse**: LLM gets full chat history via `contexts`, not one-shot buffer snapshots. `prompt=None`. system_prompt stays fixed → prefix caching。**上下文装配顺序（S2）：system_prompt → 示例块 → session → turn_block → KG 尾注**（恒定在前、增长段居中、易变在尾）。
+- **Session reuse**: LLM gets full chat history via `contexts`, not one-shot buffer snapshots. `prompt=None`. system_prompt stays fixed → prefix caching。**上下文装配顺序**：`system_prompt → 工具语法 → 示例块 → 关系图谱 → session → turn_block → KG 尾注`（恒定在前、增长段居中、易变在尾）。关系图谱自 2026-09-17 起**冻结**（B-022：首次进前缀后逐字节不变；变更以 system 消息追加到会话尾部）。
 - **Generating lock**: `_generating[group_id]` per-group lock prevents concurrent LLM calls. 500ms debounce before generation.
 - **回复链三层职责（S2 锁定）**: 外部硬闸 = **结构过滤器 + 音量阀**（睡眠/冷却/@冷却/日程/预算；
   `rag.score_threshold` 只用于控制 Gate 调用量，**不做"该不该回"的判断**）；
@@ -52,7 +52,7 @@
 - **Memory layer (#2)**: 3-layer design (Hermes/Cognee/Dreaming inspired). 已落地：KGProvider (retrieval) → MemoryStore (SQLite ADD-only + FTS5 BM25) → `services/dream.py`（周 cron，**已与原 DreamJob 分离**：做梦不负责熟悉度汇报）。Postgres 图+pgvector 仍是远期规划，未实现。
 
 ### Design decisions (locked)
-- **Session reuse**: LLM gets full chat history via `contexts`, not one-shot buffer snapshots. `prompt=None`. system_prompt stays fixed → prefix caching。**上下文装配顺序（S2）：system_prompt → 示例块 → session → turn_block → KG 尾注**（恒定在前、增长段居中、易变在尾）。
+- **Session reuse**: LLM gets full chat history via `contexts`, not one-shot buffer snapshots. `prompt=None`. system_prompt stays fixed → prefix caching。**上下文装配顺序**：`system_prompt → 工具语法 → 示例块 → 关系图谱 → session → turn_block → KG 尾注`（恒定在前、增长段居中、易变在尾）。关系图谱自 2026-09-17 起**冻结**（B-022：首次进前缀后逐字节不变；变更以 system 消息追加到会话尾部）。
 - **Generating lock**: `_generating[group_id]` per-group lock prevents concurrent LLM calls. 500ms debounce before generation.
 - **回复链三层职责（S2 锁定）**: 外部硬闸 = **结构过滤器 + 音量阀**（睡眠/冷却/@冷却/日程/预算；
   `rag.score_threshold` 只用于控制 Gate 调用量，**不做"该不该回"的判断**）；
