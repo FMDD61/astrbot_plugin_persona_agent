@@ -232,16 +232,31 @@ class Session:
         return out
 
     def quote_entries(self) -> list[tuple[str, str, str]]:
-        """引用编号基的原始三元组（与 ``get_messages()`` 逐条对齐）。
+        """引用编号基的原始三元组（与 ``get_messages()`` **逐条对齐**）。
 
         ``get_messages()`` 会丢弃空 content 条目，这里必须用**同一过滤**，
         否则编号基又会与 LLM 所见错位 —— 那正是 B-001 的次要成因。
+
+        🔴 B-026（2026-09-17 验证）：**可变块（``_BLOCK_MARK``）也必须占位**。
+        ``get_messages()`` 会把它物化成一条真正的 system 消息（LLM 看得见、会数进去），
+        这里此前却整条跳过 → 编号基比 LLM 所见少一条 → ``[r:-N]``（N≥2）
+        整体偏移一位 → **静默引用错人**。占位用空三元组表示：不可引用，
+        但编号不塌陷（与 ``QuoteIndex`` 对"bot 自己的回复"的处理一致）。
+        两个方法必须保持同一条可见性规则 —— ``test_quote_snapshot_aligns_*``
+        系列测试锁定该不变量。
         """
-        return [
-            (str(m.get("_mid") or ""), str(m.get("_uin") or ""), str(m.get("name") or ""))
-            for m in self.messages
-            if _has_content(m) and _BLOCK_MARK not in m
-        ]
+        out: list[tuple[str, str, str]] = []
+        for m in self.messages:
+            if _BLOCK_MARK in m:
+                # 与 get_messages 同判据：物化后**有内容**才占位（空块两边都不算）
+                if self._materialize(m).get("content"):
+                    out.append(("", "", ""))
+                continue
+            if _has_content(m):
+                out.append((str(m.get("_mid") or ""),
+                            str(m.get("_uin") or ""),
+                            str(m.get("name") or "")))
+        return out
 
     def recent(self, n: int = 20) -> list[dict]:
         # 与 get_messages 同过滤，保证调用方看到的内容一致（B-002）
