@@ -11,6 +11,76 @@
 
 ## [Unreleased]
 
+### Fixed (2026-09-17, V1 部署验证批次：B-022～B-031 —— 九修 + 一处文档对齐，全部清账)
+> 来源：对生产机的**只读**验证（报告 `docs/measurements/verify_20260917.md`，缺陷登记 `BUGS.md`）。
+> 验证窗口 2026-09-16 13:38 → 09-17 19:34（当前进程生命周期）；部署 `05981a2` 与开发机 HEAD 的
+> 全部 `.py` / `_conf_schema.json` **逐字节相同**、620 测试全绿 —— 即"代码即计划"，但行为层
+> 仍挖出 9 条缺陷。共性：**"设计写了、实现没做到"**与**"记录不到"**两类，与项目反复栽的
+> 静默失效同族。每条**先写失败测试**（TDD）再改；测试 620 → **651 全绿**。
+
+- **🔴 周/月报读的是废弃的根目录日记 → 关系提升提案永久失效（B-024，`525b015`）**：
+  `summary.py::collect` 读 `<data>/daily_diary.jsonl`（停在 2026-08-29），而日记自 `e566116`
+  （09-08）起写在 `logs/<gid>/`。生产实证：09-14 的 W37 窗口内已有 09-11/09-13 两条日记，
+  记录却是 `n_diaries=0`；连带 `_propose_relations` 的 `not diaries` 守卫恒真 →
+  **S12 整套熟悉度/关系提升提案从不产出**（`familiarity_proposals.json` 至今不存在）。
+  修法：新增 `read_diaries()` 双路径（口径同 `dream.py::gather_diaries`：现行优先、同日取较新）。
+  **真实生产数据复验：`n_diaries` 0 → 2**
+- **🔴 关系图谱头部块未冻结 → 吃掉 32.6% 的全价 token（B-022，`d25d64d`）**：
+  `_assemble_base` 每轮现算活块且位于 session **之前** → 图谱随新成员入列增长（实测一天 8~11 次）
+  就把它后面 4–9 万 token 的前缀缓存全部作废。实测 13 次变更事件共 777,441 全价 token
+  （`common_prefix_chars` 恒为 793(gate)/1703(rp)，断点恰在"群友识别"块）。
+  S10 的设计（"旧块留在前缀里不动 + 增量追加到尾部"）此前只实现了后半句。
+  修法：`SessionManager.freeze_relations_block()` 首次冻结、之后恒返回冻结值
+  （随 session 落盘、跨重启不变；轮转即重置）；顺带修掉"同一变更被 LLM 看到两遍"
+- **🔴 `/admin status` 必崩（B-023，`5ea0214`）**：`snapshot()` 有**两个形状**的返回值，
+  无 group_id 分支不含 `hourly_used`/`current_hour`，而 `_admin_status` 正的正是它
+  → `KeyError: 'hourly_used'` → 管理员只收到 `:( 在调用插件…时出现异常`（09-15 起存在，
+  命令改名后跟着活下来，620 测试无一覆盖）。修法：服务层把键契约钉死（无参分支 = 多群峰值）+
+  main 改用 `snapshot(self.target_group_id)`（语义本就该是目标群）
+- **轮转归档丢会话状态（B-025，`39d265a`）**：`rotate_if_day_changed()` 的归档 payload
+  只写 5 键，漏了 `_save()` 早已写入的 `system_prompt`/`sys_blocks`/`next_block_id`
+  → 归档日 session 的导出/离线复核里**人格整条消失**（实测同一导出工具：归档文件命中人格 0 次、
+  在写文件 1 次）。必须在 `sess.clear()` **之前**取走这些值
+- **可变块标记被恢复路径剥掉 → 每次重启静默丢块（B-031，`39d265a`）**：
+  `load_all()` 用 `_public()` 清洗条目，而它按"下划线开头即剥"处理 →
+  `__sys_block__` 标记被销毁，内容留在 `sys_blocks` 里却无人引用 ——
+  **所有［设定更新］块会在下一次重启时无声消失**。（随 B-025 的往返测试发现）
+- **`[r:-N]` 编号基漏掉可变块占位 → 整体偏移一位、静默引用错人（B-026，`e4f4db2`）**：
+  `get_messages()` 把可变块物化成 system 消息（LLM 看得见），`quote_entries()` 却整条跳过
+  → 编号基比 LLM 所见少一条（实测 4 vs 2）。修法：块在编号基里占**空三元组**位（不可引用但
+  编号不塌陷，与既有设计一致）。⚠️ 生产上 2/5 引用解析失败经核实**不是缺陷** ——
+  模型把 `[r:-1]` 指到了尾部的关系增量块，该槽位不可引用 → 保守放弃引用（有测试锁定）；
+  残余属提示词层，转 STAGE3
+- **`cache_stats` 水位取整回退 → 重复计数（B-027，`958ac42`）**：水位存 `round(ts,1)`
+  而筛选用原始 ts → 上次最后一行被反复写入（**没新数据也每次 +1**）。生产实证 367 行仅
+  363 个唯一 ts，UTC 日汇总被污染（09-14 calls 82→80、hit 0.9155→0.9121）。
+  修法：水位改存原始 ts + 按 ts 去重兜底 + `compact()` 保留 `kind`（RP/Gate 分线）。
+  **--rebuild 复验：401 行 / 401 唯一 ts / 0 重复**
+- **生成失败在 trace 无痕（B-028，`ba8b068`）**：空生成只写进 `SendIntent.silent_reason`，
+  探针又在 main 的 except 里提前 return → 86 次 Gate 放行只有 83 次能在 trace 里对上。
+  修法：`trace.generation_attempted` + `trace.llm_error`（异常成因经 meta 回传），
+  `trace_stats` 漏斗拆成 生成尝试 / 生成失败 / 生成成功
+- **🔴 思维链留存从未生效（B-029，`34af53c`）**：代码读 `reasoning_content`，而
+  AstrBot 的 openai 源**从不给它赋值**、网关实际回的是非标准字段 **`reasoning`**。
+  实测同一模型同一参数：`reasoning_content=None` 而 `reasoning` 非空、`reasoning_tokens=58`。
+  后果：401/401 次探针 `reasoning_chars=0`、6 个 session 文件 `_reasoning` 全为 0，
+  导出恒显示"思维链：无"—— **看起来像模型没思考**，而计费里有 60,482 个 reasoning token。
+  修法：新增纯函数 `llm_params.extract_reasoning()`（标准字段 → 网关 `reasoning` →
+  `reasoning_details[].text`），main 两处取值改走它；导出改为"未留存"并注明
+  **不代表模型没思考**。真实响应端到端复验：0 字符 → 83 字符
+
+### Changed (2026-09-17, 同批次）
+- **装配顺序文档对齐代码（B-030，`159652b`）**：真实顺序是
+  `system prompt → 工具语法 → 示例块 → 关系图谱 → session → **本轮块** → KG 尾注`
+  （`_finalize` 用 `insert(-1, …)`）；README.md/AGENTS.md 此前把末尾两块写反且漏了工具语法块，
+  `docs/services.md` 缺两块 —— 三处一起对齐
+- **`InterjectionManager.snapshot()` 键契约统一**：两个分支都返回 `current_hour`/`hourly_used`
+  （消除"两形状"footgun）；顺带审计 main 里其它 snapshot 调用点（sticker/session_mgr/poke），
+  无同类问题
+- **观测口径补齐**：`tools/trace_stats` 漏斗新增"生成尝试/生成失败"两行；
+  `tools/cache_stats` 的 `kind` 透传 + `--rebuild` 可一次性修掉历史重复行；
+  `export_session_md` 的思维链抬头改为"未留存（不代表模型没思考）"
+
 ### Fixed (2026-09-13, R2 重构 S0：静默失效可见化 —— 四个"装成正常"的缺陷)
 > 背景：对生产 trace（2262 条）/ runtime.log / SnowLuma 归档日志取证后发现同一类病：
 > **结构化 LLM 调用失败后被 except 吞掉，降级值与"模型正常输出"在日志上完全不可区分**。
