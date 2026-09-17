@@ -251,6 +251,21 @@ class TestRegressionSemantics(unittest.TestCase):
         self.assertIn((snap["current_hour"], snap["hourly_used"]), pairs,
                       "current_hour 与 hourly_used 必须同源（独立核验反例 5）")
 
+    def test_global_prefers_group_within_current_hour(self):
+        """独立核验残留：不 roll hour → 陈旧群的大用量会胜出。
+
+        语义修正为"优先当小时内的群"，否则回退到全局最大（两数仍然同源）。
+        """
+        import time as _t
+        now = _t.time()
+        for _ in range(9):
+            self.mgr.register_reply(group_id="STALE", now_utc=now - 17 * 3600,
+                                    trigger=TRIGGER_RAG)
+        self.mgr.register_reply(group_id="G1", now_utc=now, trigger=TRIGGER_RAG)
+        snap = self.mgr.snapshot()
+        self.assertEqual(snap["hourly_used"], 1.0,
+                         "应当取当小时内的群（陈旧群 9.0 不该胜出）")
+
     def test_snapshot_global_without_any_usage(self):
         """一个群都没登记时也不能崩（`/admin status` 在冷启动后就会这样）。"""
         snap = self.mgr.snapshot()

@@ -746,8 +746,24 @@ class SessionManager:
             )
             # 恢复 system prompt + 可变块内容
             sys_prompt = str(payload.get("system_prompt") or "")
+            # 🔴 独立核验回归风险 3：这两个 int() 不在 per-file try 内 ——
+            # 一份写坏的 session 文件（非数字 key / 非数字 next_block_id）会让
+            # **整个** load_all 抛错、所有会话都恢复不了（B-031 之后 sys_blocks
+            # 非空成为常态，这条路径被走到的概率显著上升）。这里逐一容错。
             blocks = payload.get("sys_blocks") or {}
-            nbid = int(payload.get("next_block_id") or 0)
+            if not isinstance(blocks, dict):
+                blocks = {}
+            safe_blocks = {}
+            for _k, _v in blocks.items():
+                try:
+                    safe_blocks[int(_k)] = str(_v)
+                except (TypeError, ValueError):
+                    continue          # 脏 key：跳过（该块内容丢失，但不影响其它会话）
+            blocks = safe_blocks
+            try:
+                nbid = int(payload.get("next_block_id") or 0)
+            except (TypeError, ValueError):
+                nbid = 0
             # B-022: 冻结的关系图谱块（缺键 = 旧文件 → 留空，下轮重新冻结）
             rel_frozen = str(payload.get("relations_block") or "")
             with self._lock:
@@ -764,8 +780,7 @@ class SessionManager:
                 sess.system_prompt = sys_prompt
                 # 只恢复**仍在 deque 里**的块（被淘汰的标记不再引用它们）
                 live = {m[_BLOCK_MARK] for m in sess.messages if _BLOCK_MARK in m}
-                sess.sys_blocks = {int(k): str(v) for k, v in blocks.items()
-                                   if int(k) in live}
+                sess.sys_blocks = {k: v for k, v in blocks.items() if k in live}
                 sess._next_block_id = max([nbid] + [k + 1 for k in live] or [0])
                 sess.relations_block = rel_frozen
                 sess.day = day

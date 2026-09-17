@@ -203,6 +203,16 @@ class TestGenerationAttemptsS28(unittest.TestCase):
         self.assertEqual(st["gen_failed"], 1, "失败次数必须可见（B-028）")
         self.assertEqual(st["generated"], 1, "成功生成仍是 1")
 
+    def test_not_called_rows_are_not_counted_as_attempt(self):
+        """独立核验：`generation_attempted=False`（没调 LLM）不得算一次尝试。"""
+        rows = [{"hard_gate": {"action": "reply"}, "gate": {"reply": True},
+                 "generation_attempted": False,
+                 "generation_skipped": "no provider available (LLM not called)",
+                 "llm_error": "no provider available (LLM not called)"}]
+        st = compute_stats(rows)
+        self.assertEqual(st["gen_attempted"], 0, "没调 LLM 就不算生成尝试")
+        self.assertEqual(st["gen_failed"], 1, "但失败仍要可见")
+
     def test_legacy_rows_without_marker_still_counted(self):
         """旧 trace 没有 generation_attempted → 退回按 raw_generation 计数。"""
         rows = [{"hard_gate": {"action": "reply"}, "gate": {"reply": True},

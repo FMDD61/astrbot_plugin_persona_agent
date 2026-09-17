@@ -398,7 +398,11 @@ class InterjectionManager:
             # hour=20（G1）配 hourly_used=9.0（另一个陈旧群），是拼出来的假状态。
             # 现语义：取"当前小时用量最大"的那个群，**成对**返回它的两个值；
             # 一个群都没有时给 (-1, 0.0)。单群仍应传 group_id（那是精确语义）。
-            busiest = max(self._usage.values(),
+            # 独立核验残留：本方法不 roll hour → 陈旧群（几小时前的大用量）会胜出。
+            # 先只在"当前小时"的群里挑；一个都没有才回退到全局最大。
+            now_hour = self._local_hour(time.time())
+            fresh = [u for u in self._usage.values() if u.current_hour == now_hour]
+            busiest = max(fresh or list(self._usage.values()),
                           key=lambda u: u.hourly_used, default=None)
             return {
                 "active_interjection": self.active_interjection,
