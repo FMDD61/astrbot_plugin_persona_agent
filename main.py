@@ -146,11 +146,21 @@ class PersonaAgent(Star):
         except Exception as e:
             logger.warning(f"[persona] 物化人格段文件失败（沿用内置默认）: {e}")
         _pm = self.style.persona_manifest()
+        # mode 必须取自清单本身（独立核验 B2：写死 "mode=v2" 会让
+        # `sections_mode=legacy` 的归因退路在日志上说谎）。
+        # 字符数取 assembled_chars（= 真正进提示词的长度），不是各段之和（N8）。
         logger.info(
-            f"[persona] mode=v2 段={len(_pm['used'])}/{len(_pm['order'])} "
-            f"缺={_pm['missing'] or '无'} 文件覆盖={_pm['overridden'] or '无'} "
-            f"人格 {sum(_pm['chars'].values())} 字符"
+            f"[persona] mode={_pm['mode']} 段={len(_pm['used'])}/{len(_pm['order'])} "
+            f"缺={_pm['missing'] or '无'} 按设计省略={_pm['omitted'] or '无'} "
+            f"自定义段={_pm['overridden'] or '无'} 人格 {_pm['assembled_chars']} 字符"
         )
+        if _pm.get("materialize_error"):
+            logger.warning(f"[persona] ⚠️ 段文件物化失败：{_pm['materialize_error']}")
+        if _pm.get("memory_error"):
+            logger.warning(
+                f"[persona] ⚠️ memory_digest.json 读不出来：{_pm['memory_error']} "
+                f"→ §3 历史群聊摘要整段消失（不是「还没生成」）"
+            )
         if _pm["superseded_keys"]:
             # B-037 的另一半：旧键**不再被读取**这件事必须说出来，否则又是一次静默丢弃
             logger.warning(
@@ -1454,10 +1464,21 @@ class PersonaAgent(Star):
                         f"[persona] 段清单 used={pm['used']} missing={pm['missing']} "
                         f"file_override={pm['overridden']}"
                     )
-                    if pm["mode"] == "v2" and pm["missing"]:
+                    # 只对**真丢失**告警。`omitted`（按设计省略，如 C4 落地前的
+                    # §3）不算降级 —— 否则降级信号从部署当天起恒亮（独立核验 B1）。
+                    if pm["missing"]:
                         logger.warning(
                             f"[selfcheck] ⚠️ 人格段缺失（未进提示词）：{pm['missing']} "
                             f"→ 检查 persona/*.md 是否被清空"
+                        )
+                    if pm.get("omitted"):
+                        logger.info(
+                            f"[selfcheck] 段按设计省略（内容为空）：{pm['omitted']}"
+                        )
+                    if pm.get("memory_error"):
+                        logger.warning(
+                            f"[selfcheck] ⚠️ memory_digest.json 损坏："
+                            f"{pm['memory_error']} → 记忆整段消失且与「未生成」不可区分"
                         )
                 except Exception as e:
                     logger.warning(f"[selfcheck] 人格段清单读取失败: {e}")
@@ -1572,19 +1593,24 @@ class PersonaAgent(Star):
         """
         lines: list[str] = []
         if int((self.config.get("sticker", {}) or {}).get("teach", 0)) == 1:
+            # C20 / rp_toolsyntax_draft_v1 §A：
+            #   · 删掉「选不中就不发」「没有合适的表情时不要硬写」—— 选图是
+            #     [emote:] 意图短语经 RAG 命中已向量化的表情包描述，属**机制行为**，
+            #     不由模型把关（C2/D20）；且劝退措辞与「多发表情」的要求相反；
+            #   · 去掉 markdown 加粗（D30：提示词用词会渗进输出语域，而 §7 明写
+            #     「不用列表和加粗」—— 提示词自己先别用）。
             lines.append(
-                "如果你想在回复后配一张表情包，就在回复**末尾**写："
-                "`[emote:意图短语]`（如 `[emote:无奈地摇头]`、`[emote:害羞比心]`）。"
-                "短语描述你想表达的情绪或动作；选不中就不发，正文照常。"
-                "没有合适的表情时**不要**硬写这个标记。"
+                "想在回复后配一张表情包，就在回复末尾写 `[emote:意图短语]`，"
+                "比如 `[emote:无奈地摇头]`、`[emote:害羞比心]`。"
+                "短语写你想表达的情绪或动作，挑哪张图不用你管。"
             )
         if int((self.config.get("poke", {}) or {}).get("teach", 0)) == 1:
+            # C20：例句里的人名违 D2（人名唯一来源是「群友识别」块）→ 改占位符；
+            # 「只对熟悉的人用」是否定式（R2）→ 改成正面的轻重判断。
             lines.append(
-                "如果你想戳一下某人（QQ 的拍一拍），在回复里写 `[poke:对方的名字]`，"
-                "名字就用你在群里叫他的那个称呼（如 `[poke:成员乙]`）。"
-                "**只对你熟悉的人用**（关系不熟的人不要戳），"
-                "且只在确实想引起对方注意时用。"
-                "名字必须与群里使用的称呼一致，否则这一戳会被丢弃。"
+                "想戳一下某人（QQ 的拍一拍），就在回复里写 `[poke:XX]`，"
+                "XX 用「群友识别」里对应的别名 —— 熟人之间用更自然。"
+                "名字对不上，这一戳就发不出去。"
             )
         if not lines:
             return ""
@@ -2565,7 +2591,11 @@ class PersonaAgent(Star):
             if not provider:
                 logger.info("[persona_agent] diary skipped: no provider id known yet")
                 return
-            sys_prompt = self.style.system_prompt() if self.style else ""
+            # C32（summary_v2 §4）：总结类调用的 system 收窄成 §1+§2 ——
+            # ① §6/§7/§8 是「怎么说话」，与「记什么」无关；
+            # ② D30：提示词措辞会被模仿，聊天腔会让总结层层累积；
+            # ③ 工具标记（[emote:]）有被照抄进日记正文的风险。
+            sys_prompt = self.style.summary_system_prompt() if self.style else ""
             contexts = [dict(m) for m in msgs]
             # 逐轮易变量（时间）同样挪到上下文末尾 —— 保持 system prompt 恒定，
             # 让「归档日会话」这段前缀可被网关缓存复用（v3 设计意图）。
@@ -2797,7 +2827,8 @@ class PersonaAgent(Star):
                 **({"monthlies": collected.get("monthlies") or []}
                    if kind == "yearly" else {}),
             )
-            sys_prompt = self.style.system_prompt()
+            # C32：同上 —— 周/月/年记的 system 也收窄成 §1+§2。
+            sys_prompt = self.style.summary_system_prompt()
             try:
                 resp = await self.context.llm_generate(
                     chat_provider_id=provider,

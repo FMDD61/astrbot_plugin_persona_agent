@@ -26,7 +26,9 @@
   - **段与视图**：RP 卡 = §1+作息+§2+§3+§4+§6+§7+§8（≈1470 字符，旧 910）；
     Gate 冻结头部 = §1+§2+§4+GATE 决策段（`gate_system_prompt()`，C22 的一半）；
     总结类 system = §1+§2（`summary_system_prompt()`，C32 的一半）。
-  - **可编辑**：`<data_dir>/persona/sN.md` 存在即**覆盖**内置默认，删文件即回到默认（mtime 热重载）；
+  - **可编辑**：`<data_dir>/persona/sN.md` **有内容即覆盖**内置默认，删文件即回到默认；
+    ⚠️ 空文件**不算**覆盖（想临时禁用某段请删文件）。每次调用现读，**不做 mtime 缓存** ——
+    实测内核粗时钟下两次同尺寸写入的 `st_mtime_ns` **完全相同**，任何 mtime 指纹都会漏检；
     启动时把默认物化到该目录（**只在缺失时写**），并同步写一份 `README.md` 说明段→文件对应关系。
   - **回退开关**：`persona.sections_mode = legacy` 回到旧键元组装配（改不动时的退路）。
   - **降级必须可见**（本项目反复栽在这里）：启动日志与自检逐条打印
@@ -69,6 +71,36 @@
   - **保留旧编号制**：`[r:-N]` 仍可解析 —— `persona.sections_mode=legacy` 回退时
     旧文案教的正是它，两条路都要能走。
   - 测试 +7 例（`TestTaggedQuoteC17`）。
+
+### Fixed (2026-09-20, 独立核验第 1 轮：C7/C10 的 2 阻塞 + 11 非阻塞全收)
+> 审查方对 `ebb8f1e` 的**冻结快照**逐行核验（报告 `scratch/prompt_v2_recon/REVIEW_round1_C7C10.md`）。
+> 两条阻塞都不是功能 bug，而是**仪表盘说谎**：会让运维得出错误结论。
+
+- **🔴 trace 每轮误报降级（B1）**：`manifest()` 用 `used` 反推 `missing`，把「**按设计省略**」
+  （§3 在没有记忆正文时整段不出现，§4.4）与「**段丢失**」混成一类 → 从部署当天到 C4 落地之间，
+  **100% 的轮次**都带 `persona_degraded`，而自检的排查指引（"检查 persona/*.md 是否被清空"）
+  指向的文件其实是满的。**恒亮的降级信号 = 没有信号** —— 与「降级必须可见」的初衷相反。
+  修法：`manifest()` 拆出 `omitted`（按设计省略）/ `missing`（真丢失），消费侧只看后者；
+  自检对 `omitted` 打 info、对 `missing` 打 warning。
+- **🔴 回退开关的仪表盘说谎（B2）**：启动日志把 `mode=v2` **写死在 f-string 里**，
+  且 `persona_manifest()` 在 legacy 下仍返回 v2 段清单 → 切到 `sections_mode=legacy` 时，
+  日志会报「v2 全套已生效」（而实际生效的是旧装配）→ 会得出「回退没生效」的错误结论。
+  `legacy` 是本批承诺的**唯一归因退路**，读错就等于没有退路。修法：日志取 `_pm['mode']`；
+  legacy 返回 legacy 视图（`used=[]` + `note` + 真实 `assembled_chars`）。
+- **11 条非阻塞同批收掉**：`overridden` 改「真被改过」而非「文件存在」（首启物化后它曾恒为 8 段，
+  信号饱和）；README/CHANGELOG 的「存在即覆盖」改成「**有内容**即覆盖」（空文件不覆盖，以代码为准）；
+  `gate_system_prompt()` 空装配时退回裁判 system（**绝不返回空串** —— S13 实测空 system 让解析失败率
+  0%→40~60%）并留痕；`summary_system_prompt()` 回升全量人格时留痕（否则静默取消 C32）；
+  `memory_digest.json` 写坏与「还没生成」分开留痕；**去掉 mtime 缓存**（实测内核粗时钟下
+  两次同尺寸写入的 `st_mtime_ns` 完全相同 → 任何 mtime 指纹都漏检；8 个小文件每次现读）；
+  清单只报 `assembled_chars`（装配后真实长度），不再让启动日志与自检对不上；
+  删死过滤；trace 与自检**同源**（`system_prompt()` 把算好的 texts 传给 manifest）；
+  物化失败留痕。
+- **补一条不依赖 docs/specs 的内容指纹闸**（`TestGeneratedContentFrozen`）：
+  `test_persona_source_sync` 在台式机（无设计文档目录）会 skip，生产机因此没有「生成物==草案」
+  的保障；改成对每段内容冻结 sha256 前 12 位 —— 手改生成物或重跑生成器都会红，
+  强制把改动显式更新进来。
+- 测试 709 → **726 全绿**（新增 `TestReviewRound1Fixes` 15 例 + 指纹闸 2 例）。
 
 ### Fixed (2026-09-17, V1 部署验证批次：B-022～B-031 —— 九修 + 一处文档对齐，全部清账)
 > 来源：对生产机的**只读**验证（报告 `docs/measurements/verify_20260917.md`，缺陷登记 `BUGS.md`）。

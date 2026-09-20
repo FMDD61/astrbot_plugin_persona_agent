@@ -69,7 +69,8 @@ CLOSENESS_LABEL = {"close": "熟人", "known": "认识", "new": "新人"}
 #: 物化到 <data_dir>/persona/ 的说明文件（**不是段文件**：加载器按段 id 精确取名，不会读它）
 _PERSONA_README = """# 人格段文件（C10）
 
-本目录每个文件 = 角色卡的一段。**文件存在即覆盖插件内置的默认文案；删掉文件即回到默认。**
+本目录每个文件 = 角色卡的一段。**文件有内容即覆盖插件内置的默认文案；删掉文件即回到默认。**
+（⚠️ **空文件不算覆盖** —— 想临时禁用某段请删文件，留一个空文件不会让它消失。）
 
 | 文件 | 段 | 进 RP | 进 Gate |
 |---|---|---|---|
@@ -119,6 +120,11 @@ class StyleProfile:
         self._sections_sig: tuple = ()
         #: 最近一次装配的留痕（供启动自检 / trace；降级必须可见）
         self.last_persona_report: dict = {}
+        #: 降级留痕（各自独立，避免"一个字段承担两种失效形态"）
+        self.last_memory_error: str = ""
+        self.last_materialize_error: str = ""
+        self.last_gate_fallback: str = ""
+        self.last_summary_fallback: str = ""
         for name in _FILES:
             self._maybe_reload(name)
 
@@ -226,9 +232,10 @@ class StyleProfile:
         ``local_hour`` 参数保留以兼容既有调用点（不再参与拼接）。
         """
         if self._sections_mode == "legacy":
-            text = self._legacy_system_prompt()
-            self.last_persona_report = {"mode": "legacy", "used": [], "missing": []}
-            return text
+            # N10：trace 与自检走**同一份**清单 —— 两条独立路径会在同状态下
+            # 给出不同的 missing（独立核验指出过），那就等于没有仪表盘。
+            self.last_persona_report = self.persona_manifest()
+            return self._legacy_system_prompt()
         # C7/C10：八段现场组装（冻结文本）。§3 由记忆摘要快照渲染（无内容则整段不出现）。
         texts = self.persona_section_texts()
         memory_block = persona_mod.render_memory_block(self.memory_layers())
@@ -236,19 +243,14 @@ class StyleProfile:
             texts, persona_mod.RP_ORDER, memory_block=memory_block)
         if not text.strip():
             # 装配为空 = 文案全丢（磁盘损坏/被清空）→ 退回旧装配，且**必须留痕**
-            self.last_persona_report = {
-                "mode": "v2", "fallback": "empty_assembly", "used": [], "missing": [],
-            }
+            rep = self.persona_manifest(texts=texts, memory_block=memory_block)
+            rep["fallback"] = "empty_assembly"
+            self.last_persona_report = rep
             return self._legacy_system_prompt()
-        used_set = set(used)
-        self.last_persona_report = {
-            "mode": "v2",
-            "used": list(used),
-            "missing": [s for s in persona_mod.RP_ORDER if s not in used_set],
-            "overridden": sorted(k for k in self._persona_override_flags() if k),
-            "chars": sum(len(texts.get(s) or "") for s in persona_mod.RP_ORDER),
-            "memory_lines": len(memory_block.splitlines()),
-        }
+        rep = self.persona_manifest(
+            texts=texts, memory_block=memory_block, assembled=text, used=used)
+        rep["memory_lines"] = len(memory_block.splitlines())
+        self.last_persona_report = rep
         return text
 
     # ---- C7/C10：八段装配 ----
@@ -290,34 +292,34 @@ class StyleProfile:
     def _persona_path(self, sid: str) -> Path:
         return self.persona_dir() / f"{sid}.md"
 
-    def _persona_override_flags(self) -> dict[str, bool]:
-        """段 id -> 是否有数据目录覆盖文件（空文件不算覆盖）。"""
-        out: dict[str, bool] = {}
+    def _persona_file_state(self) -> dict[str, str]:
+        """段 id -> 文件状态：``missing``（无文件） / ``default``（文件==内置默认，
+        多是首启物化出来的） / ``custom``（**真被改过**）。
+
+        为什么分三态（独立核验 N1）：只报"文件存在"的话，首启物化之后 8 段全算
+        "被覆盖" —— 信号饱和，答不了"我到底改了哪几段"。
+
+        ⚠️ 空文件 = **不覆盖**（回落内置默认）。想临时禁用某段请删文件，
+        空文件不会让它消失 —— 这与 README 的措辞必须一致（独立核验 N2）。
+        """
+        out: dict[str, str] = {}
         for sid in persona_mod.ALL_SECTIONS:
-            path = self._persona_path(sid)
-            try:
-                out[sid] = path.is_file() and bool(path.read_text("utf-8").strip())
-            except OSError:
-                out[sid] = False
+            raw = self._read_section_file(sid)
+            if not raw:
+                out[sid] = "missing"
+            elif sid == "sched":
+                # sched 没有内置默认 → 有内容就是自定义
+                out[sid] = "custom"
+            else:
+                out[sid] = "default" if raw == SECTION_TEXT[sid].strip() else "custom"
         return out
 
-    def _sections_signature(self) -> tuple:
-        """目录内 8 个段文件的 (mtime, size) 指纹 —— 变则重读（热重载）。"""
-        sig = []
-        for sid in persona_mod.ALL_SECTIONS:
-            path = self._persona_path(sid)
-            try:
-                st = path.stat()
-                sig.append((sid, round(st.st_mtime, 3), st.st_size))
-            except OSError:
-                sig.append((sid, 0.0, 0))
-        # 旧人格文件的 schedule 键也参与（sched 段无内置默认）
-        frag = self._path("system_prompt_fragments.json")
-        try:
-            sig.append(("__frag__", round(frag.stat().st_mtime, 3)))
-        except OSError:
-            sig.append(("__frag__", 0.0))
-        return tuple(sig)
+    # ⚠️ **这里刻意不做 mtime 缓存**（独立核验 N7 的教训）：
+    # 文件 mtime 走的是内核**粗时钟**，实测两次紧接着的同尺寸写入
+    # `st_mtime_ns` **完全相同**（1700000000123456789 == 1700000000123456789）
+    # → 任何"mtime + size"指纹都会漏掉「同尺寸改写」（改个错字、换个词）。
+    # 这 8 个文件都是几百字节，每次调用读一遍的成本远低于一次 LLM 调用；
+    # **正确性优先**。若将来段文件变大，再考虑内容哈希或显式失效。
 
     def persona_section_texts(self) -> dict[str, str]:
         """段 id -> 文案。**数据目录 `persona/sN.md` 存在即覆盖内置默认**。
@@ -326,19 +328,12 @@ class StyleProfile:
         它在 v1 一直是生效段（`docs/specs/prompt_v2_rp.md` §2 的八段之外），
         丢它就是一次静默的能力回退。
         """
-        sig = self._sections_signature()
-        with self._lock:
-            if self._sections_cache is not None and sig == self._sections_sig:
-                return dict(self._sections_cache)
         texts: dict[str, str] = {}
         for sid, default in SECTION_TEXT.items():
             texts[sid] = self._read_section_file(sid) or default
         # sched：文件 > 旧人格文件的 schedule 键（> 无）
         texts["sched"] = self._read_section_file("sched") or self._legacy_schedule()
-        with self._lock:
-            self._sections_cache = dict(texts)
-            self._sections_sig = sig
-        return dict(texts)
+        return texts
 
     def _read_section_file(self, sid: str) -> str:
         path = self._persona_path(sid)
@@ -362,9 +357,12 @@ class StyleProfile:
         返回本次新建的文件名（空列表 = 无需动作）。
         """
         created: list[str] = []
+        self.last_materialize_error = ""
         try:
             self.persona_dir().mkdir(parents=True, exist_ok=True)
-        except OSError:
+        except OSError as e:
+            # N11：全部失败也要留痕 —— 否则"物化没做成"与"无需物化"不可区分
+            self.last_materialize_error = f"{type(e).__name__}: {e}"
             return created
         for sid, default in SECTION_TEXT.items():
             path = self._persona_path(sid)
@@ -383,8 +381,12 @@ class StyleProfile:
         if not readme.exists() and self._atomic_write(readme, _PERSONA_README):
             created.append(readme.name)
         if created:
-            with self._lock:      # 新建后强制重读
-                self._sections_sig = ()
+            pass                  # 无需失效：段文案每次调用都现读
+        else:
+            # 一个都没写成：要么文件都在（正常），要么**全部写失败**（磁盘满/只读）
+            # —— 后者必须留痕（N11）。用"目录是否可写"区分这两者。
+            if not os.access(self.persona_dir(), os.W_OK):
+                self.last_materialize_error = f"persona 目录不可写: {self.persona_dir()}"
         return created
 
     @staticmethod
@@ -408,13 +410,18 @@ class StyleProfile:
         文件不存在 → 空 dict → **§3 整段不出现**（而不是留一个空壳标题）。
         """
         path = self._dir / MEMORY_DIGEST_FILE
+        self.last_memory_error = ""
         try:
             if not path.is_file():
-                return {}
+                return {}          # 没生成过：正常态（C4 落地前一直如此）
             obj = json.loads(path.read_text("utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as e:
+            # N6：**写坏了**与"没有内容"必须可区分 —— 否则 §3 会静默消失，
+            # 而"记忆丢了"看起来与"还没生成"一模一样（C31 之后这就是真风险）。
+            self.last_memory_error = f"{type(e).__name__}: {e}"
             return {}
         if not isinstance(obj, dict):
+            self.last_memory_error = f"顶层不是对象: {type(obj).__name__}"
             return {}
         layers = obj.get("layers") if isinstance(obj.get("layers"), dict) else obj
         out: dict[str, list[str]] = {}
@@ -430,40 +437,86 @@ class StyleProfile:
         与 RP 头部**从第一个字节起就分叉**（Gate 在 §4 之后插决策段）——
         `prompt_v2_gate.md` §2：**不追求跨调用共享前缀缓存**，两边各自命中自己的。
         """
+        self.last_gate_fallback = ""
+        gate_meta: dict = {}
         try:
-            return persona_mod.gate_head(self.persona_section_texts())
-        except Exception:
-            return ""
+            head = persona_mod.gate_head(self.persona_section_texts(), gate_meta)
+        except Exception as e:                        # pragma: no cover - 防御
+            head = ""
+            self.last_gate_fallback = f"gate_head_error: {type(e).__name__}: {e}"
+        if gate_meta.get("identity_empty"):
+            # §1/§2/§4 全空 → 只剩决策段，Gate 就没有"我"了（C22 的前提是这三段）
+            # → 退回裁判 system，并留痕（不静默）。
+            from .gate import GATE_SYSTEM_PROMPT
+            self.last_gate_fallback = "empty_identity_sections"
+            return GATE_SYSTEM_PROMPT
+        if not head.strip():
+            # N5：退回 Gate 自己的裁判 system，**绝不返回空串**
+            # —— 空 system 会让模型失去裁判身份（S13 实测：解析失败率 0%→40~60%）。
+            from .gate import GATE_SYSTEM_PROMPT
+            self.last_gate_fallback = self.last_gate_fallback or "empty_gate_head"
+            return GATE_SYSTEM_PROMPT
+        return head
 
     def summary_system_prompt(self) -> str:
         """总结类 LLM 的 system（C32）：§1+§2，收窄自全量人格。"""
+        self.last_summary_fallback = ""
         try:
             text = persona_mod.summary_head(self.persona_section_texts())
-        except Exception:
+        except Exception as e:                        # pragma: no cover - 防御
             text = ""
-        return text or self.system_prompt()
+            self.last_summary_fallback = f"summary_head_error: {type(e).__name__}: {e}"
+        if not text.strip():
+            # N4：退回全量人格会**静默取消 C32** —— 所以必须留痕，
+            # 让"这一篇总结用了全量人格"在日志里看得见。
+            self.last_summary_fallback = self.last_summary_fallback or "empty_summary_head"
+            return self.system_prompt()
+        return text
 
-    def persona_manifest(self) -> dict:
-        """装配清单（启动自检 / trace；降级必须可见 —— 本项目反复栽在静默失效）。"""
-        texts = self.persona_section_texts()
-        memory_block = persona_mod.render_memory_block(self.memory_layers())
-        base = persona_mod.manifest(texts, persona_mod.RP_ORDER, memory_block=memory_block)
-        base["mode"] = self._sections_mode
-        flags = self._persona_override_flags()
-        base["overridden"] = sorted(sid for sid, ok in flags.items() if ok)
-        # 旧键仍留在人格文件里、但 v2 已不再读取 —— 列出来，别让它继续"看起来生效"
+    def persona_manifest(self, *, texts: Optional[dict] = None,
+                       memory_block: Optional[str] = None,
+                       assembled: str = "",
+                       used: Optional[tuple] = None) -> dict:
+        """装配清单（启动自检 / trace 共用 —— 降级必须可见，但**不许恒亮**）。
+
+        调用方（``system_prompt()``）会把刚算出的 texts/memory_block 传进来，
+        避免"trace 走一条路径、自检走另一条"（独立核验 N10）。
+        legacy 模式下返回 legacy 视图：**不能报 v2 的段清单**，否则
+        "切回 legacy 到底生效没有"就无从判断（独立核验 B2）。
+        """
         frag = self._get("system_prompt_fragments.json")
-        inert = [k for k in LEGACY_SUPERSEDED_KEYS if k in frag]
-        superseded = sorted(
-            k for k in inert if k not in ("schedule",)
-        )
-        base["superseded_keys"] = superseded
-        base["superseded_chars"] = sum(
-            len(frag[k]) if isinstance(frag[k], str)
-            else len(json.dumps(frag[k], ensure_ascii=False))
-            for k in superseded
-        )
+        superseded = sorted(k for k in LEGACY_SUPERSEDED_KEYS if k in frag)
+        base: dict = {
+            "mode": self._sections_mode,
+            "superseded_keys": superseded,
+            "superseded_chars": sum(
+                len(frag[k]) if isinstance(frag[k], str)
+                else len(json.dumps(frag[k], ensure_ascii=False))
+                for k in superseded
+            ),
+        }
+        if self._sections_mode == "legacy":
+            base.update({"order": [], "used": [], "omitted": [], "missing": [],
+                         "chars": {}, "assembled_chars": len(self._legacy_system_prompt()),
+                         "overridden": [], "files": {}, "memory_layers": {},
+                         "memory_error": "", "materialize_error": "",
+                         "note": "legacy 装配：只读旧键元组，persona/ 段文件不参与"})
+            return base
+        texts = self.persona_section_texts() if texts is None else texts
+        if memory_block is None:
+            memory_block = persona_mod.render_memory_block(self.memory_layers())
+        rep = persona_mod.manifest(texts, persona_mod.RP_ORDER,
+                                   memory_block=memory_block, assembled=assembled)
+        base.update(rep)
+        files = self._persona_file_state()
+        base["files"] = files
+        # overridden = **真被改过**的段（文件内容 != 内置默认）；
+        # files_present 只说明"文件在"（首启物化后恒为全部）—— 两者别混（N1）。
+        base["overridden"] = sorted(sid for sid, st in files.items() if st == "custom")
+        base["files_present"] = sorted(sid for sid, st in files.items() if st != "missing")
         base["memory_layers"] = {k: len(v) for k, v in self.memory_layers().items() if v}
+        base["memory_error"] = getattr(self, "last_memory_error", "")
+        base["materialize_error"] = getattr(self, "last_materialize_error", "")
         return base
 
     def relations_lines(self) -> list[tuple[str, str]]:

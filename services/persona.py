@@ -65,6 +65,12 @@ MEMORY_LAYERS: tuple[tuple[str, str], ...] = (
 #: 全部段 id（含无内置默认的 `sched`）
 ALL_SECTIONS: tuple[str, ...] = tuple(SECTION_TEXT.keys()) + ("sched",)
 
+#: **内容为空时按设计整段省略**的段（不算降级）。
+#: §4.4：没有内容的层整段不出现 —— 首月只有日层时不留空标题；全空时 §3 整段省略。
+#: 所以「§3 没进提示词」在 C4 落地前是**正常态**，不能当成段丢失告警
+#: （否则降级信号恒亮 = 没有信号）。
+OPTIONAL_WHEN_EMPTY: tuple[str, ...] = ("s3_memory",)
+
 
 def section_title(sid: str) -> str:
     """段的中文标题（**只用于日志/自检，不进提示词** —— D26）。"""
@@ -127,9 +133,17 @@ def compose(
     return "\n\n".join(parts), tuple(used)
 
 
-def gate_head(texts: Mapping[str, str]) -> str:
-    """Gate 冻结头部 = §1+§2+§4 ＋ GATE 独有决策段（C22）。"""
-    base, _used = compose(texts, GATE_ORDER)
+def gate_head(texts: Mapping[str, str], meta: Optional[dict] = None) -> str:
+    """Gate 冻结头部 = §1+§2+§4 ＋ GATE 独有决策段（C22）。
+
+    ``meta``（可选，回传诊断信息）：``identity_empty`` = §1/§2/§4 一段都没装上；
+    ``used_identity`` = 实际装上的身份段。调用方据此决定要不要退回裁判 system
+    —— 只剩决策段时，Gate 就没有"我"了，而 C22 的前提正是这三段。
+    """
+    base, used = compose(texts, GATE_ORDER)
+    if meta is not None:
+        meta["identity_empty"] = not base.strip()
+        meta["used_identity"] = list(used)
     parts = [p for p in (base, GATE_DECISION_SECTION.strip()) if p]
     return "\n\n".join(parts)
 
@@ -150,13 +164,33 @@ def manifest(
     order: Sequence[str] = RP_ORDER,
     *,
     memory_block: str = "",
+    assembled: str = "",
 ) -> dict:
-    """装配清单（供启动自检 / trace 用，降级必须可见）。"""
-    _text, used = compose(texts, order, memory_block=memory_block)
-    missing = [sid for sid in order if sid not in used]
+    """装配清单（供启动自检 / trace 用，降级必须可见）。
+
+    🔴 **omitted 与 missing 必须分开**（独立核验 B1）：
+      * ``omitted`` —— **按设计省略**（§3 在没有记忆正文时整段不出现，§4.4）；
+      * ``missing`` —— **该有却没有**（段文案为空，且不属于「空则省略」那一类）。
+
+    两者混成一个 ``missing``，会让 C4 落地前的**每一轮**都带降级标记 ——
+    恒亮的降级信号等于没有信号，真降级时反而没人看。
+    """
+    text, used = compose(texts, order, memory_block=memory_block)
+    used_set = set(used)
+    omitted: list[str] = []
+    missing: list[str] = []
+    for sid in order:
+        if sid in used_set:
+            continue
+        (omitted if sid in OPTIONAL_WHEN_EMPTY else missing).append(sid)
     return {
         "order": list(order),
         "used": list(used),
+        "omitted": omitted,
         "missing": missing,
         "chars": {sid: len(str(texts.get(sid) or "")) for sid in order},
+        # 装配后的**真实长度**（段间以空行相接、去尾空白），
+        # 与 sum(chars.values()) **不是同一个量** —— 日志只报这个，
+        # 免得启动日志与自检的 sp_len 对不上（独立核验 N8）。
+        "assembled_chars": len(assembled) if assembled else len(text),
     }
