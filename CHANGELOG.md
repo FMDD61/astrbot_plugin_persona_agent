@@ -139,6 +139,31 @@
   （当前单目标群，无影响）—— 分别归批次三与"多群支持"。
 - 测试 769 → **773 全绿**（实测 `Ran 773 tests`；新增 N-1/N-3/N-5 回归 3 例 + 闸门重写 2 例）。
 
+### Added (2026-09-20, 无人值守部署工具 `tools/deploy/` —— 09-21 轮转前上线用)
+> 用户 2026-09-20：「插件部署操作保证台式机上能自动定时执行」。
+> 台式机口径（`DESKTOP_STATE.md`）：AstrBot 跑在**宿主机的 screen 会话 `astrbot`** 里，
+> 插件代码在 `/opt/AstrBot/data/plugins/astrbot_plugin_persona_agent`。
+
+- **`tools/deploy/deploy_persona_plugin.sh`** —— 一次跑完：
+  `git fetch`（120s 超时 + `GIT_TERMINAL_PROMPT=0`，凭据坏掉也不会挂死在 cron 里）
+  → 工作树必须干净 → **快进合并**（非快进即中止）→ **跑测试**（不过就 `git reset --hard` 回滚）
+  → **只重启 AstrBot**（`screen -S astrbot -X quit` → 等它真退出（最多 60s，**不强杀**）
+  → `screen -dmS astrbot bash start-astrbot.sh`）→ 核对启动日志（`[persona] mode=` / 示例来源 / 组装 / cron）。
+  **绝不碰 docker / QQ 容器**；失败一定给出可读的中文原因，并写 `~/.deploy-persona-plugin.status`。
+  子命令：`--check-only`（只看不动作）、`--force-restart`（盘上代码已新，只差激活）、
+  `--no-restart`、`--skip-tests`、`--allow-dirty`、`--install-cron '<cron 表达式>' [--one-shot]`、
+  `--remove-cron`。`--one-shot` = 成功跑完**自动摘掉自己那条 cron**（失败保留，便于次日排查）。
+- **`tools/deploy/selftest.sh`** —— 离线自测台（**32 断言全过**）：真 git（裸远端 + 克隆）+
+  桩 `screen`/`python3`/`crontab`，跑 9 个场景：工作树脏 → 拒绝；`--check-only` → 不动；
+  正常部署 → 拉取+测试+重启+核对日志；已是最新 → **不重启**；`--force-restart` → 重启；
+  **测试失败 → 回滚且不重启**；非快进 → 中止；cron 安装幂等/摘除；`--one-shot` 自摘。
+  写它的理由：这个脚本会在**凌晨无人值守**时决定「要不要重启线上 bot」，判错一次就是一次事故。
+  *（自测台自身也踩了两个坑并修掉：桩脚本的 heredoc 转义被吃掉、`screen -S x -X quit` 的 `quit` 是第 4 个参数 ——
+  两个都只在跑起来才暴露。）*
+- 口径变更：**部署脚本进插件仓库**（而不是项目根 `ops/desktop/`）——
+  根目录不是 git 仓库，台式机拿不到；`ops/desktop/README.md` 留操作步骤与本仓库路径的指引。
+- 测试：插件 Python 套件不受影响（**778 全绿**）；另加 shell 的 32 断言自测台。
+
 ### Fixed (2026-09-20, 独立核验第 7 轮：闸门加固 —— **复核结论：可上线** ✅)
 > 审查方对 `71c47c2` 的冻结快照复核：B-1 的**三条触发链全部堵住**（含我特别问的
 > 「cron 拿到 `old_msgs=None` 也仍会组装」）；`await` 真 awaited；超时后仍组装；
