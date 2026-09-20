@@ -1,0 +1,5 @@
+{
+  "entries_sha256_12": "67ab8491be59",
+  "count": 20,
+  "note": "示例文案指纹（C1/C2）。有意改动请重跑 tools/gen_examples_default.py 并更新本文件。"
+}

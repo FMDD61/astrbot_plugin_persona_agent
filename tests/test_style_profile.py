@@ -321,3 +321,71 @@ class TestHourlyTimezoneGuard(unittest.TestCase):
             sp = StyleProfile(td)
             self.assertEqual(sp.hourly_budget(12), 0.0)
             self.assertEqual(sp.peak_hours(), set())
+
+
+class TestMemberNoteRendering(unittest.TestCase):
+    """C5：`notes`（人工写的「关于这个人的事 + 他独特的用语方式」）必须进关系图谱。
+
+    用户 2026-09-20：notes 由**人工维护**（原打算 LLM 从日志生成，后决定手工写最好）。
+    为什么必须渲染：D28 把「对谁怎么说」整块推给了群关系图谱 NOTE ——
+    **不渲染 = §6 的那半句没有载体**。
+    """
+
+    def _sp(self, td, members):
+        with open(os.path.join(td, "member_relations.json"), "w", encoding="utf-8") as f:
+            json.dump({"members": members}, f, ensure_ascii=False)
+        return StyleProfile(td)
+
+    def test_note_is_rendered_on_one_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = self._sp(td, [{
+                "uin": "1", "alias": "甲", "closeness": "close",
+                "notes": "喜欢用「口癖乙」\n最近在备考",
+            }])
+            lines = sp.relations_lines()
+            self.assertEqual(len(lines), 1)
+            line = lines[0][1]
+            self.assertIn("喜欢用「口癖乙」", line)
+            self.assertIn("最近在备考", line)
+            self.assertNotIn("\n", line, "必须压成一行（增量按整行比对）")
+            self.assertIn("—", line)
+
+    def test_empty_note_adds_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = self._sp(td, [{
+                "uin": "1", "alias": "甲", "closeness": "close", "notes": "   ",
+            }])
+            self.assertNotIn("—", sp.relations_lines()[0][1])
+
+    def test_bot_sentinel_note_is_not_rendered(self):
+        """`notes == "bot"` 是历史哨兵值（旧版标 bot 账号的方式）。
+
+        现状：`is_bot_member()` 按 kind/notes 双读 → 这条**整个成员被过滤掉**，
+        "bot" 不会作为备注渲染出来。渲染侧那句 `note != "bot"` 是**第二道防线**
+        （将来 kind 迁移干净、哨兵只留在 notes 里时，仍不会泄漏进提示词）。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sp = self._sp(td, [{
+                "uin": "1", "alias": "甲", "closeness": "known", "notes": "bot",
+            }, {
+                "uin": "2", "alias": "乙", "closeness": "known", "notes": "正常人",
+            }])
+            lines = sp.relations_lines()
+            self.assertEqual([x[0] for x in lines], ["2"],
+                             "notes=bot 的成员必须被过滤，且不得渲染出 — bot")
+            self.assertNotIn("bot", lines[0][1])
+
+    def test_note_change_shows_up_as_delta(self):
+        """人工改 NOTE 后，增量算法必须把它算成「变化行」（S10 尾部追加的入口）。"""
+        with tempfile.TemporaryDirectory() as td:
+            sp = self._sp(td, [{
+                "uin": "1", "alias": "甲", "closeness": "close", "notes": "旧备注",
+            }])
+            known = {uin: line for uin, line in sp.relations_lines()}
+            sp2 = self._sp(td, [{
+                "uin": "1", "alias": "甲", "closeness": "close", "notes": "新备注",
+            }])
+            added, changed = sp2.relations_delta(known)
+            self.assertEqual(added, [])
+            self.assertEqual(len(changed), 1)
+            self.assertIn("新备注", changed[0])

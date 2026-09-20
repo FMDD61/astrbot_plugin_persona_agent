@@ -289,7 +289,8 @@
       "max_entries": {
         "type": "int",
         "description": "最多注入示例条数",
-        "default": 12
+        "default": 20,
+        "hint": "C1：不锁死在 12（用户：「13 条不一定够，甚至可能会增加」）。示例文案真身在 docs/specs/rp_examples_draft_v1.md，生成物 services/examples_default.py；数据目录 example_dialogs.json 存在且可解析时优先用它，否则回落内置 20 条 —— 任何情况下都不会回退到旧示例句。"
       }
     }
   },

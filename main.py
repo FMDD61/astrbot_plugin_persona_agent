@@ -62,7 +62,11 @@ from .services.pipeline import PersonaPipeline, PipelineInput, SendIntent
 from .services.vision import VisionService, face_name
 from .services.poke import PokeService
 from .services import protocol_compat
-from .services.examples import load_examples_block, ExamplesState
+from .services.examples import (
+    MAX_ENTRIES as EXAMPLES_MAX_ENTRIES,
+    ExamplesState,
+    load_examples_block,
+)
 from .services.memory_store import MemoryStore, MemoryEvent
 from .services.dream import DreamMaker, persist_dream
 from .services.familiarity import (
@@ -2149,7 +2153,13 @@ class PersonaAgent(Star):
             self._vision_resolving = False
 
     def _examples_block(self) -> str:
-        """G14: hot-reloadable example-dialog block (A/B = rename the file)."""
+        """G14/C1: 示例块（热重载；数据目录文件优先，缺失回落**内置新 20 条**）。
+
+        ⚠️ 用户 2026-09-20 定：**任何情况下都不回退到旧示例句** ——
+        旧句在代码里一个字都不存在，缺失时回落的就是新 20 条。
+        `source` 变了就打一行日志（用了文件还是内置、几条）——
+        部署时忘了替换文件，这里是唯一能看见的地方。
+        """
         try:
             cfg = self.config.get("examples", {}) or {}
             if int(cfg.get("enabled", 1)) != 1:
@@ -2157,9 +2167,16 @@ class PersonaAgent(Star):
                 return ""
             block, state = load_examples_block(
                 self.data_dir / "example_dialogs.json",
-                max_entries=int(cfg.get("max_entries", 12)),
+                max_entries=int(cfg.get("max_entries", EXAMPLES_MAX_ENTRIES)),
                 prev=self._examples_state,
             )
+            _prev = self._examples_state
+            if getattr(_prev, "source", "") != state.source or \
+                    getattr(_prev, "entries", 0) != state.entries:
+                logger.info(
+                    f"[examples] 示例块来源={state.source} 条数={state.entries} "
+                    f"（file=数据目录 example_dialogs.json；bundled=内置新 20 条）"
+                )
             self._examples_state = state
             return block
         except Exception:

@@ -1,8 +1,18 @@
-"""examples — G14 static example-dialog injection loader.
+"""examples — G14 静态示例块注入（C1/C2 重做）。
 
-Pure stdlib; mtime-based hot reload so A/B switching is just renaming the
-file (no restart). Block is injected as one fixed system message between the
-session and the KG tail (stable cache prefix; see main.py wiring).
+纯 stdlib；mtime 热重载（纳秒），A/B 切换就是改/换文件（无需重启）。
+块作为**一条恒定 system 消息**注入（稳定缓存前缀，见 main 的接线）。
+
+## 数据来源（用户 2026-09-20 定）
+
+```
+<data_dir>/example_dialogs.json   有可解析条目 → 用它（部署时"替换文件"这条路）
+                                没有/坏了/空 → 回落到 services/examples_default.py
+```
+
+**任何情况下都不会回退到旧示例句**：旧句在这份代码里一个字都不存在 ——
+回落目标就是新 20 条（由 `tools/gen_examples_default.py` 从草案生成）。
+`ExamplesState.source` 记录本次用的是哪一路，供启动自检打出来（降级必须可见）。
 """
 from __future__ import annotations
 
@@ -11,18 +21,42 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-MAX_ENTRIES = 12
-HEADER = (
-    "示例对话（风格参考，禁止复读原文）：\n"
-    "规则A：口癖甲 仅用于肯定/恍然大悟，禁止在问好、吃饭、闲聊中滥用。\n"
-    "规则B：谐音问候（早上好~等）仅在对方整词说出「早上好/中午好/下午好/晚上好」时使用。"
-)
+from . import examples_default
+
+#: 条数上限默认值（C1：不锁死在 12 —— 用户「13 条不一定够，甚至可能会增加」）
+MAX_ENTRIES = 20
+
+#: 头部（兼容旧引用；真身在 examples_default，由草案 §A 生成）
+HEADER = examples_default.HEADER
 
 
 @dataclass
 class ExamplesState:
     mtime: float = 0.0
     block: str = ""
+    #: "file"（数据目录文件）/ "bundled"（内置默认）/ "none"（连默认都空）
+    source: str = "none"
+    entries: int = 0
+
+
+def _render(entries: list[dict], max_entries: int) -> list[str]:
+    """把条目渲染成逐行文本（`[话题] 角色: 内容 角色: 内容`）。"""
+    lines: list[str] = []
+    for ex in (entries or [])[:max_entries]:
+        if not isinstance(ex, dict):
+            continue
+        parts = []
+        for m in (ex.get("messages") or []):
+            if not isinstance(m, dict):
+                continue
+            content = (m.get("content") or "").strip()
+            role = (m.get("role") or "").strip()
+            if content:
+                parts.append(f"{role}: {content}".strip())
+        if len(parts) >= 2:
+            topic = (ex.get("topic") or "").strip()
+            lines.append((f"[{topic}] " if topic else "") + " ".join(parts))
+    return lines
 
 
 def load_examples_block(
@@ -30,35 +64,35 @@ def load_examples_block(
     max_entries: int = MAX_ENTRIES,
     prev: Optional[ExamplesState] = None,
 ) -> tuple[str, ExamplesState]:
-    """Return (block, state). block == '' when the file is absent, empty,
-    unreadable or disabled via a zero-length sentinel. `prev` carries the
-    previous mtime/block for the hot-reload check."""
+    """返回 ``(block, state)``。
+
+    ``block == ""`` 只在**连内置默认都没有**时出现（正常永远不会）。
+    ``prev`` 携带上次的 mtime/block 做热重载判断。
+    """
     path = Path(path)
     try:
-        mt = path.stat().st_mtime_ns  # nanosecond: catches same-second rewrites
+        mt = path.stat().st_mtime_ns  # 纳秒：尽量察觉同尺寸改写
     except OSError:
-        return "", ExamplesState()
-    if prev is not None and prev.mtime > 0 and mt == prev.mtime:
+        mt = 0
+    if prev is not None and prev.mtime > 0 and mt > 0 and mt == prev.mtime:
         return prev.block, prev
-    block = ""
-    try:
-        data = json.loads(path.read_text("utf-8"))
-        lines = []
-        for ex in (data or [])[:max_entries]:
-            msgs = ex.get("messages") or []
-            if len(msgs) < 2:
-                continue
-            topic = (ex.get("topic") or "").strip()
-            parts = []
-            for m in msgs:
-                role = (m.get("role") or "").strip()
-                content = (m.get("content") or "").strip()
-                if content:
-                    parts.append(f"{role}: {content}".strip())
-            if len(parts) >= 2:
-                lines.append((f"[{topic}] " if topic else "") + " ".join(parts))
-        if lines:
-            block = HEADER + "\n" + "\n".join(lines)
-    except (json.JSONDecodeError, OSError, TypeError, ValueError):
-        block = ""
-    return block, ExamplesState(mtime=mt, block=block)
+    lines: list[str] = []
+    source = "bundled"
+    if mt > 0:
+        try:
+            data = json.loads(path.read_text("utf-8"))
+            lines = _render(data if isinstance(data, list) else [], max_entries)
+            if lines:
+                source = "file"
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            lines = []
+    if lines:
+        header = HEADER
+    else:
+        # 回落内置默认（新 20 条）。⚠️ 这**不是**降级告警：文件缺失是正常部署形态；
+        # 但 source 会如实写进 state，启动日志里看得见用的是哪一路。
+        lines = _render(examples_default.ENTRIES, max_entries)
+        header = examples_default.HEADER
+        source = "bundled" if lines else "none"
+    block = (header + "\n" + "\n".join(lines)) if lines else ""
+    return block, ExamplesState(mtime=mt, block=block, source=source, entries=len(lines))

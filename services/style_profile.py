@@ -559,6 +559,22 @@ class StyleProfile:
             if other_names:
                 line += f" (也常被叫作: {'、'.join(other_names)})"
             line += f"  [{label}]"
+            # ---- C5：NOTE（`notes` 字段）----
+            # 用户 2026-09-20 定：`notes` 里写「我记住的关于这个人的事 + 他独特的用语方式」，
+            # **人工维护**（原打算让 LLM 从日志生成，后来决定手工写最好）。
+            # 为什么必须渲染：D28 把「对谁怎么说」整块推给了群关系图谱 NOTE ——
+            # **不渲染 = §6 的那半句没有载体**。
+            #
+            # ⚠️ 两条硬约束：
+            #   ① `notes` 是人写的散文，可能含换行 → **必须压成一行**：
+            #      `relations_lines()` 的契约是「一人一行」，而增量算法（S10）
+            #      按**整行文本**比对，多行会把块结构撑坏；
+            #   ② 历史哨兵值 `notes == "bot"` 是旧版标 bot 账号的方式，
+            #      **不能当备注渲染出来**（`is_bot_member` 已按 kind/notes 双读过滤，
+            #      这里再挡一次，防止将来 kind 迁移后哨兵泄漏进提示词）。
+            note = " ".join(str(m.get("notes") or "").split())
+            if note and note != "bot":
+                line += f" — {note}"
             out.append((uin, line))
         return out
 

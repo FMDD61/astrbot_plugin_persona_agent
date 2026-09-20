@@ -589,7 +589,9 @@ class ReplayRuntime:
                 return ""
             block, _ = examples_mod.load_examples_block(
                 self._data_dir / "example_dialogs.json",
-                max_entries=int(cfg.get("max_entries", 12)),
+                # C1：默认上限与线上同源（20），别让离线台与生产用不同的条数
+                max_entries=int(cfg.get("max_entries",
+                                       getattr(examples_mod, "MAX_ENTRIES", 20))),
             )
             return block
         except Exception:
