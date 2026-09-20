@@ -125,6 +125,17 @@ run 'oneshot-run' 0 --one-shot
 check 'one-shot 已重启' "$(restarted)" yes
 check 'one-shot 摘掉了自身定时任务' "$(grep -c 'deploy-persona-plugin' "$WORK/crontab.txt")" 0
 
+
+echo '── 10) fetch 失败：带 --force-restart 时仍激活盘上代码'
+git -C "$WORK/plugin" remote set-url origin "$WORK/nonexistent.git"
+run 'fetch-fail-force' 0 --force-restart
+check 'fetch 失败但 --force-restart → 仍重启' "$(restarted)" yes
+check 'fetch 失败有明确告警' "$(grep -c 'fetch 失败' "$WORK/out.txt")" 1
+
+echo '── 11) fetch 失败：不带 --force-restart → 中止、不重启'
+run 'fetch-fail-plain' 1
+check 'fetch 失败且无 force → 不重启' "$(restarted)" no
+git -C "$WORK/plugin" remote set-url origin "$WORK/remote.git"
 echo
 echo "==== 自测结果：$PASS 通过 / $FAIL 失败 ===="
 [ "$FAIL" = 0 ] || exit 1

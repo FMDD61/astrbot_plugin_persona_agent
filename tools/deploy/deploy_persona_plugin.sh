@@ -134,11 +134,19 @@ fi
 
 # ---------------------------------------------------------------- 拉取
 log "fetch origin/$BRANCH …"
-if ! GIT_TERMINAL_PROMPT=0 "$TIMEOUT_BIN" "$FETCH_TIMEOUT" \
+if GIT_TERMINAL_PROMPT=0 "$TIMEOUT_BIN" "$FETCH_TIMEOUT" \
      "$GIT_BIN" fetch --prune origin "$BRANCH" >>"$LOG_FILE" 2>&1; then
-  die "git fetch 失败（网络/凭据？）—— 未做任何改动"
+  NEW_HEAD="$("$GIT_BIN" rev-parse "origin/$BRANCH")"
+else
+  # 网络/凭据失败**不该让「激活盘上代码」一起废掉**：定时任务里带了 --force-restart 时，
+  # 照旧跑测试并重启（用当前 HEAD）。否则凌晨那一跑会静默地什么都没做。
+  if [ "$FORCE_RESTART" = 1 ]; then
+    warn "git fetch 失败（网络/凭据？）→ 因指定了 --force-restart，改用**盘上现有代码**继续"
+    NEW_HEAD="$OLD_HEAD"
+  else
+    die "git fetch 失败（网络/凭据？）—— 未做任何改动"
+  fi
 fi
-NEW_HEAD="$("$GIT_BIN" rev-parse "origin/$BRANCH")"
 
 if [ "$OLD_HEAD" = "$NEW_HEAD" ]; then
   log "已是最新（$OLD_HEAD）"
