@@ -96,16 +96,57 @@ class TestNoUndefinedNames(unittest.TestCase):
         self.assertNotIn("os.path.exists(os", src)   # 顺带防止写错
 
 
+def reads_of(path: Path, field=None, key=None) -> list[tuple[int, str]]:
+    """用 **AST** 找出对某字段/某清单键的**真读**：(行号, 形态) 列表。
+
+    只认三种形态，**完全不看注释与 docstring**（`ast` 里注释根本不出现，
+    docstring 是 `Expr(Constant)` 也不会命中）：
+
+      ① 属性读：``x.last_summary_fallback``；
+      ② ``getattr(x, "last_summary_fallback", ...)``；
+      ③ 清单键：``d["memory_error"]`` / ``d.get("memory_error")``。
+
+    为什么必须是 AST（独立核验第 3 轮证伪了子串版）：子串匹配会把
+    "注释里提了一句字段名"当成有人读 —— 把真读删掉、只留注释，闸门**仍然绿**。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if field and isinstance(node, ast.Attribute) and node.attr == field \
+                and isinstance(node.ctx, ast.Load):
+            hits.append((node.lineno, "attr-load"))
+        if field and isinstance(node, ast.Call) \
+                and isinstance(node.func, ast.Name) and node.func.id == "getattr" \
+                and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) \
+                and node.args[1].value == field:
+            hits.append((node.lineno, "getattr"))
+        if key:
+            if isinstance(node, ast.Subscript) \
+                    and isinstance(node.slice, ast.Constant) \
+                    and node.slice.value == key:
+                hits.append((node.lineno, "subscript"))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                    and node.func.attr == "get" and node.args \
+                    and isinstance(node.args[0], ast.Constant) \
+                    and node.args[0].value == key:
+                hits.append((node.lineno, "dict.get"))
+    return sorted(set(hits))
+
+
 class TestInstrumentationHasReaders(unittest.TestCase):
     """**只写不读的仪表盘 = 没有仪表盘**（2026-09-20 独立核验 R4 的教训）。
 
     `StyleProfile` 上的降级留痕字段（`last_summary_fallback` / `last_gate_fallback` / …）
     曾经"设了但全仓无人读"：docstring 承诺"日志里看得见"没兑现 —— 而这类失效**不会报错**，
-    只会让运维在真降级时一无所获。本测试用最粗的判据把它钉住：
-    **每个留痕字段必须在 `services/style_profile.py` 之外至少有一个出现点**（即真有人读）。
+    只会让运维在真降级时一无所获。
+
+    ⚠️ **判据必须是 AST，不能是子串匹配**（独立核验第 3 轮证伪了我的第一版）：
+    第一版对整文件文本做 `in` 判断 → **注释与 docstring 里的字段名也算"读者"**；
+    变异实验（删掉两处真读、只留注释）下它**仍然绿** —— 判据松了等于没有闸门。
+    `ast` 天然不含注释，docstring 是 `Expr(Constant)` 不会被误判。
     """
 
-    #: 字段必须**直接被别处读**（属性名出现在别的模块里）
+    #: 字段必须**直接被别处读**（属性读 / getattr）
     DIRECT_FIELDS = ("last_summary_fallback", "last_gate_fallback",
                      "last_persona_report")
     #: 字段经由 `persona_manifest()` 出到清单，再由消费方读**清单键**
@@ -116,32 +157,63 @@ class TestInstrumentationHasReaders(unittest.TestCase):
         out = [REPO / "main.py"]
         out += sorted((REPO / "services").glob("*.py"))
         out += sorted((REPO / "tools").glob("*.py"))
-        return [p for p in out if p.is_file()]
+        # 定义方除外：它自己写字段，不能算"有人读"
+        return [p for p in out if p.is_file() and p.name != "style_profile.py"]
 
-    def _readers(self, needle: str) -> list:
-        return [p.relative_to(REPO) for p in self._sources()
-                if needle in p.read_text(encoding="utf-8")
-                and p.name != "style_profile.py"]
+    def _readers(self, field, key) -> list:
+        found = []
+        for src in self._sources():
+            for line, kind in reads_of(src, field=field, key=key):
+                found.append(f"{src.relative_to(REPO)}:{line}({kind})")
+        return found
 
-    def test_each_fallback_marker_has_a_reader(self):
+    def test_each_fallback_marker_has_a_real_reader(self):
         for field in self.DIRECT_FIELDS:
             self.assertTrue(
-                self._readers(field),
-                f"{field} 只写不读（无仪表盘）：给它一个出口（日志/trace），或删掉它",
+                self._readers(field, None),
+                f"{field} 只有写入、没有真读（无仪表盘）：给它一个出口，或删掉它",
             )
 
-    def test_manifest_surfaced_markers_have_readers(self):
+    def test_manifest_surfaced_markers_have_real_readers(self):
         for field, key in self.MANIFEST_FIELDS:
             self.assertTrue(
-                self._readers(f'"{key}"'),
-                f"{field} 只经 manifest 输出为 {key!r}，但没人读那个键 → 仍是没有仪表盘",
+                self._readers(None, key),
+                f"{field} 经 manifest 输出为 {key!r}，但没人读那个键 → 仍是没有仪表盘",
             )
 
-    def test_checker_actually_catches_write_only_field(self):
-        """自证：凭空造的字段名应当找不到读者（否则本测试是空转的）。"""
-        readers = [p for p in self._sources()
-                   if "last_nonexistent_marker" in p.read_text(encoding="utf-8")]
-        self.assertEqual(readers, [])
+    def test_checker_is_not_fooled_by_comments_or_docstrings(self):
+        """自证（双向）：注释/docstring 提及不算读；真读必须被认出来。
+
+        第一版的自证是同义反复（断言"一个全仓都不存在的字符串找不到读者"，恒真）。
+        这里造**合成模块**：写字段 + 只在注释/docstring 里提它 → 必须判无读者；
+        再加一处真读 → 必须认出来。
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "sample.py"
+            f.write_text(
+                'class S:\n'
+                '    """docstring 里提到 last_marker，但它不是读。"""\n'
+                '    def __init__(self):\n'
+                '        self.last_marker = ""   # 写\n'
+                '    def touch(self):\n'
+                '        # 注释里也说一句 last_marker\n'
+                '        return None\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                reads_of(f, field="last_marker", key=None), [],
+                "注释/docstring 里的提及被误判成读了 —— 判据又松了",
+            )
+            f.write_text(
+                f.read_text(encoding="utf-8")
+                + "\ndef read_it(s):\n    return s.last_marker\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(
+                reads_of(f, field="last_marker", key=None),
+                "真读（属性 load）没被认出来",
+            )
 
 
 if __name__ == "__main__":

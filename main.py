@@ -1459,6 +1459,14 @@ class PersonaAgent(Star):
                 # C22 的 Gate 头部：**接线前它没有别的消费点**，而
                 # `StyleProfile.last_gate_fallback` 是"降级必须可见"的标记 ——
                 # 只设不读等于没留痕（独立核验 R4）。启动时取一次并报出来。
+                #
+                # ⚠️ **覆盖范围有限**（独立核验第 3 轮实测）：这里只在 initialize()
+                # 跑一次，而 gate_system_prompt() 是**逐轮现读**段文件的 —— 当前之所以
+                # 够用，靠的是"空文件回落内置默认"这条不变量（清空 s1/s2/s4 也装配得出
+                # 正常头部，identity_empty 在文件层不可达）。一旦新增无内置默认的段、
+                # 或改了"空文件"的语义，回退就会变成运行期可变，这里会**静默失效**。
+                # → C22 接线时必须把出口挪到 Gate 调用点，写 per-turn trace
+                #   `trace["gate_head_fallback"]`（与 persona_degraded 同形，进 trace_log）。
                 try:
                     self.style.gate_system_prompt()
                     _gfb = getattr(self.style, "last_gate_fallback", "")
