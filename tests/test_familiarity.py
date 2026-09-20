@@ -106,14 +106,14 @@ class TestParseProposals(unittest.TestCase):
 class TestPromptIncludesCurrentGraph(unittest.TestCase):
     def test_prompt_has_relations_block(self):
         """🔴 必须附**旧版关系图谱** —— 否则模型会提议已经是 close 的人。"""
-        p = build_proposal_prompt("【熟人】\\n  1: 甲 [熟人]", [{"day": "d", "summary": "s"}],
+        p = build_proposal_prompt("【熟人】\\n  1: 甲 [熟人]", [{"day": "d", "body": "s"}],
                                   {"1": "close"})
         self.assertIn("旧版群友关系图谱", p)
         self.assertIn("甲", p)
         self.assertIn("本周日记", p)
 
     def test_prompt_handles_empty_graph(self):
-        p = build_proposal_prompt("", [{"day": "d", "summary": "s"}], {})
+        p = build_proposal_prompt("", [{"day": "d", "body": "s"}], {})
         self.assertIn("（空）", p)
 
 

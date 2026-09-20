@@ -199,7 +199,8 @@ class TestDreamMaker(unittest.TestCase):
 
         思考 token 是**重尾随机变量**（实测同一 prompt 556~2048），
         `max_tokens` 是**上限而非消耗** —— 给紧只会在运气差时截断成空 content。
-        实测锚点阶段 2048 会顶格成空，8192/16384 稳定。
+        实测：2048 会顶格成空、8192/16384 稳定（当时在锚点阶段观测到，结论对整条链成立）。
+        C33⑤ 删掉锚点阶段后，这里只剩做梦这一条调用可守。
         """
         import json as _json, os as _os
         p = _os.path.join(_os.path.dirname(__file__), "..", "_conf_schema.json")

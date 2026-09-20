@@ -275,7 +275,8 @@ class PersonaAgent(Star):
         self._dream_maker = DreamMaker(
             str(self.data_dir),
             dream_fn=self._dream_llm,
-            world_block=(self.style.world_section() if self.style else ""),
+            # 惰性取世界段（每次做梦现读段文件，与其它段一致）
+            world_block_fn=(self.style.world_section if self.style else None),
         )
 
         dream_cfg = self.config.get("dream", {}) or {}
@@ -2658,9 +2659,21 @@ class PersonaAgent(Star):
             if not digest:
                 # 格式没遵守：正文照收，但**必须可统计**（summary_v2 §2 的可用率口径）
                 record["digest_missing"] = True
+            # N-3（独立核验第 4 轮）：两条写侧必须对称 —— 周期侧早就有 body_missing，
+            # 日记侧没有；而**没有 body 的记录会被读侧完全丢弃**
+            # （`list_diaries` 要求 body 非空）→ 这一天对周报/做梦不可见。
+            # 触发概率低（模型只回围栏不回正文），但那是"写进去却读不出来"的静默路径。
+            if not body:
+                record["body_missing"] = True
             if not body and digest:
+                # 有 digest 没正文 → 正文回落 digest，别让这一天凭空消失
                 record["body"] = digest
                 record["body_from_digest"] = True
+            if not record["body"]:
+                logger.warning(
+                    f"[persona_agent] ⚠️ diary 既无正文也无 digest（day={record['day']}）"
+                    f" → 这一天对周报/做梦**不可见**（读侧要求 body 非空）"
+                )
             # 🔴 幂等（2026-09-14 实测事故）：用户在夜间反复重启，**新旧实例交叠**
             # 时同一 cron 被两个进程各跑一次 → 同一天日记写了 2–3 条。
             # 内存标记跨不了进程，判据必须落在**文件**上。

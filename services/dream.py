@@ -266,13 +266,27 @@ class DreamMaker:
                  dream_fn=None,
                  seed: Optional[int] = None,
                  fragment_ids=DEFAULT_FEWSHOT_IDS,
-                 world_block: str = "") -> None:
+                 world_block: str = "",
+                 world_block_fn=None) -> None:
         self._dir = Path(data_dir)
         self._dream_fn = dream_fn
-        # C33④：system = DREAM_SYSTEM + §4 世界段（梦唯一的设定来源）
-        self._system = build_dream_system(world_block)
+        # C33④：system = DREAM_SYSTEM + §4 世界段（梦唯一的设定来源）。
+        # 🔑 世界段**惰性取用**（独立核验 N-1）：段文件是每次现读的，
+        # 构造时快照会让"改了 s4_world.md 却要重启才对梦生效"——
+        # 与其它段的行为不一致（那是个不易察觉的坑）。
+        self._world_fn = world_block_fn
+        self._system_snapshot = build_dream_system(world_block)
         self._rnd = random.Random(seed)
         self._ids = fragment_ids
+
+    def _system_text(self) -> str:
+        """当前该用的 system（世界段惰性取，取不到就用构造时的快照）。"""
+        if self._world_fn is None:
+            return self._system_snapshot
+        try:
+            return build_dream_system(str(self._world_fn() or ""))
+        except Exception:                             # pragma: no cover - 防御
+            return self._system_snapshot
 
     def prepare(self, group_id: str, limit: int = DIARY_WINDOW) -> DreamResult:
         """只做本地准备（取日记 + 残缺化 + 取片段），不调 LLM。
@@ -321,7 +335,7 @@ class DreamMaker:
             return res
         try:
             text = str(await self._dream_fn(
-                self._system,
+                self._system_text(),
                 build_dream_prompt(frag_diaries, fragments)) or "").strip()
         except Exception as e:
             res.stats["error"] = f"dream_failed: {type(e).__name__}: {e}"
