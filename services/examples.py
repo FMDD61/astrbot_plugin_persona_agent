@@ -66,16 +66,20 @@ def load_examples_block(
 ) -> tuple[str, ExamplesState]:
     """返回 ``(block, state)``。
 
-    ``block == ""`` 只在**连内置默认都没有**时出现（正常永远不会）。
-    ``prev`` 携带上次的 mtime/block 做热重载判断。
+    ``block == ""`` 只在 ``max_entries=0`` 或**连内置默认都没有**时出现
+    （正常部署永远不会）。
+
+    ⚠️ **不做 mtime 缓存**（独立核验 N-1）：文件 mtime 走内核**粗时钟**，
+    实测同一刻度内的改写 `st_mtime_ns` **完全相同** → 任何"mtime 指纹"都会
+    返回**旧块**（新示例不可见，且不报错）。这与段文件那边（N7）是同一根因，
+    两条约定必须一致 —— 这个文件只有二十来条，每次现读比"缓存 + 偶发看不见"划算。
+    ``prev`` 参数保留只为兼容既有调用点（不再用于新鲜度判断）。
     """
     path = Path(path)
     try:
-        mt = path.stat().st_mtime_ns  # 纳秒：尽量察觉同尺寸改写
+        mt = path.stat().st_mtime_ns      # 仅作 state 记录/观测，不用于短路
     except OSError:
         mt = 0
-    if prev is not None and prev.mtime > 0 and mt > 0 and mt == prev.mtime:
-        return prev.block, prev
     lines: list[str] = []
     source = "bundled"
     if mt > 0:

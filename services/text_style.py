@@ -87,6 +87,10 @@ def split_media_annotations(text: str) -> tuple[str, list[str], list[str]]:
     return body, imgs, faces
 
 
+# ⚠️ `口癖丙` 属于**待清理项**：D21 已定它在提示词侧删除（实测风格源 0 次使用），
+# 草案 §7 与示例块里都已没有它 —— **提示词侧是干净的**。这里留着只是因为它进了
+# `cap_koupi()` 的封顶名单（永不匹配、无害）。归 **C8（口癖/点名率的硬控制）** 一起处理，
+# 免得被误当成 C1/C2 的残留。
 KOUPI_LIST = ("口癖己", "口癖庚", "口癖丁", "口癖丙", "口癖甲", "口癖戊", "口癖乙")
 KOUPI_MAX_TOTAL = 2
 

@@ -118,7 +118,13 @@ def main() -> int:
             for pid, text, topic in PROBES:
                 msgs = [{"role": "user", "content": text, "name": "小明"}]
                 if phase == "ON":
-                    block, _ = ex_mod.load_examples_block(ex_path)
+                    # N-5：把「用的是数据目录文件还是内置默认」也印出来 ——
+                    # 否则跑 A/B 的人看不出 ON 臂到底加载了哪一路（文件缺失时
+                    # 回落内置 20 条，A/B 结论的口径就不同了）。
+                    block, st = ex_mod.load_examples_block(ex_path)
+                    if rep == 0 and pid == PROBES[0][0]:
+                        print(f"[ON] 示例块来源={getattr(st, 'source', '?')} "
+                              f"条数={getattr(st, 'entries', '?')}")
                     if block:
                         msgs.append({"role": "system", "content": block})
                 msgs.append({"role": "system", "content": speaker_line("234567", "小明", True)})

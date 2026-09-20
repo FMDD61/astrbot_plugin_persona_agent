@@ -1,5 +1,7 @@
 {
-  "entries_sha256_12": "67ab8491be59",
+  "entries_sha256_12": "8514b92f93e2",
   "count": 20,
-  "note": "示例文案指纹（C1/C2）。有意改动请重跑 tools/gen_examples_default.py 并更新本文件。"
+  "note": "示例文案指纹（C1/C2）。有意改动请重跑 tools/gen_examples_default.py 并更新本文件。rendered_sha256_12 钉住渲染结果（_render 改动会触发）；emote_count 钉住 [emote:] 密度。",
+  "rendered_sha256_12": "7ad5dc9fdb79",
+  "emote_count": 9
 }
