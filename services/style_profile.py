@@ -413,9 +413,15 @@ class StyleProfile:
         """§3 的动态正文来源：`<data_dir>/memory_digest.json`（C4 产出）。
 
         文件不存在 → 空 dict → **§3 整段不出现**（而不是留一个空壳标题）。
+
+        N-5（独立核验第 6 轮）：把 `generated_at` 也读出来存到 `last_memory_generated_at`
+        —— **陈旧与新鲜在 §3 里长得一模一样**，没有这个字段就无法在自检里发现
+        「组装没跑成，用的还是昨天的摘要」。
         """
         path = self._dir / MEMORY_DIGEST_FILE
         self.last_memory_error = ""
+        self.last_memory_generated_at = ""
+        self.last_memory_layers_n = 0
         try:
             if not path.is_file():
                 return {}          # 没生成过：正常态（C4 落地前一直如此）
@@ -429,11 +435,13 @@ class StyleProfile:
             self.last_memory_error = f"顶层不是对象: {type(obj).__name__}"
             return {}
         layers = obj.get("layers") if isinstance(obj.get("layers"), dict) else obj
+        self.last_memory_generated_at = str(obj.get("generated_at") or "")
         out: dict[str, list[str]] = {}
         for key, _title in persona_mod.MEMORY_LAYERS:
             rows = layers.get(key)
             if isinstance(rows, (list, tuple)):
                 out[key] = [str(r) for r in rows if str(r).strip()]
+        self.last_memory_layers_n = sum(len(v) for v in out.values())
         return out
 
     def gate_system_prompt(self) -> str:

@@ -404,6 +404,16 @@ class PersonaAgent(Star):
         self._build_pipeline()
         logger.info("[persona_agent] pipeline ready (shared decision/generation path)")
 
+        # 🔴 C4 / 独立核验 B-1：启动时补一次 §3 组装。
+        # 覆盖「进程在 02:05 不在运行」这一大类（重启 / 部署 / 崩溃 / 昨天没开机）：
+        # 那时当天的 cron 没跑，日界由消息兜底路径换掉，而兜底路径以前不组装 →
+        # §3 会**停在昨天**（陈旧比空更糟：空看得见，陈旧看起来完全正常）。
+        # 这一步是幂等的纯读+写，且「内容没变就不落盘」（不会白造「设定更新」块）。
+        try:
+            self._rebuild_memory_digest(self._active_group_id())
+        except Exception as e:
+            logger.warning(f"[persona_agent] 启动时组装 memory digest 失败：{e}")
+
         # S5: 启动自检 —— 专门拦"配额类参数静默失效"（本轮 hourly_budget 时区
         # 错位就是这么藏了两周：预算恒为 0.34，行为看起来只是"它不主动说话"）。
         self._startup_selfcheck()
@@ -911,8 +921,18 @@ class PersonaAgent(Star):
             except Exception:
                 pass
         old_msgs = self.session_mgr.rotate_if_day_changed(group_id)
-        if old_msgs and self._diary_enabled:
-            asyncio.create_task(self._generate_diary(group_id, old_msgs))
+        if old_msgs:
+            # 🔴 独立核验 B-1（2026-09-20）：这是**第二条轮转路径**。
+            # 以前这里只 `create_task(日记)` —— 不发不组装；而它一旦先跑，
+            # 02:05 的 cron 就会因为「日界已换过」拿到 old_msgs=None →
+            # **整段组装被跳过**，新一天的 §3 停在**昨天**的内容上。
+            # 陈旧比空更糟：空是可见的，陈旧看起来完全正常。
+            # 现在两条路径合成同一个协程（日记 → 组装），且都走 wait_for 上界。
+            asyncio.create_task(self._rotate_followup(group_id, old_msgs))
+        else:
+            # 即使这次没换日（cron 已经换过），也确保 §3 是当天的：
+            # 进程可能在 02:05 不在运行（重启/部署/崩溃）→ 全靠这条兜底。
+            self._rebuild_memory_digest(group_id)
 
         alias = self.style.preferred_alias(sender_uin) or f"群友{sender_uin}"
         if alias.startswith("群友") and sender_uin and sender_uin != self.bot_qq:
@@ -1507,6 +1527,18 @@ class PersonaAgent(Star):
                     if pm.get("omitted"):
                         logger.info(
                             f"[selfcheck] 段按设计省略（内容为空）：{pm['omitted']}"
+                        )
+                    # N-5：§3 的**新鲜度**必须看得见 —— 陈旧与新鲜在正文里长得一样
+                    _gen = getattr(self.style, "last_memory_generated_at", "")
+                    _n = getattr(self.style, "last_memory_layers_n", 0)
+                    logger.info(
+                        f"[selfcheck] §3 历史群聊摘要：{_n} 行"
+                        + (f"，组装于 {_gen}" if _gen else "（memory_digest.json 不存在）")
+                    )
+                    if _gen and _gen[:10] < time.strftime("%Y-%m-%d", time.gmtime()):
+                        logger.warning(
+                            f"[selfcheck] ⚠️ §3 是**旧的**（组装于 {_gen}，不是今天）→ "
+                            f"检查 02:05 轮转的日记/组装那两步是否跑成"
                         )
                     if pm.get("memory_error"):
                         logger.warning(
@@ -2600,25 +2632,30 @@ class PersonaAgent(Star):
             old_msgs = self.session_mgr.rotate_if_day_changed(gid)
             if old_msgs:
                 logger.info(f"[persona_agent] daily rotation: group={gid} msgs={len(old_msgs)}")
-                if self._diary_enabled:
-                    # 🔴 C23-b / C4（2026-09-20）：**先总结、后组装**。
-                    # 这里以前是 `asyncio.create_task(...)`（发出去就不管）——
-                    # 于是新一天的 §3「历史群聊摘要」可能在日记落盘**之前**就被组装，
-                    # 长期记忆里永远缺最近一天/一周/一月/一年。
-                    # 睡眠窗 02:00–07:00 足够大（实测零调用），await 是安全的；
-                    # 而且它必须在**当日首次 RP 调用之前**完成 —— 那才是冻结时刻。
-                    # ⚠️ 给一个上界（5 分钟）：日记 LLM 若卡死，不能让**整天**的 §3
-                    # 都组装不出来 —— 超时就跳过总结、照常组装（有内容就装配）。
-                    try:
-                        await asyncio.wait_for(
-                            self._generate_diary(gid, old_msgs), timeout=300)
-                    except asyncio.TimeoutError:
-                        logger.warning("[persona_agent] 日记生成超时 300s（跳过，继续组装）")
-                    except Exception as e:
-                        logger.warning(f"[persona_agent] 日记生成失败（继续组装）：{e}")
-                # C4：总结完了再**动态组装**「历史群聊摘要」→ memory_digest.json。
-                # 组装失败的后果是 §3 整段不出现（不是静默：自检与 manifest 都看得见）。
-                self._rebuild_memory_digest(gid)
+            # 🔴 C23-b / C4：**先总结、后组装**，且两条轮转路径（这里与消息兜底）
+            # **共用同一个协程** —— 独立核验 B-1 的教训：这段逻辑曾被复制成两份，
+            # 只有一份接了组装，另一份把新一天的 §3 留在**昨天**（陈旧比空更糟）。
+            # 组装**无条件**执行（`_rotate_followup` 内部自己判要不要生成日记）。
+            await self._rotate_followup(gid, old_msgs or [])
+
+    async def _rotate_followup(self, group_id: str, old_msgs: list) -> None:
+        """轮转后的「总结 → 组装」—— 两条轮转路径（cron 与消息兜底）共用。
+
+        🔴 独立核验 B-1：以前消息兜底路径只 `create_task(日记)`，不发不组装；
+        而它一旦先换掉日界，02:05 的 cron 就会拿到 `old_msgs=None`，
+        把组装整段跳过 → 新一天的 §3 停在**昨天**（陈旧比空更糟：空看得见）。
+        现在两条路走同一个协程。
+        """
+        if old_msgs and self._diary_enabled:
+            try:
+                # 上界 5 分钟：日记 LLM 卡死时不能拖住组装（有内容就装配）
+                await asyncio.wait_for(
+                    self._generate_diary(group_id, old_msgs), timeout=300)
+            except asyncio.TimeoutError:
+                logger.warning("[persona_agent] 日记生成超时 300s（跳过，继续组装）")
+            except Exception as e:
+                logger.warning(f"[persona_agent] 日记生成失败（继续组装）：{e}")
+        self._rebuild_memory_digest(group_id)
 
     def _rebuild_memory_digest(self, group_id: str) -> None:
         """组装并落盘 `<data_dir>/memory_digest.json`（C4 的"组装"那一步）。

@@ -223,19 +223,32 @@ if __name__ == "__main__":
 class TestRotationOrderC4(unittest.TestCase):
     """🔴 C23-b / C4：轮转必须**先总结、后组装**（`summary_v2.md` §4.3 的时序）。
 
-    旧实现是 `asyncio.create_task(self._generate_diary(...))` —— **发出去就不管**，
-    于是新一天的 §3「历史群聊摘要」可能在日记落盘**之前**就被组装 →
-    长期记忆里永远缺最近一天/一周/一月/一年（而表现只是「它记性不太好」）。
+    两代缺陷、两种判据：
 
-    `main.py` 不被测试导入（依赖 astrbot 运行时），所以这里用 AST 静态查**顺序**。
+    1. **fire-and-forget**：`create_task(日记)` 发出去就不管 → 组装可能跑在总结之前；
+    2. **只改了一条路径**（独立核验第 6 轮 B-1，**阻塞**）：轮转有**两条**入口
+       （02:05 cron 与消息兜底），当时只给 cron 接了组装，而且兜底路径一先换日界，
+       cron 就拿到 `old_msgs=None` → **组装被整段跳过** → §3 停在**昨天**。
+       陈旧比空更糟：空是可见的，陈旧看起来完全正常。
+
+    ⚠️ 所以判据**不能只看某一个函数名**（第一版就是这么漏掉 B-1 的）：
+    这里扫**全文件** —— 每个 `rotate_if_day_changed` 调用点都必须通向组装。
+
+    `main.py` 不被测试导入（依赖 astrbot 运行时），所以用 AST 静态查。
     """
 
     SRC = REPO / "main.py"
 
+    def _tree(self):
+        return ast.parse(self.SRC.read_text(encoding="utf-8"), filename=str(self.SRC))
+
+    def _fns(self):
+        return [n for n in ast.walk(self._tree())
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
     def _fn(self, name):
-        tree = ast.parse(self.SRC.read_text(encoding="utf-8"), filename=str(self.SRC))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == name:
+        for node in self._fns():
+            if node.name == name:
                 return node
         self.fail(f"{name} 不见了")
 
@@ -243,21 +256,39 @@ class TestRotationOrderC4(unittest.TestCase):
         return [(n.lineno, n.func.attr) for n in ast.walk(node)
                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
 
-    def test_diary_is_awaited_not_fire_and_forget(self):
-        fn = self._fn("_daily_rotation_job")
-        src = ast.get_source_segment(self.SRC.read_text(encoding="utf-8"), fn) or ""
-        self.assertIn("await asyncio.wait_for", src,
-                      "日记必须被 await（有上界），不能 create_task 发出去就不管")
-        self.assertNotIn("create_task(self._generate_diary", src.replace(" ", ""),
-                         "不许再回到 fire-and-forget 的写法")
+    def _src(self, node):
+        return ast.get_source_segment(self.SRC.read_text(encoding="utf-8"), node) or ""
 
-    def test_digest_is_rebuilt_after_the_diary(self):
-        calls = self._calls(self._fn("_daily_rotation_job"))
+    def test_no_fire_and_forget_diary_anywhere(self):
+        """全文件禁 `create_task(self._generate_diary`（两条路径都算）。"""
+        whole = self.SRC.read_text(encoding="utf-8").replace(" ", "")
+        self.assertNotIn("create_task(self._generate_diary", whole,
+                         "日记不许再 fire-and-forget —— 组装会跑在总结之前")
+
+    def test_followup_awaits_then_rebuilds(self):
+        """共用的那个协程：先 await 日记（有上界），再组装。"""
+        src = self._src(self._fn("_rotate_followup"))
+        self.assertIn("await asyncio.wait_for", src, "日记必须被 await（带超时上界）")
+        calls = self._calls(self._fn("_rotate_followup"))
         diary = [ln for ln, name in calls if name == "_generate_diary"]
         digest = [ln for ln, name in calls if name == "_rebuild_memory_digest"]
-        self.assertTrue(diary, "轮转里必须生成日记")
-        self.assertTrue(digest, "轮转里必须组装 memory digest")
+        self.assertTrue(diary and digest, "总结与组装都要在")
         self.assertGreater(min(digest), max(diary), "组装必须在总结之后")
+
+    def test_every_rotation_path_leads_to_digest(self):
+        """🔴 B-1 的正面判据：**每个**换日界的地方都必须通向组装。"""
+        found = 0
+        for fn in self._fns():
+            names = [name for _ln, name in self._calls(fn)]
+            if "rotate_if_day_changed" not in names:
+                continue
+            found += 1
+            src = self._src(fn)
+            self.assertTrue(
+                "_rotate_followup" in src or "_rebuild_memory_digest" in src,
+                f"{fn.name} 换了日界却没通向组装（§3 会停在昨天）",
+            )
+        self.assertGreaterEqual(found, 2, "轮转路径应有两条（cron + 消息兜底）")
 
     def test_period_summary_rebuilds_digest(self):
         names = [name for _ln, name in self._calls(self._fn("_period_summary"))]

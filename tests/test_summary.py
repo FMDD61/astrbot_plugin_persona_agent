@@ -420,3 +420,62 @@ class TestDigestLayers(unittest.TestCase):
         sp = StyleProfile(self.td.name)
         self.assertEqual(sp.memory_layers().get("recent_days"), ["09-20 今天"])
         self.assertIn("09-20 今天", sp.system_prompt())
+
+
+class TestDigestHardening(unittest.TestCase):
+    """独立核验第 6 轮的非阻塞项（N-1 / N-3 / N-5）。"""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        d = Path(self.td.name) / "logs" / "g1"
+        d.mkdir(parents=True)
+        (d / "daily_diary.jsonl").write_text(
+            json.dumps({"day": "2026-09-20", "group_id": "g1", "digest": "今天"},
+                       ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def test_unchanged_layers_do_not_rewrite_file(self):
+        """N-1：内容没变就不落盘 —— 否则白造一次「［设定更新］」块。"""
+        from services.summary import write_memory_digest
+        p = Path(self.td.name) / "memory_digest.json"
+        write_memory_digest(self.td.name, "g1")
+        first = p.read_text(encoding="utf-8")
+        res = write_memory_digest(self.td.name, "g1")
+        self.assertTrue(res.get("unchanged"), "第二次必须识别为未变化")
+        self.assertEqual(p.read_text(encoding="utf-8"), first, "文件不该被重写")
+        # 内容真变了就要写
+        d = Path(self.td.name) / "logs" / "g1" / "daily_diary.jsonl"
+        with open(d, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"day": "2026-09-21", "group_id": "g1",
+                                "digest": "新的一天"}, ensure_ascii=False) + "\n")
+        res2 = write_memory_digest(self.td.name, "g1")
+        self.assertFalse(res2.get("unchanged"))
+        self.assertIn("新的一天", p.read_text(encoding="utf-8"))
+
+    def test_bad_period_is_skipped_and_counted(self):
+        """N-3：period/day 非法时**不进 §3**（此前会原样漏成一行垃圾）。"""
+        from services.summary import build_digest_layers
+        (Path(self.td.name) / "weekly_summary.jsonl").write_text(
+            json.dumps({"kind": "weekly", "group_id": "g1",
+                        "period": "坏-W w坏", "digest": "x"}, ensure_ascii=False) + "\n",
+            encoding="utf-8")
+        with open(Path(self.td.name) / "logs" / "g1" / "daily_diary.jsonl", "a",
+                  encoding="utf-8") as f:
+            f.write(json.dumps({"day": "不是日期", "group_id": "g1", "digest": "y"},
+                               ensure_ascii=False) + "\n")
+        res = build_digest_layers(self.td.name, "g1")
+        self.assertEqual(res["layers"]["recent_weeks"], [])
+        self.assertNotIn("不是日期", "\n".join(res["layers"]["recent_days"]))
+        self.assertGreaterEqual(res["stats"].get("skipped_bad_period", 0), 2)
+
+    def test_staleness_is_observable(self):
+        """N-5：读侧要能报出「这版 §3 是什么时候组装的」。"""
+        from services.summary import write_memory_digest
+        from services.style_profile import StyleProfile
+        write_memory_digest(self.td.name, "g1")
+        sp = StyleProfile(self.td.name)
+        sp.memory_layers()
+        self.assertTrue(sp.last_memory_generated_at, "generated_at 必须被读出来")
+        self.assertEqual(sp.last_memory_layers_n, 1)

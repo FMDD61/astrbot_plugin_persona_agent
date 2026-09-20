@@ -480,13 +480,19 @@ def build_digest_layers(data_dir: "str | Path", group_id: str,
                 if _parse_day(r["period"]) is not None
                 and _parse_day(r["period"]) > w_end]
 
-    def _fmt(rows: list[dict], limit: int, label_fn) -> list[str]:
+    def _fmt(rows: list[dict], limit: int, label_fn, valid=None) -> list[str]:
         kept = rows[-limit:] if limit else []
         out: list[str] = []
         skipped = 0
         for r in kept:
             if not r["digest"]:
                 skipped += 1
+                continue
+            # N-3（独立核验第 6 轮）：`period`/`day` 非法时**不抛**，但会原样漏进 §3
+            # （实测出现过 `坏-W w坏-W` 这种行）。模型看到的是一行垃圾，而我们不知道。
+            # 判据：这一层的边界解析函数能不能解析它。
+            if valid is not None and valid(r["period"]) is None:
+                stats["skipped_bad_period"] = stats.get("skipped_bad_period", 0) + 1
                 continue
             out.append(f"{label_fn(r['period'])} {r['digest']}")
         if skipped:
@@ -495,10 +501,13 @@ def build_digest_layers(data_dir: "str | Path", group_id: str,
 
     layers = {
         "recent_days": _fmt(_keep_days(), caps["recent_days"],
-                            lambda p: p[5:] if len(p) >= 10 else p),        # 09-17
-        "recent_weeks": _fmt(_keep_weeks(), caps["recent_weeks"], lambda p: p),
-        "recent_months": _fmt(_keep_months(), caps["recent_months"], lambda p: p),
-        "older": _fmt(yearlies, caps["older"], lambda p: p),
+                            lambda p: p[5:] if len(p) >= 10 else p,      # 09-17
+                            valid=_parse_day),
+        "recent_weeks": _fmt(_keep_weeks(), caps["recent_weeks"], lambda p: p,
+                             valid=_week_end),
+        "recent_months": _fmt(_keep_months(), caps["recent_months"], lambda p: p,
+                              valid=_month_end),
+        "older": _fmt(yearlies, caps["older"], lambda p: p, valid=_year_end),
     }
     stats["counts"] = {k: len(v) for k, v in layers.items() if v}
     stats["total_lines"] = sum(len(v) for v in layers.values())
@@ -525,6 +534,19 @@ def write_memory_digest(data_dir: "str | Path", group_id: str) -> dict:
     res["generated_at"] = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
     res["group_id"] = str(group_id)
     p = Path(data_dir) / "memory_digest.json"
+    # N-1（独立核验第 6 轮）：**内容没变就不落盘**。
+    # 为什么重要：人格文本一变，`sync_system_prompt` 会走 `update` 把**新版全文**
+    # 追加到会话尾部。若组装只是刷新时间戳也写文件，就会白造一次"设定更新"块。
+    # 判据只比 `layers`（`generated_at` 每次都不同，不能参与比对）。
+    try:
+        if p.is_file():
+            old = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(old, dict) and old.get("layers") == res["layers"]:
+                res["unchanged"] = True
+                res["generated_at"] = str(old.get("generated_at") or res["generated_at"])
+                return res
+    except (OSError, json.JSONDecodeError):
+        pass          # 旧文件坏了/读不动 → 照写（自愈）
     tmp = p.with_suffix(p.suffix + ".tmp")
     try:
         tmp.write_text(json.dumps(res, ensure_ascii=False, indent=2) + "\n",
