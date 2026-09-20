@@ -131,6 +131,7 @@ def _pipeline(**over):
         temperature_for=lambda trig: 0.8,
         turn_block=over.get("turn_block", None),
         session_append=over.get("session_append", None),
+        kg_display=bool(over.get("kg_display", False)),
         debounce_sec=0.0,
         rag_enabled=over.get("rag_enabled", True),
     )
@@ -388,7 +389,9 @@ class TestRagEnabled(unittest.TestCase):
                 received["ext"] = external_dense_hits
                 return None
 
-        p = _pipeline(rag=rag, kg=FakeKG())
+        # D42/C16：展示默认关（此时 KG 根本不查）→ 本用例测"展示时的单次复用"，
+        # 显式打开开关。
+        p = _pipeline(rag=rag, kg=FakeKG(), kg_display=True)
         si = _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
         self.assertEqual(rag.calls, 1)              # \u53ea\u67e5\u4e00\u6b21
         # \u5168\u91cf\u4f20\u7ed9 KG\uff08\u4e0d\u662f\u622a\u65ad\u7684 top3\uff09
@@ -516,7 +519,9 @@ class TestTurnBlockS2(unittest.TestCase):
             captured["ctx"] = list(c)
             return _async("好")
 
-        p = _pipeline(turn_block=tb, kg=_Kg(), generate=gen)
+        # D42（C16）后 KG 尾注默认不展示 —— 本用例测的是**展示时的缓存序**，
+        # 所以显式打开开关（生产默认 kg_display=False）。
+        p = _pipeline(turn_block=tb, kg=_Kg(), generate=gen, kg_display=True)
         _run(p.run(PipelineInput("g1", "你好", False, "1", "甲")))
         ctx = captured["ctx"]
         self.assertEqual(ctx[-1]["content"], "KG尾注内容")          # KG 仍最后
@@ -1401,3 +1406,182 @@ class TestGenerationTraceS28(unittest.TestCase):
         self.assertNotIn("llm_error", intent.trace)
         self.assertEqual(intent.trace.get("raw_generation"), "好呀")
 
+
+
+class TestKgRagDisplayRemovedC16(unittest.TestCase):
+    """🔴 D42 / C16：KG/RAG 块的展示从 RP 与 Gate 双双删除。
+
+    设计（docs/specs/prompt_v2_rp.md §13.7 / §13.8）：
+
+    * RP 不拼 kg_content，且**跳过 kg_provider.query()**（省一次 BM25+entity 融合）；
+    * Gate 不再收 rag_hits；
+    * **硬闸的 top_rag_score 不动** —— 参与量杠杆仍由 rag.score_threshold 控制；
+    * trace["kg_tail"] **必须保留**（写"已禁用"也算留痕）—— §13.8③ 点名要求。
+    """
+
+    class _CountingKg:
+        def __init__(self):
+            self.calls = 0
+
+        async def query(self, ctx, external_dense_hits=None):
+            self.calls += 1
+
+            class R:
+                content = "KG尾注内容"
+            return R()
+
+    class _SpyGate:
+        def __init__(self):
+            self.seen = {}
+
+        async def decide(self, group_id, recent, speaker, text, rag_hits=None,
+                         is_at=False, contexts=None):
+            from services.gate import GateDecision
+            self.seen["rag_hits"] = rag_hits
+            return GateDecision(reply=True, reason="ok")
+
+    def test_kg_query_is_skipped_by_default(self):
+        kg = self._CountingKg()
+        p = _pipeline(rag=_FakeRag([{"document": "h1", "score": 0.9}]), kg=kg)
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+        self.assertEqual(kg.calls, 0, "D42：展示关闭时不得再查 KG（省一次融合）")
+        self.assertFalse(si.trace.get("kg_display"))
+        self.assertEqual(si.trace.get("kg_tail"), "（已禁用：D42 KG/RAG 展示移除）")
+
+    def test_kg_query_still_runs_when_display_on(self):
+        """回退面必须真的通：开关打开 → KG 照查、尾注照进上下文。"""
+        kg = self._CountingKg()
+        captured = {}
+
+        def gen(t, c, e, temp, su, umo):
+            captured["ctx"] = list(c)
+            return _async("好")
+
+        p = _pipeline(rag=_FakeRag([{"document": "h1", "score": 0.9}]), kg=kg,
+                      generate=gen, kg_display=True)
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+        self.assertEqual(kg.calls, 1)
+        self.assertTrue(si.trace.get("kg_display"))
+        self.assertEqual(si.trace.get("kg_tail"), "KG尾注内容")
+        joined = "\n".join(str(m.get("content")) for m in captured["ctx"])
+        self.assertIn("KG尾注内容", joined)
+
+    def test_hard_gate_still_uses_top_rag_score(self):
+        """展示删了，硬闸的分数与触发**不受影响**（参与量杠杆不动）。"""
+        seen = {}
+
+        class _Rec(_FakeInterjection):
+            def decide(self, **kw):
+                seen.update(kw)
+                return super().decide(**kw)
+
+        p = _pipeline(rag=_FakeRag([{"document": "h1", "score": 0.81}]),
+                      interjection=_Rec())
+        _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+        self.assertAlmostEqual(seen.get("top_rag_score"), 0.81, places=6)
+
+    def test_gate_receives_no_rag_hits_by_default(self):
+        gate = self._SpyGate()
+        p = _pipeline(rag=_FakeRag([{"document": "h1", "score": 0.9}]), gate=gate)
+        _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+        self.assertIsNone(gate.seen.get("rag_hits"), "D42：Gate 不再收风格片段")
+
+    def test_gate_gets_hits_when_display_on(self):
+        gate = self._SpyGate()
+        p = _pipeline(rag=_FakeRag([{"document": "h1", "score": 0.9}]), gate=gate,
+                      kg_display=True)
+        _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+        self.assertEqual(len(gate.seen.get("rag_hits") or []), 1)
+
+    def test_display_switch_defaults_off_in_schema(self):
+        """配置默认必须是 0（D42 已定），否则线上还是老行为。"""
+        import json as _json, os as _os
+        here = _os.path.dirname(_os.path.abspath(__file__))
+        with open(_os.path.join(here, "..", "_conf_schema.json"), encoding="utf-8") as f:
+            schema = _json.load(f)
+        self.assertEqual(schema["rag"]["items"]["display_enabled"]["default"], 0)
+
+
+class TestTaggedQuoteC17(unittest.TestCase):
+    """🔴 C17 / D37 / D40 / D43：引用改"打标制"。
+
+    旧制：模型写 `[r:-N]`，**自己数**第几条 —— 编号错位是 B-001 那一族缺陷的根。
+    新制：硬闸放行的那条消息**在 PHI 里就是【现在要回应的】那一行**，模型只写 `[r]`
+    （不带 N），引用 id 由代码给出。
+
+    三条设计约束（docs/specs/rp_section8_draft_v1.md §C）：
+      ① 硬闸放行时记下该条消息 id，一路带到本轮；
+      ② 模型写了 `[r]` → 直接用那个 id 引用，不再解析 -N；
+      ③ 异常路径下没有 id → **静默退化为不引用**（标记仍必须剥离）。
+    """
+
+    def _gen(self, reply):
+        return lambda t, c, e, temp, su, umo: _async(reply)
+
+    def test_bare_marker_quotes_the_tagged_message(self):
+        p = _pipeline(generate=self._gen("[r] 对呀"))
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "甲",
+                                      message_id="MID-TAGGED")))
+        self.assertEqual(si.text, "对呀", "标记必须剥离（泄漏到群里就是乱码）")
+        self.assertEqual(si.quote_id, "MID-TAGGED")
+        self.assertEqual(si.trace.get("quote_mode"), "tagged")
+        self.assertTrue(si.trace.get("quote_resolved"))
+        self.assertEqual(si.trace.get("quote_tagged_id"), "MID-TAGGED")
+
+    def test_no_marker_means_no_quote(self):
+        p = _pipeline(generate=self._gen("对呀"))
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "甲",
+                                      message_id="MID-TAGGED")))
+        self.assertIsNone(si.quote_id)
+        self.assertIsNone(si.trace.get("quote_mode"))
+
+    def test_no_id_degrades_silently_but_visibly(self):
+        """设计③：拿不到 id → 不引用；但 trace 必须留下"为什么没引用"。"""
+        p = _pipeline(generate=self._gen("[r] 对呀"))
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "甲")))
+        self.assertEqual(si.text, "对呀")
+        self.assertIsNone(si.quote_id)
+        self.assertEqual(si.trace.get("quote_mode"), "tagged")
+        self.assertFalse(si.trace.get("quote_resolved"))
+        self.assertTrue(si.trace.get("quote_target_missing"))
+
+    def test_falls_back_to_pending_append_message_id(self):
+        """离线/旧接线不传 message_id → 用 main 挂起槽里的那条 id。"""
+        p = _pipeline(generate=self._gen("[r] 好"),
+                      session_append=lambda *a: None)
+        p.defer_session_append("g1", "你好", name="甲", message_id="MID-PEND",
+                               sender_uin="1")
+        si = _run(p.run(PipelineInput("g1", "你好", False, "1", "甲")))
+        self.assertEqual(si.quote_id, "MID-PEND")
+
+    def test_index_mode_still_works(self):
+        """回退面：旧文案教的是 `[r:-N]`，不能因为上新制就把老路砍了。"""
+        from services.context_buffer import ContextBuffer
+        import tempfile
+        buf = ContextBuffer(tempfile.mkdtemp(), max_messages=50)
+        buf.add(ts=100.0, group_id="g1", sender_id="1", sender_name="小红",
+                text="原消息", message_id="msg-42", message_type="group")
+        p = _pipeline(buffer=buf, generate=self._gen("[r:-1] 对呀"))
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+        self.assertEqual(si.quote_id, "msg-42")
+        self.assertEqual(si.trace.get("quote_mode"), "index")
+        self.assertEqual(si.trace.get("quote_n"), 1)
+
+    def test_bare_marker_stripped_by_real_postprocess(self):
+        """裸 `[r]` 也在剥离表里（此前 RE_REPLY_MARKER 只认 `[r:`）。"""
+        from services import text_style
+        self.assertNotIn("[r]", text_style.postprocess("[r] 你好"))
+        self.assertNotIn("[r]", text_style.postprocess("你好 [r]"))
+        p = _pipeline(generate=self._gen("[r] 你好"),
+                      postprocess=text_style.postprocess)
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "甲",
+                                      message_id="M1")))
+        self.assertEqual(si.text, "你好")
+        self.assertEqual(si.quote_id, "M1")
+
+    def test_marker_not_at_start_is_not_treated_as_quote(self):
+        """只有行首的标记才算引用（与旧制一致，避免正文里的 `[r]` 被吃掉）。"""
+        p = _pipeline(generate=self._gen("我觉得 [r] 可以"))
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "甲",
+                                      message_id="M1")))
+        self.assertIsNone(si.quote_id)

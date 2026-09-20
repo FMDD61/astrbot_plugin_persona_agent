@@ -50,6 +50,10 @@ class PipelineInput:
     sender_uin: str
     sender_alias: str
     umo: str = ""             # unified_msg_origin（provider 解析用；离线测试可空）
+    # C17/D37 打标制：本条消息的 OneBot message_id。模型写 [r] 时直接用它引用
+    # —— "引用哪一条"从"模型数数"变成"代码给 id"。
+    # 留空时回退到 defer_session_append 挂起槽里的 id（离线测试台兼容）。
+    message_id: str = ""
 
 
 @dataclass
@@ -110,6 +114,11 @@ class PersonaPipeline:
         debounce_sec: float = 0.5,
         max_generation_tries: int = 1,
         rag_enabled: bool = True,
+        # D42（2026-09-19）：KG/RAG 块的**展示**默认关闭 —— 硬闸的 top_rag_score
+        # 照旧参与触发判定，但检索结果不再拼进 RP / Gate 的上下文。
+        # 保留开关是为了能归因：这段时间同时在重写整个提示词，删了展示若质量下降，
+        # 没有开关就分不清是哪一批改动的锅（prompt_v2_rp.md §13.8③）。
+        kg_display: bool = False,
         now_utc_fn: Optional[Callable[[], float]] = None,
         # S2: 推迟的会话追加。main 在收到消息时调用 `defer_session_append()`
         # 把本条挂起，pipeline 在**决策完成后、生成前**真正写入 session。
@@ -149,6 +158,8 @@ class PersonaPipeline:
         # A7③: RAG/BGE 总开关。0 时完全不查向量库（决策无分数、Gate 无参考、
         # KG 走退化分支）。与 KGProvider.dense_enabled 联动（main 构造时同源）。
         self.rag_enabled = bool(rag_enabled)
+        #: D42：KG/RAG 块是否进上下文（默认否）。**不影响硬闸的 top_rag_score。**
+        self._kg_display = bool(kg_display)
         # A7④: 时钟注入（离线重放按场景时刻决策；缺省真实时钟）
         self._now_utc = now_utc_fn or time.time
 
@@ -358,6 +369,16 @@ class PersonaPipeline:
         text = inp.text
         alias = inp.sender_alias or f"群友{inp.sender_uin}"
 
+        # ---- C17 / D37 / D43 打标制：记下"通过硬闸的这一条"的消息 id ----
+        # 它就是 PHI 里【现在要回应的】那一行；模型写 [r] 时直接引用它，
+        # 不再解析 -N（模型不再数数 → B-001 那一族编号错位从根上消失）。
+        # 兜底来源是 main 挂起的落盘条目（离线测试台不传 message_id）。
+        tagged_mid = str(getattr(inp, "message_id", "") or "")
+        if not tagged_mid:
+            _pend = self._pending_append.get(str(group_id))
+            if _pend:
+                tagged_mid = str(_pend[2] or "")
+
         # ---- live context (buffer may be None in offline mode) ----
         live_ctx = ""
         if self.buffer is not None:
@@ -485,7 +506,9 @@ class PersonaPipeline:
                     recent,
                     alias,
                     text,
-                    rag_hits=hits if hits else None,
+                    # D42（C16）：风格片段不再注入 Gate —— 它只有裸回复、无情境
+                    # （B-039），且中位分 0.40、94% 在 0.6 以下。开关：kg_display。
+                    rag_hits=(hits if (hits and self._kg_display) else None),
                     is_at=inp.is_at,
                     # S4：共享上下文 —— Gate 与 RP 看到逐字节相同的前缀
                     # （人格 + 示例 + session + KG）。此前 Gate 只有 740 字符
@@ -530,8 +553,18 @@ class PersonaPipeline:
             return SendIntent(action="topic", trace=trace)
 
         # ---- KG（A7③：外部传入 dense hits → KG 不自查，单次检索复用）----
+        # 🔴 D42（C16）：KG/RAG 块的展示已删 —— RP 不再拼 kg_content，且**跳过
+        # kg_provider.query()**（省一次 BM25+entity 融合）。
+        # ⚠️ 硬闸的 top_rag_score（上面那次 BGE 检索）**不动** —— 参与量的杠杆
+        # 仍由 rag.score_threshold 控制，只是判断依据不再给模型看。
+        # 降级必须可见：kg_tail **保留**，写"已禁用"也算留痕（§13.8③）。
         kg_content = ""
-        if self.kg_provider is not None:
+        if not self._kg_display:
+            trace["kg_display"] = False
+            trace["kg_tail"] = (
+                "（已禁用：D42 KG/RAG 展示移除）" if self.kg_provider is not None else ""
+            )
+        elif self.kg_provider is not None:
             try:
                 recent = (
                     self.session_mgr.recent(group_id, n=20)
@@ -552,7 +585,8 @@ class PersonaPipeline:
                 kg_content = kg_result.content if kg_result else ""
             except Exception as e:
                 trace["kg_error"] = f"{type(e).__name__}: {e}"
-        trace["kg_tail"] = kg_content[:400]
+            trace["kg_display"] = True
+            trace["kg_tail"] = kg_content[:400]
 
         # ---- 上下文装配（S4：RP 与 Gate **共用同一份**）----
         base_contexts = self._assemble_base(group_id, kg_content)
@@ -707,19 +741,35 @@ class PersonaPipeline:
             )
         trace["raw_generation"] = reply_text[:500]
 
-        # ---- quote extract (BEFORE postprocess: postprocess strips [r:-N]) ----
-        # B-001: 对**生成前冻结的** QuoteIndex 求值（编号基 = LLM 当时所见），
-        # 而不是对实时 buffer —— 后者会因生成窗口内新到的消息整体偏移。
+        # ---- quote extract (BEFORE postprocess: postprocess strips the marker) ----
+        # 两条路：
+        #   * 打标制（C17/D37/D43）：模型写 `[r]` → 直接用**硬闸放行的那条**的 id，
+        #     不解析 N。模型不再数数 → B-001 那一族编号错位从根上消失。
+        #   * 编号制（旧文案）：`[r:-N]` → 对**生成前冻结的** QuoteIndex 求值
+        #     （编号基 = LLM 当时所见），而不是对实时 buffer —— 后者会因生成窗口
+        #     内新到的消息整体偏移（B-001）。回退到 legacy 人格文案时走这条。
         quote_n: Optional[int] = None
         quote_id: Optional[str] = None
         quote_alias = ""
         quote_uin = ""
         quote_basis: Optional[int] = None
+        quote_mode = ""
         body_text = reply_text
         try:
-            body_text_no_q, qn = text_style.extract_quote(reply_text)
+            quote_meta: dict = {}
+            body_text_no_q, qn = text_style.extract_quote(reply_text, quote_meta)
             quote_n = qn
-            if qn is not None:
+            if quote_meta.get("bare"):
+                quote_mode = "tagged"
+                # ★ 标记必须剥离 —— 泄漏到群里就是乱码（B-012 的教训）。
+                body_text = body_text_no_q
+                if tagged_mid:
+                    quote_id = tagged_mid
+                # 无 id（异常路径 / 离线测试台）→ **静默退化为不引用**（设计③）。
+                # 这里只在 trace 留痕，不报错：模型已经决定了"要引"，
+                # 拿不到 id 是我们的输入不全，不该让整条回复失败。
+            elif qn is not None:
+                quote_mode = "index"
                 if quote_index is not None:
                     quote_basis = len(quote_index)
                     hit = quote_index.resolve(qn)
@@ -730,21 +780,26 @@ class PersonaPipeline:
                 elif self.buffer is not None:
                     # 退化：session 未接线（离线单测 / 无 session 场景）
                     quote_id = self.buffer.quote_target(qn)
-            # ★ 无论是否解析出目标，标记都必须剥离 —— 泄漏到群里就是乱码。
-            #   （此前只在 quote_id 非空时剥离，解析失败会把 [r:-N] 原样发出；
-            #   实测线上真的发生过，见 data_out/snowluma_quote_chain_verified_with_bug.md）
-            if quote_n is not None:
+                # ★ 无论是否解析出目标，标记都必须剥离。
+                #   （此前只在 quote_id 非空时剥离，解析失败会把 [r:-N] 原样发出；
+                #   实测线上真的发生过，见 data_out/snowluma_quote_chain_verified_with_bug.md）
                 body_text = body_text_no_q
         except Exception as e:
             trace["quote_error"] = f"{type(e).__name__}: {e}"
 
         # B-001 审计字段：此前 trace 没有 quote 字段，导致 2026-09-13 那次错位
         # 排查只能靠人工比对 SnowLuma 日志。有了这几列即可直读 + 统计错位率。
-        if quote_n is not None:
-            trace["quote_n"] = quote_n
+        # C17 新增 quote_mode / quote_tagged_id：区分"打标"与"编号"两条路，
+        # 并记下打标的那个 id —— 否则"没引用"与"拿不到 id"在日志上不可区分。
+        if quote_mode:
+            trace["quote_mode"] = quote_mode
+            if tagged_mid:
+                trace["quote_tagged_id"] = tagged_mid
             trace["quote_id"] = quote_id
             trace["quote_resolved"] = bool(quote_id)
-            trace["quote_basis"] = quote_basis
+            if quote_mode == "index":
+                trace["quote_n"] = quote_n
+                trace["quote_basis"] = quote_basis
             if quote_id:
                 trace["quote_target_alias"] = quote_alias
                 trace["quote_target_uin"] = quote_uin

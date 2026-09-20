@@ -31,10 +31,17 @@ RE_PAREN_META = re.compile(
     r")"
     r"\s*[）)]"
 )
-RE_REPLY_MARKER = re.compile(r"\[(?:回复|r:)[^\]]*\]")
+RE_REPLY_MARKER = re.compile(r"\[(?:回复|r:)[^\]]*\]|\[r\]")
 # AstrBot message_str renders media as [图片: <file>] / [ComponentType.X] etc.
 RE_ASTRBOT_MARKER = re.compile(r"\[(?:图片|表情|ComponentType\.[A-Za-z]+)[^\]]*\]")
-RE_QUOTE_MARK = re.compile(r"^\s*\[r:\s*(-?\d+)\]\s*")
+# 引用标记：**两种形态**
+#   * `[r:-N]` —— 旧"编号制"（模型自己数第几条）；
+#   * `[r]`    —— 新"打标制"（C17/D37/D40/D43）：模型只说"要引"，
+#                 引用对象 = 硬闸放行的那条（PHI 的【现在要回应的】行），
+#                 id 由代码给出 —— 模型不再数数，B-001 那一族缺陷从根上消失。
+# 保留旧形态：人格文案可用 `persona.sections_mode=legacy` 整体回退，
+# 旧文案教的是 `[r:-N]`，两条路都要能走。
+RE_QUOTE_MARK = re.compile(r"^\s*\[r(?::\s*(-?\d+))?\]\s*")
 # 工具意图标记（spec §4.3）。**先有剥离规则，才敢把协议教给模型** —— 否则
 # 模型学会 [emote:...] 的那一天，标记会被原样发进群里。S3 实现执行器前
 # 这里就先兜住（当前提示词还没教，属预防性收口）。
@@ -136,20 +143,38 @@ def extract_tool_intents(text: str) -> tuple[str, Optional[str], Optional[str]]:
     return body, emote, poke
 
 
-def extract_quote(text: str) -> tuple[str, Optional[int]]:
-    """Extract a leading [r:-N] quote marker from the raw LLM output.
+def extract_quote(text: str, meta: Optional[dict] = None) -> tuple[str, Optional[int]]:
+    """Extract a leading `[r]` / `[r:-N]` quote marker from the raw LLM output.
 
-    Returns (clean_text, n_or_None). n=1 means the newest buffered message.
+    Returns ``(clean_text, n_or_None)``. ``n=1`` means the newest buffered
+    message（旧"编号制"）。
+
+    **打标制（C17/D37）**：模型只写 ``[r]``（不带 N）时 ``n`` 返回 ``None``，
+    调用方用"硬闸放行的那条消息 id"直接引用。两种形态靠可选 ``meta`` 区分；
+    **不改返回类型** —— 该签名被 pipeline / main / 测试多处依赖
+    （code-quality：跨轮携带信息用可选字典参数）。
+
+    ``meta`` 键：``marker``（命中的原文，未命中为 None）、``bare``（是否裸 ``[r]``）。
     """
+    if meta is not None:
+        meta["marker"] = None
+        meta["bare"] = False
     if not text:
         return text, None
     m = RE_QUOTE_MARK.match(text)
     if not m:
         return text, None
+    rest = text[m.end():].lstrip("\n ")
+    if meta is not None:
+        meta["marker"] = m.group(0).strip()
+    if m.group(1) is None:
+        # 裸 [r]：打标制。标记**必须**剥离（泄漏到群里就是乱码）。
+        if meta is not None:
+            meta["bare"] = True
+        return rest, None
     n = abs(int(m.group(1)))  # [r:-1] == 倒数第 1 条 == index 1
     if n <= 0:
         return text, None
-    rest = text[m.end():].lstrip("\n ")
     return rest, n
 
 

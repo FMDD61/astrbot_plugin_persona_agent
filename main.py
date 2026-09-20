@@ -449,6 +449,9 @@ class PersonaAgent(Star):
             gate_recent_n=int(gate_cfg.get("recent_n", 15)),
             debounce_sec=0.5,
             rag_enabled=int(rag_cfg.get("enabled", 1)) == 1,
+            # D42（C16）：KG/RAG 块的展示默认关闭（硬闸的 top_rag_score 不受影响）。
+            # 置 1 可回到"把检索结果拼进上下文"的旧行为（A/B 与归因用）。
+            kg_display=int(rag_cfg.get("display_enabled", 0)) == 1,
         )
         # S2: 标记 turn_block 已接线 —— _generate_reply 据此不再重复追加
         # 说话人行与 volatile 行（它们已并入同一块）
@@ -981,6 +984,8 @@ class PersonaAgent(Star):
                 sender_uin=sender_uin,
                 sender_alias=alias,
                 umo=str(event.unified_msg_origin or ""),
+                # C17/D37 打标制：本条 = 通过硬闸的那条 → 模型写 [r] 时引用的就是它
+                message_id=_mid,
             ))
         finally:
             self._generating[group_id] = False

@@ -95,6 +95,12 @@
         "type": "int",
         "description": "RAG 示例块最大字符数",
         "default": 800
+      },
+      "display_enabled": {
+        "type": "int",
+        "description": "KG/RAG 块的展示开关（D42）",
+        "hint": "0（默认）=检索结果**不进** RP/Gate 的上下文：RP 不拼 KG 尾注且跳过 kg_provider.query()，Gate 不再收风格片段。硬闸的 top_rag_score 照旧参与触发判定，参与量杠杆不变。置 1 = 回到旧行为（把命中片段拼进上下文），用于 A/B 与归因。trace 里 kg_display 记录本开关的实际取值。",
+        "default": 0
       }
     }
   },
