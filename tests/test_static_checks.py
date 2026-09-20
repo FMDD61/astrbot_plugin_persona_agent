@@ -220,6 +220,43 @@ if __name__ == "__main__":
     unittest.main()
 
 
+
+
+def gated_rotation_calls(tree) -> list:
+    '''返回「被 `if <x>_msgs` 门控住、且没有 else 兜底」的换日界调用点。
+
+    为什么需要这条判据（独立核验第 7 轮 N-1）：
+    **B-1 的要害是「被门控」** —— 换日界的兜底路径一旦先跑，cron 就拿到 old_msgs=None，
+    此时若组装写在 `if old_msgs:` **里面**，它会被整段跳过 → §3 停在昨天。
+    而「函数文本里出现过 _rebuild_memory_digest」这种判据抓不到这一点：
+    变异实测（M2）—— 把 `await _rotate_followup(...)` 塞进 `if old_msgs:` 之内，闸门仍然绿。
+
+    规则：对每个测试 *_msgs 的 if：
+      * 组装/跟进调用在它的 [lineno, end_lineno] **之外** → 合格；
+      * 在**之内**，但该 if 有 else 且 else 里也通向组装 → 合格
+        （这正是消息兜底路径的合法形态：if 里起任务、else 里直接组装）；
+      * 其余（在 if 里且没有 else）→ **不合格**。
+    '''
+    bad = []
+    follow = {'_rotate_followup', '_rebuild_memory_digest'}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        if '_msgs' not in ast.dump(node.test):
+            continue
+        inside = {c.func.attr for n in ast.walk(node) if n is not node
+                  for c in [n] if isinstance(c, ast.Call)
+                  and isinstance(c.func, ast.Attribute)}
+        if not (inside & follow):
+            continue
+        else_calls = {c.func.attr for n in node.orelse for c in ast.walk(n)
+                      if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)}
+        if else_calls & follow:
+            continue                      # 有 else 兜底 → 合格
+        bad.append(('gated_rotation_call', node.lineno))
+    return bad
+
+
 class TestRotationOrderC4(unittest.TestCase):
     """🔴 C23-b / C4：轮转必须**先总结、后组装**（`summary_v2.md` §4.3 的时序）。
 
@@ -290,6 +327,51 @@ class TestRotationOrderC4(unittest.TestCase):
             )
         self.assertGreaterEqual(found, 2, "轮转路径应有两条（cron + 消息兜底）")
 
+
+    def test_gate_misses_nothing_gated(self):
+        '''闸门必须真的能抓「被 if old_msgs 门控」这一形态（第 7 轮 M2 变异）。
+
+        代码当前是对的 —— 这条守的是**判据**本身：它在 M2 形态下必须报红，
+        而在当前唯一的合法形态（if 里起任务 + else 里组装）下必须放行。
+        '''
+        from textwrap import dedent
+        import tempfile as _tf
+
+        def _bad(src):
+            with _tf.TemporaryDirectory() as td:
+                f = Path(td) / 'm.py'
+                f.write_text(dedent(src), encoding='utf-8')
+                return gated_rotation_calls(
+                    ast.parse(f.read_text(encoding='utf-8')))
+
+        # M2 形态：跟进调用被门控、没有 else → 必须报红
+        self.assertTrue(_bad('''
+            def job():
+                old_msgs = rotate()
+                if old_msgs:
+                    await self._rotate_followup(gid, old_msgs)
+        '''))
+        # 合法形态（消息兜底路径）：if 里起任务、else 里组装 → 放行
+        self.assertEqual(_bad('''
+            def on_msg():
+                old_msgs = rotate()
+                if old_msgs:
+                    asyncio.create_task(self._rotate_followup(gid, old_msgs))
+                else:
+                    self._rebuild_memory_digest(gid)
+        '''), [])
+        # 合法形态（cron）：调用在 if 之外 → 放行
+        self.assertEqual(_bad('''
+            def job():
+                old_msgs = rotate()
+                if old_msgs:
+                    log.info('rotated')
+                await self._rotate_followup(gid, old_msgs or [])
+        '''), [])
+
+    def test_real_main_has_no_gated_rotation(self):
+        '''对真实 main.py 跑同一条判据。'''
+        self.assertEqual(gated_rotation_calls(self._tree()), [])
     def test_period_summary_rebuilds_digest(self):
         names = [name for _ln, name in self._calls(self._fn("_period_summary"))]
         self.assertIn("_rebuild_memory_digest", names,
