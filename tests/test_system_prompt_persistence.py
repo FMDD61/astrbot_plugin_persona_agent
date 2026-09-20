@@ -265,9 +265,12 @@ class TestGateRpSystemSeparation(unittest.TestCase):
 
     def _mk(self, td):
         import json as _json, os as _os
-        with open(_os.path.join(td, "system_prompt_fragments.json"), "w",
+        # C10：人格段来自 persona/*.md（文件覆盖内置默认）。这里写 s1_who 段，
+        # 「群员」二字是各用例识别"这一段是不是人格"的锚点。
+        _os.makedirs(_os.path.join(td, "persona"), exist_ok=True)
+        with open(_os.path.join(td, "persona", "s1_who.md"), "w",
                   encoding="utf-8") as f:
-            _json.dump({"identity": "你是群员成员丁"}, f, ensure_ascii=False)
+            f.write("你是群员成员丁")
         with open(_os.path.join(td, "member_relations.json"), "w",
                   encoding="utf-8") as f:
             _json.dump({"members": [{"uin": "1", "alias": "成员甲",

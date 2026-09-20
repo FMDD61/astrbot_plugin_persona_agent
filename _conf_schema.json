@@ -5,6 +5,18 @@
     "hint": "存放风格文件、chromadb、决策日志等。git pull 不会覆盖此目录。（该键仅作文档说明；插件运行时实际由 AstrBot 的 StarTools.get_data_dir() 决定）",
     "default": "<AstrBot 数据目录>/plugin_data/astrbot_plugin_persona_agent"
   },
+  "persona": {
+    "type": "object",
+    "description": "人格装配（C7/C10：八段现场组装）",
+    "items": {
+      "sections_mode": {
+        "type": "string",
+        "description": "人格装配模式",
+        "hint": "v2（默认）=按 <data_dir>/persona/*.md 现场组装八段角色卡（缺文件用内置默认）；legacy=旧的 system_prompt_fragments.json 键元组装配。改回 legacy 可整体回退提示词 v2 的人格改写（B-037）。",
+        "default": "v2"
+      }
+    }
+  },
   "target_group_id": {
     "type": "string",
     "description": "目标 QQ 群号",

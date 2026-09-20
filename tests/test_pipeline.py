@@ -1026,13 +1026,18 @@ class TestRelationsBlockSplitS9(unittest.TestCase):
         self.assertTrue(any("历史甲" in c for c in contents))
 
     def test_system_prompt_no_longer_contains_relations(self):
-        """回归：`system_prompt()` 不得再拼别名/关系块（那是拆分的要点）。"""
+        """回归：`system_prompt()` 不得再拼别名/关系块（那是拆分的要点）。
+
+        C10 之后人格来自 `persona/*.md`（段文件覆盖内置默认）；
+        旧 `system_prompt_fragments.json` 的 `identity` 键**已不再进提示词**。
+        """
         import tempfile as _tf, json as _json, os as _os
         from services.style_profile import StyleProfile
         with _tf.TemporaryDirectory() as td:
-            with open(_os.path.join(td, "system_prompt_fragments.json"), "w",
+            _os.makedirs(_os.path.join(td, "persona"), exist_ok=True)
+            with open(_os.path.join(td, "persona", "s1_who.md"), "w",
                       encoding="utf-8") as f:
-                _json.dump({"identity": "我是成员丙"}, f, ensure_ascii=False)
+                f.write("我是成员丙")
             with open(_os.path.join(td, "member_relations.json"), "w",
                       encoding="utf-8") as f:
                 _json.dump({"members": [

@@ -11,6 +11,35 @@
 
 ## [Unreleased]
 
+### Changed (2026-09-20, 提示词 v2 · 批次一（前置四件之 C7/C10）：人格装配接线)
+> 来源：`docs/specs/prompt_v2_handoff.md`（任务清单）+ `docs/specs/prompt_v2_rp.md` §2/§10
+> + `BUGS.md` B-037。设计文档在仓库外（根目录非 git 仓库）。
+> **只做前置四件里的 C7/C10**；C16/C17 见下一条。
+
+- **🔴 人格文件 75% 从未进 prompt —— 接线（B-037 / C7 / C10）**：`StyleProfile.system_prompt()`
+  用硬编码 7 元组读 `system_prompt_fragments.json`，2026-07-26 的 v0.4 整份重写后**键元组没跟着改**
+  → 22 键里只有 6 键（910 / 6145 字符）进过 prompt，`expression_dna`/`social_behavior`/
+  `mental_models` 等 14 键（4629 字符）**被静默丢弃**（其中 `relations` 还被 `isinstance(v,str)`
+  守卫二次吞掉）。修法：新增 `services/persona.py`（**声明式段注册表** + 三个装配视图）
+  与生成物 `services/persona_sections.py`（文案真身在 `docs/specs/` 草案，`tools/gen_persona_sections.py` 生成，
+  单测 `test_persona_source_sync` 钉死"生成物 == 草案"）。
+  - **段与视图**：RP 卡 = §1+作息+§2+§3+§4+§6+§7+§8（≈1470 字符，旧 910）；
+    Gate 冻结头部 = §1+§2+§4+GATE 决策段（`gate_system_prompt()`，C22 的一半）；
+    总结类 system = §1+§2（`summary_system_prompt()`，C32 的一半）。
+  - **可编辑**：`<data_dir>/persona/sN.md` 存在即**覆盖**内置默认，删文件即回到默认（mtime 热重载）；
+    启动时把默认物化到该目录（**只在缺失时写**），并同步写一份 `README.md` 说明段→文件对应关系。
+  - **回退开关**：`persona.sections_mode = legacy` 回到旧键元组装配（改不动时的退路）。
+  - **降级必须可见**（本项目反复栽在这里）：启动日志与自检逐条打印
+    `段清单 used/missing/file_override`；旧人格文件里**已被取代但仍留着的键**显式告警列出
+    （B-037 的另一半："不再读取"这件事必须说出来）；`missing`/整体回退会写进 trace `persona_degraded`。
+  - **§3 记忆段**：头部为恒定文案，正文由 `<data_dir>/memory_digest.json` 渲染；**空层整段不出现**，
+    全空时 §3 整段省略（不留空壳标题）。**注意：这是渲染器，选取侧规则（各层不重叠）属 C4，尚未实现。**
+  - 测试 670 → **696 全绿**（新增 `test_persona_sections` 25 例 + `test_persona_source_sync` 1 例；
+    旧夹具照抄过时键元组、与实现同源漂移的两处已改成写 `persona/*.md`）。
+  - ⚠️ **已知取舍（首日副作用）**：人格文本一变，`sync_system_prompt` 判 `update` →
+    **旧 910 字人格仍留在 session[0]**，新全文以「［设定更新］…以此为准」追加在尾部，
+    两者共存到次日 02:05 轮转。语义由"以此为准"兜住，但旧块仍占前缀一天。
+
 ### Fixed (2026-09-17, V1 部署验证批次：B-022～B-031 —— 九修 + 一处文档对齐，全部清账)
 > 来源：对生产机的**只读**验证（报告 `docs/measurements/verify_20260917.md`，缺陷登记 `BUGS.md`）。
 > 验证窗口 2026-09-16 13:38 → 09-17 19:34（当前进程生命周期）；部署 `05981a2` 与开发机 HEAD 的

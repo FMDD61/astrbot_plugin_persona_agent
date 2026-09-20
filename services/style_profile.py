@@ -51,6 +51,9 @@ import time
 from pathlib import Path
 from typing import NamedTuple, Optional
 
+from . import persona as persona_mod
+from .persona_sections import SECTION_TEXT
+
 _FILES = (
     "my_style_profile.json",
     "my_lexicon.json",
@@ -63,13 +66,59 @@ _FILES = (
 
 CLOSENESS_LABEL = {"close": "熟人", "known": "认识", "new": "新人"}
 
+#: 物化到 <data_dir>/persona/ 的说明文件（**不是段文件**：加载器按段 id 精确取名，不会读它）
+_PERSONA_README = """# 人格段文件（C10）
+
+本目录每个文件 = 角色卡的一段。**文件存在即覆盖插件内置的默认文案；删掉文件即回到默认。**
+
+| 文件 | 段 | 进 RP | 进 Gate |
+|---|---|---|---|
+| `s1_who.md`      | §1 基本角色设定 | ✅ | ✅ |
+| `sched.md`       | 作息（默认取 `system_prompt_fragments.json` 的 `schedule`）| ✅ | ❌ |
+| `s2_goal.md`     | §2 我在群里想做什么 | ✅ | ✅ |
+| `s3_memory.md`   | §3 历史群聊摘要（**头部**；正文由 `memory_digest.json` 渲染）| ✅ | ❌ |
+| `s4_world.md`    | §4 世界——群聊 | ✅ | ✅ |
+| `s6_behavior.md` | §6 行为反应 | ✅ | ❌ |
+| `s7_style.md`    | §7 语言风格 | ✅ | ❌ |
+| `s8_rules.md`    | §8 规则（引用打标）| ✅ | ❌ |
+
+Gate 的冻结头部 = §1 + §2 + §4 ＋ 插件内置的 GATE 决策段（`services/persona_sections.py`）。
+
+改完保存即生效（mtime 热重载）。启动日志里有装配清单（`[persona] …`），
+能看到哪些段来自文件、哪些来自默认。
+"""
+
+
+
+#: 八段文案目录（C10）：`<data_dir>/persona/sN.md`。文件存在即覆盖内置默认。
+PERSONA_DIR = "persona"
+
+#: 记忆摘要快照（C4/C31）：`<data_dir>/memory_digest.json`
+#: `{"layers": {"recent_days": ["09-17 …"], …}, "generated_at": "…"}`
+MEMORY_DIGEST_FILE = "memory_digest.json"
+
+#: v2 装配**不再读取**的旧键（B-037 的另一半：让"被取代"可见，而不是静默丢弃）
+LEGACY_SUPERSEDED_KEYS = (
+    "identity", "tone", "personality", "group_context", "rules", "vocabulary",
+    "scenario", "first_mes", "expression_dna", "likes", "dislikes", "knowledge",
+    "social_behavior", "voice_signatures", "relations", "relations_summary",
+    "lexicon", "mental_models", "decision_heuristics", "honesty_bounds",
+)
+
 
 class StyleProfile:
-    def __init__(self, data_dir: str | os.PathLike) -> None:
+    def __init__(self, data_dir: str | os.PathLike, *,
+                 sections_mode: str = "v2") -> None:
         self._dir = Path(data_dir)
         self._lock = threading.Lock()
         self._mtime: dict[str, float] = {}
         self._cache: dict[str, dict] = {}
+        # C7/C10: 人格装配模式 —— "v2"（八段现场组装）/"legacy"（旧键元组，回退开关）
+        self._sections_mode = "legacy" if str(sections_mode).strip().lower() == "legacy" else "v2"
+        self._sections_cache: Optional[dict[str, str]] = None
+        self._sections_sig: tuple = ()
+        #: 最近一次装配的留痕（供启动自检 / trace；降级必须可见）
+        self.last_persona_report: dict = {}
         for name in _FILES:
             self._maybe_reload(name)
 
@@ -176,6 +225,40 @@ class StyleProfile:
         只破坏尾部，稳定前缀（人设 + 会话 + 示例块）得以复用。
         ``local_hour`` 参数保留以兼容既有调用点（不再参与拼接）。
         """
+        if self._sections_mode == "legacy":
+            text = self._legacy_system_prompt()
+            self.last_persona_report = {"mode": "legacy", "used": [], "missing": []}
+            return text
+        # C7/C10：八段现场组装（冻结文本）。§3 由记忆摘要快照渲染（无内容则整段不出现）。
+        texts = self.persona_section_texts()
+        memory_block = persona_mod.render_memory_block(self.memory_layers())
+        text, used = persona_mod.compose(
+            texts, persona_mod.RP_ORDER, memory_block=memory_block)
+        if not text.strip():
+            # 装配为空 = 文案全丢（磁盘损坏/被清空）→ 退回旧装配，且**必须留痕**
+            self.last_persona_report = {
+                "mode": "v2", "fallback": "empty_assembly", "used": [], "missing": [],
+            }
+            return self._legacy_system_prompt()
+        used_set = set(used)
+        self.last_persona_report = {
+            "mode": "v2",
+            "used": list(used),
+            "missing": [s for s in persona_mod.RP_ORDER if s not in used_set],
+            "overridden": sorted(k for k in self._persona_override_flags() if k),
+            "chars": sum(len(texts.get(s) or "") for s in persona_mod.RP_ORDER),
+            "memory_lines": len(memory_block.splitlines()),
+        }
+        return text
+
+    # ---- C7/C10：八段装配 ----
+
+    def _legacy_system_prompt(self) -> str:
+        """旧装配（v2 的回退路径，也供 `sections_mode=legacy` 使用）。
+
+        ⚠️ 保留原样：只读 7 元组键 + `rules`。这正是 B-037 的病灶
+        （14 键被静默丢弃），保留它只为"改不回去"时有一条可控退路。
+        """
         f = self._get("system_prompt_fragments.json")
         parts: list[str] = []
         for key in ("identity", "tone", "vocabulary", "schedule", "relations", "group_context", "personality"):
@@ -198,6 +281,190 @@ class StyleProfile:
         # system 消息**放在人格之后 —— 它变时只废自己之后的部分，且下一个调用
         # 就能重新缓存 session。
         return text
+
+    # ---- C7/C10：八段文案的加载（数据目录覆盖 > 内置默认）----
+
+    def persona_dir(self) -> Path:
+        return self._dir / PERSONA_DIR
+
+    def _persona_path(self, sid: str) -> Path:
+        return self.persona_dir() / f"{sid}.md"
+
+    def _persona_override_flags(self) -> dict[str, bool]:
+        """段 id -> 是否有数据目录覆盖文件（空文件不算覆盖）。"""
+        out: dict[str, bool] = {}
+        for sid in persona_mod.ALL_SECTIONS:
+            path = self._persona_path(sid)
+            try:
+                out[sid] = path.is_file() and bool(path.read_text("utf-8").strip())
+            except OSError:
+                out[sid] = False
+        return out
+
+    def _sections_signature(self) -> tuple:
+        """目录内 8 个段文件的 (mtime, size) 指纹 —— 变则重读（热重载）。"""
+        sig = []
+        for sid in persona_mod.ALL_SECTIONS:
+            path = self._persona_path(sid)
+            try:
+                st = path.stat()
+                sig.append((sid, round(st.st_mtime, 3), st.st_size))
+            except OSError:
+                sig.append((sid, 0.0, 0))
+        # 旧人格文件的 schedule 键也参与（sched 段无内置默认）
+        frag = self._path("system_prompt_fragments.json")
+        try:
+            sig.append(("__frag__", round(frag.stat().st_mtime, 3)))
+        except OSError:
+            sig.append(("__frag__", 0.0))
+        return tuple(sig)
+
+    def persona_section_texts(self) -> dict[str, str]:
+        """段 id -> 文案。**数据目录 `persona/sN.md` 存在即覆盖内置默认**。
+
+        `sched`（作息）**没有内置默认**：沿用旧人格文件的 `schedule` 键 ——
+        它在 v1 一直是生效段（`docs/specs/prompt_v2_rp.md` §2 的八段之外），
+        丢它就是一次静默的能力回退。
+        """
+        sig = self._sections_signature()
+        with self._lock:
+            if self._sections_cache is not None and sig == self._sections_sig:
+                return dict(self._sections_cache)
+        texts: dict[str, str] = {}
+        for sid, default in SECTION_TEXT.items():
+            texts[sid] = self._read_section_file(sid) or default
+        # sched：文件 > 旧人格文件的 schedule 键（> 无）
+        texts["sched"] = self._read_section_file("sched") or self._legacy_schedule()
+        with self._lock:
+            self._sections_cache = dict(texts)
+            self._sections_sig = sig
+        return dict(texts)
+
+    def _read_section_file(self, sid: str) -> str:
+        path = self._persona_path(sid)
+        try:
+            if path.is_file():
+                return path.read_text("utf-8").strip()
+        except OSError:
+            return ""
+        return ""
+
+    def _legacy_schedule(self) -> str:
+        frag = self._get("system_prompt_fragments.json")
+        v = frag.get("schedule")
+        return v.strip() if isinstance(v, str) and v.strip() else ""
+
+    def ensure_persona_files(self) -> list[str]:
+        """把内置默认物化到 `<data_dir>/persona/`（**只在文件缺失时写**）。
+
+        为什么物化：文案要能被使用者直接编辑（D26：用文件名标记内容段）。
+        代码里的常量是**默认值**，数据目录的文件是**覆盖层** —— 删掉文件即回到默认。
+        返回本次新建的文件名（空列表 = 无需动作）。
+        """
+        created: list[str] = []
+        try:
+            self.persona_dir().mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return created
+        for sid, default in SECTION_TEXT.items():
+            path = self._persona_path(sid)
+            if path.exists():
+                continue
+            written = self._atomic_write(path, default + "\n")
+            if written:
+                created.append(path.name)
+        # sched 无内置默认：仅当旧人格文件里有 schedule 时才物化
+        sched_path = self._persona_path("sched")
+        if not sched_path.exists():
+            legacy = self._legacy_schedule()
+            if legacy and self._atomic_write(sched_path, legacy + "\n"):
+                created.append(sched_path.name)
+        readme = self.persona_dir() / "README.md"
+        if not readme.exists() and self._atomic_write(readme, _PERSONA_README):
+            created.append(readme.name)
+        if created:
+            with self._lock:      # 新建后强制重读
+                self._sections_sig = ()
+        return created
+
+    @staticmethod
+    def _atomic_write(path: Path, text: str) -> bool:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            return False
+
+    def memory_layers(self) -> dict[str, list[str]]:
+        """§3 的动态正文来源：`<data_dir>/memory_digest.json`（C4 产出）。
+
+        文件不存在 → 空 dict → **§3 整段不出现**（而不是留一个空壳标题）。
+        """
+        path = self._dir / MEMORY_DIGEST_FILE
+        try:
+            if not path.is_file():
+                return {}
+            obj = json.loads(path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(obj, dict):
+            return {}
+        layers = obj.get("layers") if isinstance(obj.get("layers"), dict) else obj
+        out: dict[str, list[str]] = {}
+        for key, _title in persona_mod.MEMORY_LAYERS:
+            rows = layers.get(key)
+            if isinstance(rows, (list, tuple)):
+                out[key] = [str(r) for r in rows if str(r).strip()]
+        return out
+
+    def gate_system_prompt(self) -> str:
+        """Gate 冻结头部（C22）：§1+§2+§4 ＋ GATE 独有决策段。
+
+        与 RP 头部**从第一个字节起就分叉**（Gate 在 §4 之后插决策段）——
+        `prompt_v2_gate.md` §2：**不追求跨调用共享前缀缓存**，两边各自命中自己的。
+        """
+        try:
+            return persona_mod.gate_head(self.persona_section_texts())
+        except Exception:
+            return ""
+
+    def summary_system_prompt(self) -> str:
+        """总结类 LLM 的 system（C32）：§1+§2，收窄自全量人格。"""
+        try:
+            text = persona_mod.summary_head(self.persona_section_texts())
+        except Exception:
+            text = ""
+        return text or self.system_prompt()
+
+    def persona_manifest(self) -> dict:
+        """装配清单（启动自检 / trace；降级必须可见 —— 本项目反复栽在静默失效）。"""
+        texts = self.persona_section_texts()
+        memory_block = persona_mod.render_memory_block(self.memory_layers())
+        base = persona_mod.manifest(texts, persona_mod.RP_ORDER, memory_block=memory_block)
+        base["mode"] = self._sections_mode
+        flags = self._persona_override_flags()
+        base["overridden"] = sorted(sid for sid, ok in flags.items() if ok)
+        # 旧键仍留在人格文件里、但 v2 已不再读取 —— 列出来，别让它继续"看起来生效"
+        frag = self._get("system_prompt_fragments.json")
+        inert = [k for k in LEGACY_SUPERSEDED_KEYS if k in frag]
+        superseded = sorted(
+            k for k in inert if k not in ("schedule",)
+        )
+        base["superseded_keys"] = superseded
+        base["superseded_chars"] = sum(
+            len(frag[k]) if isinstance(frag[k], str)
+            else len(json.dumps(frag[k], ensure_ascii=False))
+            for k in superseded
+        )
+        base["memory_layers"] = {k: len(v) for k, v in self.memory_layers().items() if v}
+        return base
 
     def relations_lines(self) -> list[tuple[str, str]]:
         """关系图谱的逐行形式 ``[(uin, line), ...]``（按文件顺序）。

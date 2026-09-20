@@ -127,7 +127,37 @@ class PersonaAgent(Star):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._housekeeping()
 
-        self.style = StyleProfile(self.data_dir)
+        # C7/C10：八段人格装配。sections_mode="v2"=按 persona/ 段文件（缺则用内置默认）
+        # 现场组装；"legacy"=旧键元组（回退开关，见 docs/specs/prompt_v2_impl_p1.md）。
+        _persona_cfg = self.config.get("persona", {}) or {}
+        self.style = StyleProfile(
+            self.data_dir,
+            sections_mode=str(_persona_cfg.get("sections_mode", "v2") or "v2"),
+        )
+        # C10：把内置默认物化到 <data_dir>/persona/*.md（**只在文件缺失时写**）
+        # → 文案可被直接编辑；删文件即回到内置默认。
+        try:
+            _created = self.style.ensure_persona_files()
+            if _created:
+                logger.info(
+                    f"[persona] 已物化人格段文件 {len(_created)} 个 → "
+                    f"{self.style.persona_dir()}: {', '.join(sorted(_created))}"
+                )
+        except Exception as e:
+            logger.warning(f"[persona] 物化人格段文件失败（沿用内置默认）: {e}")
+        _pm = self.style.persona_manifest()
+        logger.info(
+            f"[persona] mode=v2 段={len(_pm['used'])}/{len(_pm['order'])} "
+            f"缺={_pm['missing'] or '无'} 文件覆盖={_pm['overridden'] or '无'} "
+            f"人格 {sum(_pm['chars'].values())} 字符"
+        )
+        if _pm["superseded_keys"]:
+            # B-037 的另一半：旧键**不再被读取**这件事必须说出来，否则又是一次静默丢弃
+            logger.warning(
+                f"[persona] ⚠️ system_prompt_fragments.json 里有 "
+                f"{len(_pm['superseded_keys'])} 个键（{_pm['superseded_chars']} 字符）"
+                f"已被八段文案取代、不再进提示词：{', '.join(_pm['superseded_keys'])}"
+            )
 
         rag_cfg = self.config.get("rag", {}) or {}
         self.rag = RagService(self.data_dir)
@@ -1053,8 +1083,8 @@ class PersonaAgent(Star):
 
         # ---- 动作链路（S3③）：[emote:意图] → 贴纸库选图 → 随正文同发 ----
         # 设计取舍（docs/specs/s3-action-channel.md §4.3）：
-        #   · 与正文**同一条消息**发出（"一句话 + 一张表情"），不额外多一条消息
-        #   · 选不中/库为空/文件缺失/**超配额** → 静默跳过，正文照发（绝不兜底文生图）
+        #   · 与正文**分两条消息**发出（"一个文本消息 + 一个表情消息"）
+        #   · 选不中/库为空/文件缺失/**超配额** → 静默跳过，正文照发（正文为空则回归静默）
         #   · 每次尝试都落 sticker_log.jsonl（S0 教训：降级必须可见）
         if send_intent.emote:
             # 异步生成器 → async for（每个 yield 是一条独立出站消息）
@@ -1409,8 +1439,23 @@ class PersonaAgent(Star):
                 if sp_len > 20000:
                     logger.warning(
                         f"[selfcheck] ⚠️ 人格提示词 {sp_len} 字符偏大 → 每轮进前缀，"
-                        f"检查 system_prompt_fragments.json 是否失控"
+                        f"检查 persona/ 段文件（或 system_prompt_fragments.json）是否失控"
                     )
+                # C7/C10：段级清单 —— B-037 的病根是"丢了 14 个键却没人知道"，
+                # 所以这里把"哪些段进、哪些段缺、哪些段来自文件"逐条打出来。
+                try:
+                    pm = self.style.persona_manifest()
+                    logger.info(
+                        f"[persona] 段清单 used={pm['used']} missing={pm['missing']} "
+                        f"file_override={pm['overridden']}"
+                    )
+                    if pm["mode"] == "v2" and pm["missing"]:
+                        logger.warning(
+                            f"[selfcheck] ⚠️ 人格段缺失（未进提示词）：{pm['missing']} "
+                            f"→ 检查 persona/*.md 是否被清空"
+                        )
+                except Exception as e:
+                    logger.warning(f"[selfcheck] 人格段清单读取失败: {e}")
                 if rel_len > 30000:
                     logger.warning(
                         f"[selfcheck] ⚠️ 关系图谱 {rel_len} 字符偏大 → 虽为追加式，"

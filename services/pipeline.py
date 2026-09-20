@@ -193,6 +193,11 @@ class PersonaPipeline:
         if self.session_mgr is not None and self._system_prompt is not None:
             self._last_sys_sync = self.session_mgr.sync_system_prompt(
                 group_id, self._system_prompt())
+        # C7/C10：人格段装配的**降级留痕** —— 段缺失/整体回退必须能进 trace，
+        # 否则"某段没进提示词"与"设计上就不该进"在日志上不可区分（B-037 的形态）。
+        # 只在**异常**时写 trace（正常装配是常量，每轮重复写没有信息量）。
+        _prep = getattr(self.style, "last_persona_report", None) if self.style is not None else None
+        self._last_persona_report = _prep if isinstance(_prep, dict) else None
 
         contexts = (
             self.session_mgr.get_contexts(group_id)
@@ -553,6 +558,13 @@ class PersonaPipeline:
         base_contexts = self._assemble_base(group_id, kg_content)
         if getattr(self, "_last_sys_sync", ""):
             trace["sys_prompt_sync"] = self._last_sys_sync
+        _prep = getattr(self, "_last_persona_report", None)
+        if isinstance(_prep, dict) and (_prep.get("missing") or _prep.get("fallback")):
+            trace["persona_degraded"] = {
+                "mode": _prep.get("mode"),
+                "missing": _prep.get("missing"),
+                "fallback": _prep.get("fallback"),
+            }
 
         # ---- S2 输入打包重划：把「该回哪句」显式标注出来 ----
         # 实测依据：决策窗口（96 条/1h）的文本有 **59% 已在 session 里**，
