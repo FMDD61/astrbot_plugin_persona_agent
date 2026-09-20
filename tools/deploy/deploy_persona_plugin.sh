@@ -46,6 +46,10 @@ SKIP_TESTS=0
 ONE_SHOT=0
 CRON_SPEC=""
 
+#: 自己的绝对路径 —— cron 行里必须写绝对路径（相对路径在 cron 里必然找不到）
+SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+[ -x "$SELF" ] || SELF="$0"
+
 LOG_FILE=""
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
@@ -86,7 +90,7 @@ remove_cron() {
 install_cron() {
   [ -n "$CRON_SPEC" ] || { echo "--install-cron 需要 cron 时间表达式，例：'50 1 21 9 *'" >&2; exit 2; }
   remove_cron
-  local line="$CRON_SPEC $0 --force-restart"
+  local line="$CRON_SPEC $SELF --force-restart"
   [ "$ONE_SHOT" = 1 ] && line="$line --one-shot"
   line="$line >> $HOME/deploy-persona-plugin.log 2>&1 $CRON_MARK"
   { cron_lines | grep -v '^$'; printf '%s\n' "$line"; } | "$CRONTAB_BIN" -
