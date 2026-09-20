@@ -227,11 +227,6 @@
         "default": 1.3,
         "hint": "用户 2026-09-14 指定先设 1.3。梦境要'逻辑跳跃'，温度低会把梦写成日记摘要。"
       },
-      "anchor_temperature": {
-        "type": "float",
-        "description": "锚点抽取温度（结构化任务宜低）",
-        "default": 0.3
-      },
       "reasoning_effort": {
         "type": "string",
         "description": "思考强度（off/low/medium/high）",
@@ -258,12 +253,6 @@
         "type": "float",
         "description": "残缺化上限",
         "default": 0.3
-      },
-      "anchor_max_tokens": {
-        "type": "int",
-        "description": "锚点抽取最大 token",
-        "default": 8192,
-        "hint": "同上：实测 2048 时思考顶格 2048 → content 空；8192/16384 稳定产出。"
       }
     }
   },

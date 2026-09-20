@@ -48,7 +48,10 @@ from .services.interjection import (
     Decision,
 )
 from .services.topic_bank import TopicBank
-from .services.summary import SummaryService, build_prompt, append_summary
+from .services.summary import (
+    SummaryService, append_summary, build_phi, build_prompt,
+    split_digest_body,
+)
 from .services.json_store import JsonStore, find_jsonl_record
 from .services.context_buffer import ContextBuffer
 from .services.session_manager import SessionManager
@@ -267,9 +270,13 @@ class PersonaAgent(Star):
         # `_dream_job_runner`，而 DreamJob.run 只写不推、且它的"关系变更建议"
         # 已由 `services/familiarity.py` 取代（用户："DreamJob 是做梦，不应该
         # 负责处理熟悉度汇报相关内容"）。故整个类与实例一并移除。
-        self._dream_maker = DreamMaker(str(self.data_dir),
-                                       anchor_fn=self._dream_anchor_llm,
-                                       dream_fn=self._dream_llm)
+        # C33⑤（2026-09-19）：**锚点阶段已删** —— 梦变单阶段，每周只剩 1 次调用。
+        # C33④：system 只给 §4 世界段（梦唯一的设定来源）；身份靠日记的第一人称继承。
+        self._dream_maker = DreamMaker(
+            str(self.data_dir),
+            dream_fn=self._dream_llm,
+            world_block=(self.style.world_section() if self.style else ""),
+        )
 
         dream_cfg = self.config.get("dream", {}) or {}
         if int(dream_cfg.get("enabled", 0)) == 1:
@@ -2295,26 +2302,6 @@ class PersonaAgent(Star):
         )
         return (getattr(resp, "completion_text", "") or "").strip()
 
-    async def _dream_anchor_llm(self, system_prompt: str, prompt: str) -> str:
-        """做梦阶段①：锚点抽取（**低温**，结构化任务）。"""
-        provider = await self._resolve_provider_id()
-        if not provider:
-            raise RuntimeError("no LLM provider available for dream anchor")
-        dcfg = self.config.get("dream", {}) or {}
-        _rv = reasoning_value(dcfg.get("reasoning_effort", "low"))
-        resp = await self.context.llm_generate(
-            chat_provider_id=provider,
-            prompt=prompt,
-            system_prompt=system_prompt,
-            temperature=float(dcfg.get("anchor_temperature", 0.3)),
-            # 🔴 预算给足（2026-09-14 用户指出）：思考 token 是**重尾随机变量**
-            # （同一 prompt 实测 556 或 2048），预算紧则被截断 → content 空。
-            # `max_tokens` 是**上限而非消耗**，给大没有代价。实测 8192/16384 稳定。
-            max_tokens=int(dcfg.get("anchor_max_tokens", 8192)),
-            **({"reasoning_effort": _rv} if _rv else {}),
-        )
-        return (getattr(resp, "completion_text", "") or "").strip()
-
     async def _dream_llm(self, system_prompt: str, prompt: str) -> str:
         """做梦阶段②：写梦境（**温度 1.3**、思考 low —— 用户 2026-09-14 指定）。
 
@@ -2641,13 +2628,10 @@ class PersonaAgent(Star):
             vol = self.style.volatile_line(local_hour=self._local_hour()) if self.style else ""
             if vol:
                 contexts.append({"role": "system", "content": vol})
-            contexts.append({
-                "role": "user",
-                "content": (
-                    "请把今天群里发生的事写成一篇简短的日记（100~200字），"
-                    "包含主要话题与群友互动，用你的语气和第一人称，不要列条。"
-                ),
-            })
+            # C31（summary_v2 §5.1/§7.2）：日记 PHI —— **末尾的 system 块**，
+            # 且**只能追加在末尾**：前缀（人格 + 归档日全量消息）一个字节都不能动，
+            # 否则 v3 那条「前缀缓存复用」的设计意图就废了。
+            contexts.append({"role": "system", "content": build_phi("daily")})
             resp = await self.context.llm_generate(
                 chat_provider_id=provider,
                 prompt=None,
@@ -2661,13 +2645,22 @@ class PersonaAgent(Star):
             # 复盘修正（2026-09-13）：day 此前取 ``day_key()``（**轮换后**的新日期），
             # 而 msgs 是**刚被归档的那一天** → 日记日期整体偏移一天。
             # 归档日 = 新日期的前一天（用同一个 day_key 口径回推 24h）。
+            # C31：切开 digest / body 两字段（代码在 --- 围栏处切，下游不解析 frontmatter）
+            digest, body = split_digest_body(summary)
             record = {
                 "day": self.session_mgr.day_key(time.time() - 86400.0),
                 "group_id": group_id,
-                "summary": summary,
+                "digest": digest,
+                "body": body,
                 "n_messages": len(msgs),
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
+            if not digest:
+                # 格式没遵守：正文照收，但**必须可统计**（summary_v2 §2 的可用率口径）
+                record["digest_missing"] = True
+            if not body and digest:
+                record["body"] = digest
+                record["body_from_digest"] = True
             # 🔴 幂等（2026-09-14 实测事故）：用户在夜间反复重启，**新旧实例交叠**
             # 时同一 cron 被两个进程各跑一次 → 同一天日记写了 2–3 条。
             # 内存标记跨不了进程，判据必须落在**文件**上。
@@ -2676,7 +2669,7 @@ class PersonaAgent(Star):
             if dup is not None:
                 logger.warning(
                     f"[persona_agent] diary 幂等拦截：{record['day']} 已存在"
-                    f"（{len(dup.get('summary') or '')} 字符），本次丢弃"
+                    f"（{len(str(dup.get('body') or dup.get('summary') or ''))} 字符），本次丢弃"
                     f"（多为多实例/重复 cron 触发）"
                 )
                 return
@@ -2788,7 +2781,7 @@ class PersonaAgent(Star):
 
         本 runner 负责（S11）：
           1. 从最近 7 个不同 day 的日记（不足按实际）**做梦**
-          2. 落 `logs/<gid>/dreams.jsonl`（长期留存 + 供 LLM 消费）
+          2. 落 `logs/<gid>/dreams.jsonl`（长期留存 + **供推送**；**没有 LLM 消费者**，C33①）
           3. **推送到 dream_binding 的会话**
         另：旧 DreamJob 的"关系变更建议/话题趋势"**不再由做梦承担**
         （用户："DreamJob 是做梦，不应该负责处理熟悉度汇报相关内容"）——
@@ -2873,7 +2866,10 @@ class PersonaAgent(Star):
                     chat_provider_id=provider,
                     prompt=None,
                     system_prompt=sys_prompt,
-                    contexts=[{"role": "user", "content": prompt}],
+                    # C31（summary_v2 §7.2）：**原料留 user、指令拆成末尾 system PHI 块**。
+                    # 整条改成 system 会让请求里没有任何非 system 消息 —— 部分 provider 不接受。
+                    contexts=[{"role": "user", "content": prompt},
+                              {"role": "system", "content": build_phi(kind)}],
                 )
             except Exception as ex:
                 logger.warning(f"[persona_agent] {kind} summary LLM failed: {ex}")
@@ -2891,7 +2887,7 @@ class PersonaAgent(Star):
             if existing is not None:
                 logger.warning(
                     f"[persona_agent] {kind} 幂等拦截：{collected['label']} 已存在"
-                    f"（{len(existing.get('summary') or '')} 字符）→ 本次丢弃，"
+                    f"（{len(str(existing.get('body') or existing.get('summary') or ''))} 字符）"
                     f"**不重复推送**（多为多实例/重复 cron 触发）"
                 )
                 continue
@@ -2912,7 +2908,7 @@ class PersonaAgent(Star):
             head = {"weekly": "周记", "monthly": "月记",
                     "yearly": "年记"}.get(kind, kind)
             pushed = await self._push_text(
-                f"【{record['period']} {head}】\n{record['summary']}")
+                f"【{record['period']} {head}】\n{record['body']}")
 
             # S12: 周报任务内顺带产出**关系提升提案**（用户要求嵌在这里）。
             # ⚠️ 放在推送之后 —— 提案是附加产物，不能拖慢/拖垮周报本身。

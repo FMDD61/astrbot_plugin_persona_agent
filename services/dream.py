@@ -11,19 +11,22 @@
 - **温度 1.3、思考强度 low**（用户指定，先跑再看效果调）
 - 样例文本是**参考**，不是要照搬的结构/手法模板
 
-## 两阶段（采纳子代理建议）
+## 单阶段（2026-09-19 删除锚点阶段，C33⑤）
 
-子代理核校素材后指出一个关键限制：
+原先分两步：① 低温抽 3–6 个身体/感觉锚点 → ② 高温做梦，以锚点为"感觉中心"。
+**用户 2026-09-19 决定删掉阶段①**：
 
-> 素材包能支撑"**怎么写**"，撑不起"**写什么**"。样例之所以成立，是因为日记里有
-> **可触的身体细节**（发烧、膝盖疼、吃药）。建议先抽取 3–6 个身体/感觉锚点，
-> 再让它们成为梦境中心 —— 这一步 few-shot 替代不了。
+> 「**锚点直接删去**。这一部分**未在设计内**，而且**会对 LLM 的注意力
+> 产生不确定的引导行为**。」
 
-所以分两步：
-  ① **锚点抽取**（低温、结构化）→ 3–6 个身体/感觉锚点（体温/疼痛/睡眠/气味/时段）
-  ② **做梦**（温度 1.3、自由写作）→ 以锚点为"感觉中心"生成梦境语段
+依据侧的两条事实（`docs/specs/dream_v2.md` §10）：
 
-费用：每周 2 次调用，可忽略。
+1. 该设计**出自一个子代理的推理**，不是实测；
+2. 三次真实运行里有两次锚点为空（等于顺带跑了"无锚点"组），**没锚点那次也成立** ——
+   现有数据构成一个非正式反例。
+
+删除后：**每周只剩 1 次 LLM 调用**，且不再有"锚点空返回无从分辨"那一类留痕问题
+（C33③ 随之作废 —— 那条留痕要求的存在前提就是阶段①）。
 
 ## 与旧实现的区别
 
@@ -122,14 +125,25 @@ def gather_diaries(data_dir: str | Path, group_id: str,
             if str(r.get("group_id") or "") != str(group_id):
                 continue
             day = str(r.get("day") or "")
-            summary = str(r.get("summary") or "").strip()
-            if not day or not summary:
+            # C31（summary_v2 §7.1）：**取 body 做原料**（digest 只进 §3 长期记忆）。
+            digest = str(r.get("digest") or "").strip()
+            body = str(r.get("body") or "").strip()
+            legacy = False
+            if not body:
+                # ⚠️ 迁移桥：旧记录只有 `summary`（那就是当时的正文）。
+                # **不能因为缺 body 就跳过** —— 迁移首日会让 dream/周报的原料全空，
+                # 而表现是"没有日记"（静默失效；独立核验第 1 轮风险 2）。
+                # 回落的事实要能被统计：`legacy_summary=True` → 进 stats。
+                body = str(r.get("summary") or "").strip()
+                legacy = bool(body)
+            if not day or not body:
                 continue
             # 同日取最新：用 created_at 排序；缺失则后出现的覆盖（文件是追加的）
             prev = by_day.get(day)
             if prev is None or str(r.get("created_at") or "") >= str(
                     prev.get("created_at") or ""):
-                by_day[day] = {"day": day, "summary": summary,
+                by_day[day] = {"day": day, "body": body, "digest": digest,
+                               "legacy_summary": legacy,
                                "created_at": str(r.get("created_at") or "")}
     days = sorted(by_day, reverse=True)[:limit]
     return [by_day[d] for d in sorted(days)]      # 按日期升序返回（时间顺序）
@@ -161,62 +175,15 @@ def load_fragments(data_dir: str | Path, ids=DEFAULT_FEWSHOT_IDS) -> list[dict]:
 
 # ---------------------------------------------------------------- 提示词
 
-# 锚点抽取（阶段①）—— 自由文本 + **充足预算**，低温
+# 做梦 —— 自由写作
 #
-# 🔴 修正我自己的错误结论（2026-09-14，用户指出）：
-# 此前我判定"必须约定 JSON schema 才能稳定拿到输出"，并据此改成了强制 JSON。
-# **那是错的** —— 真正的问题是 `max_tokens` 给得太紧。
-#
-# 实测同一批日记（`reasoning_effort=low`）：
-#   自由文本 2048  → length / 思考 **2048（顶格）** / content **空**
-#   自由文本 8192  → stop   / 思考 1837 / ✅ 6 条有效锚点
-#   自由文本 16384 → stop   / 思考 1777 / ✅ 6 条有效锚点
-#   JSON 2048      → length / 思考 **2048（顶格）** / content **空**  ← 同 prompt 上一轮却成功
-#
-# 结论：**思考 token 是重尾随机变量**（同一 prompt 实测 556 或 2048），
-# 预算紧则被截断概率高；JSON 那次"成功"只是波动中的幸运值，不可依赖。
-# 且用户指出：约定格式在高温度下会破坏生成质量、LLM 也不保证遵守。
-# ⇒ **给足预算，不要用格式换稳定性。** `max_tokens` 是上限而非消耗，给大无代价。
-ANCHOR_SYSTEM = (
-    "读下面几篇日记，把其中**身体和感官**的细节摘出来。\n"
-    "每条一行，只写体感（体温/疼/困/饿/气味/光线/声音/时段），"
-    "不写事件、不写人名、不写观点。3-6 条即可。"
-)
-
-
-def parse_anchors(raw: str) -> str:
-    """从锚点响应里取 ``anchors`` 列表，拼成逐行文本（失败返回原文本）。"""
-    t = (raw or "").strip()
-    if not t:
-        return ""
-    if t.startswith("```"):
-        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
-        t = re.sub(r"\s*```$", "", t).strip()
-    obj = None
-    try:
-        obj = json.loads(t)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", t, re.S)
-        if m:
-            try:
-                obj = json.loads(m.group(0))
-            except json.JSONDecodeError:
-                obj = None
-    if isinstance(obj, dict):
-        items = obj.get("anchors")
-        if isinstance(items, list):
-            lines = [str(x).strip() for x in items if str(x).strip()]
-            if lines:
-                return "\n".join(lines)
-    # 兜底：原样返回（调用方仍能当参考文本用）
-    return t
-
-
-# 做梦（阶段②）—— 自由写作
+# 身份（C33④，`dream_v2.md` §9 定案）：**只给 §4 世界/群聊信息** ——
+# 梦的"我"靠日记的第一人称隐含继承（保留朦胧感），给身份段反而可能把
+# 文学指令带偏。世界段由 `build_dream_system()` 追加（调用方注入）。
 DREAM_SYSTEM = (
     "你刚睡醒，要写下你做的梦。\n"
     "\n"
-    "下面给你几篇日记（有缺失，句子被随机丢掉了一些）、几个感觉锚点、"
+    "下面给你几篇日记（有缺失，句子被随机丢掉了一些）、"
     "以及几段别人写的文字作为**语感参考**。\n"
     "\n"
     "请写一段四五百字上下的梦境语段。要点：\n"
@@ -249,10 +216,20 @@ DREAM_SYSTEM = (
 )
 
 
+def build_dream_system(world_block: str = "") -> str:
+    """做梦的 system = `DREAM_SYSTEM` ＋ **§4 世界段**（C33④）。
+
+    只给世界段：它是唯一进梦的设定（`dream_v2.md` §9）。世界段为空时原样返回 ——
+    宁可不给，也不要塞一个空标题。
+    """
+    base = DREAM_SYSTEM.strip()
+    world = (world_block or "").strip()
+    return f"{base}\n\n{world}" if world else base
+
+
 @dataclass
 class DreamResult:
     text: str = ""
-    anchors: str = ""
     days: list[str] = field(default_factory=list)
     diaries_used: int = 0
     fragments_used: int = 0
@@ -260,22 +237,12 @@ class DreamResult:
     stats: dict = field(default_factory=dict)
 
 
-def build_anchor_prompt(diaries: list[dict]) -> str:
-    parts = ["以下是几篇群聊日记：\n"]
-    for d in diaries:
-        parts.append(f"［{d['day']}］\n{d['summary']}\n")
-    parts.append("\n请按要求抽出身体与感觉的锚点。")
-    return "\n".join(parts)
-
-
-def build_dream_prompt(diaries: list[dict], anchors: str,
-                       fragments: list[dict]) -> str:
+def build_dream_prompt(diaries: list[dict], fragments: list[dict]) -> str:
+    """做梦的 user（原料）。锚点阶段已删（C33⑤）→ 不再有锚点段。"""
     parts: list[str] = []
     parts.append("## 日记（有缺失）\n")
     for d in diaries:
-        parts.append(f"［{d['day']}］\n{d['summary']}\n")
-    if anchors.strip():
-        parts.append("## 感觉锚点\n" + anchors.strip() + "\n")
+        parts.append(f"［{d['day']}］\n{d['text']}\n")
     if fragments:
         parts.append("## 语感参考（不要照抄）\n")
         for f in fragments:
@@ -289,19 +256,21 @@ def build_dream_prompt(diaries: list[dict], anchors: str,
 # ---------------------------------------------------------------- 编排
 
 class DreamMaker:
-    """把"取日记 → 残缺化 → 抽锚点 → 做梦"串起来。
+    """把"取日记 → 残缺化 → 做梦"串起来（**单阶段**，C33⑤）。
 
-    两个 LLM 调用由调用方注入（``anchor_fn`` / ``dream_fn``）—— 保持本类
+    唯一那次 LLM 调用由调用方注入（``dream_fn``）—— 保持本类
     **不依赖 astrbot 运行时**，可离线单测。
     """
 
     def __init__(self, data_dir: str | Path, *,
-                 anchor_fn=None, dream_fn=None,
+                 dream_fn=None,
                  seed: Optional[int] = None,
-                 fragment_ids=DEFAULT_FEWSHOT_IDS) -> None:
+                 fragment_ids=DEFAULT_FEWSHOT_IDS,
+                 world_block: str = "") -> None:
         self._dir = Path(data_dir)
-        self._anchor_fn = anchor_fn
         self._dream_fn = dream_fn
+        # C33④：system = DREAM_SYSTEM + §4 世界段（梦唯一的设定来源）
+        self._system = build_dream_system(world_block)
         self._rnd = random.Random(seed)
         self._ids = fragment_ids
 
@@ -317,55 +286,59 @@ class DreamMaker:
             return DreamResult(stats={"error": "no_diaries"}), [], []
         total_sents = 0
         dropped = 0
+        legacy_n = 0
         frag_diaries: list[dict] = []
         for d in diaries:
-            before = split_sentences(d["summary"])
-            after_txt = fragment(d["summary"], self._rnd)
+            # C33②：原料取 **body**（不是 summary/digest）
+            before = split_sentences(d["body"])
+            after_txt = fragment(d["body"], self._rnd)
             after = split_sentences(after_txt)
             total_sents += len(before)
             dropped += max(0, len(before) - len(after))
-            frag_diaries.append({"day": d["day"], "summary": after_txt})
+            if d.get("legacy_summary"):
+                legacy_n += 1
+            frag_diaries.append({"day": d["day"], "text": after_txt})
         fragments = load_fragments(self._dir, ids=self._ids)
+        stats = {"total_sentences": total_sents, "dropped_sentences": dropped}
+        if legacy_n:
+            # 降级必须可见：这些日记是**旧格式**（只有 summary），原料质量可能偏低
+            stats["legacy_summary_diaries"] = legacy_n
         return DreamResult(
             days=[d["day"] for d in diaries],
             diaries_used=len(diaries),
             fragments_used=len(fragments),
             dropped_ratio=round(dropped / total_sents, 3) if total_sents else 0.0,
-            stats={"total_sentences": total_sents, "dropped_sentences": dropped},
+            stats=stats,
         ), frag_diaries, fragments
 
     async def make(self, group_id: str, limit: int = DIARY_WINDOW) -> DreamResult:
-        """完整流程：① 抽锚点 ② 做梦。任一阶段失败则返回带 error 的结果。"""
+        """完整流程（**单阶段**，C33⑤）：取日记 → 残缺化 → 做梦。"""
         res, frag_diaries, fragments = self.prepare(group_id, limit=limit)
         if res.stats.get("error"):
             return res
-        anchors = ""
-        if self._anchor_fn is not None:
-            try:
-                anchors = parse_anchors(str(await self._anchor_fn(
-                    ANCHOR_SYSTEM, build_anchor_prompt(frag_diaries)) or ""))
-            except Exception as e:
-                # 锚点失败不致命 —— 降级为"直接做梦"（少了意象源但仍有日记）
-                res.stats["anchor_error"] = f"{type(e).__name__}: {e}"
         if self._dream_fn is None:
             res.stats["error"] = "no_dream_fn"
             return res
         try:
             text = str(await self._dream_fn(
-                DREAM_SYSTEM,
-                build_dream_prompt(frag_diaries, anchors, fragments)) or "").strip()
+                self._system,
+                build_dream_prompt(frag_diaries, fragments)) or "").strip()
         except Exception as e:
             res.stats["error"] = f"dream_failed: {type(e).__name__}: {e}"
             return res
         res.text = text
-        res.anchors = anchors
         if not text:
             res.stats["error"] = "empty_dream"
         return res
 
 
 def persist_dream(data_dir: str | Path, group_id: str, res: DreamResult) -> dict:
-    """把梦记进 ``dreams.jsonl``（长期留存 + 供推送与 LLM 消费）。"""
+    """把梦记进 ``dreams.jsonl``（长期留存 + **供推送**）。
+
+    ⚠️ 原注释写「＋供 LLM 消费」是**错的**（C33①，用户 2026-09-19 确认
+    「不知道是之前哪个子代理乱写的」）：梦的产物**只推送给人**，
+    没有任何 LLM 消费者（梦不进 RP 上下文）。
+    """
     import time
     rec = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -374,7 +347,6 @@ def persist_dream(data_dir: str | Path, group_id: str, res: DreamResult) -> dict
         "diaries_used": res.diaries_used,
         "fragments_used": res.fragments_used,
         "dropped_ratio": res.dropped_ratio,
-        "anchors": res.anchors,
         "dream": res.text,
         "stats": res.stats,
     }

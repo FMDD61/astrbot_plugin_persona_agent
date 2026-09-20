@@ -478,6 +478,18 @@ class StyleProfile:
             return self.system_prompt()
         return text
 
+    def world_section(self) -> str:
+        """§4 世界/群聊段（C33④：**梦唯一的设定来源**）。
+
+        梦不给 §1/§2（身份靠日记的第一人称隐含继承，保留朦胧感），
+        也不给 §7 语言风格（D30：措辞会被模仿，会把 382 字的文学指令带偏）；
+        只给这一段，让模型知道"这是哪个群"。
+        """
+        try:
+            return str(self.persona_section_texts().get("s4_world") or "")
+        except Exception:                             # pragma: no cover - 防御
+            return ""
+
     def persona_manifest(self, *, texts: Optional[dict] = None,
                        memory_block: Optional[str] = None,
                        assembled: str = "") -> dict:

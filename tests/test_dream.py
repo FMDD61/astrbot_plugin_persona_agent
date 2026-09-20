@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
-"""做梦（S11）：取日记 → 残缺化 → 抽锚点 → 做梦。
+"""做梦（S11）：取日记 → 残缺化 → **做梦**（单阶段，C33⑤）。
 
-用户 2026-09-14 定的口径：
-- 原料 = 最近 **7 个不同 day** 的日记；不足按实际数量
+用户 2026-09-14 定的口径（2026-09-19 的 v2 修正见括号）：
+- 原料 = 最近 **7 个不同 day** 的日记（**取 body**，C33②）；不足按实际数量
 - **残缺化** = 每篇随机丢弃 **20%~30%** 的句子
 - 温度 1.3 / 思考强度 low
 - 样例文本是**参考**，不是要照搬的结构模板
 - **不做熟悉度汇报**（已从 DreamJob 剥离）
-- 产物要推送
+- 产物要推送（**没有 LLM 消费者**，C33①）
+- system 只给 **§4 世界段**（C33④）；**锚点阶段已删**（C33⑤）
 """
 import asyncio
+import inspect
 import json
 import os
 import random
@@ -20,8 +22,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from services.dream import (  # noqa: E402
-    DROP_MAX, DROP_MIN, DreamMaker, build_dream_prompt, fragment,
-    gather_diaries, load_fragments, persist_dream, split_sentences,
+    DROP_MAX, DROP_MIN, DreamMaker, DreamResult, build_dream_prompt,
+    fragment, gather_diaries, load_fragments, persist_dream, split_sentences,
 )
 
 LONG = ("今天群里还是老样子热闹，成员卯一整天在那娶群友，娶成员寅娶成员戊全被拒了。"
@@ -92,7 +94,7 @@ class TestGatherDiaries(unittest.TestCase):
                         encoding="utf-8")
 
     def test_takes_last_seven_distinct_days(self):
-        rows = [{"day": f"2026-09-{d:02d}", "group_id": "g1", "summary": f"第{d}天"}
+        rows = [{"day": f"2026-09-{d:02d}", "group_id": "g1", "body": f"第{d}天"}
                 for d in range(1, 15)]
         self._write(self.gdir / "daily_diary.jsonl", rows)
         got = gather_diaries(self.td.name, "g1")
@@ -103,42 +105,42 @@ class TestGatherDiaries(unittest.TestCase):
     def test_duplicate_day_takes_latest(self):
         """实测同日多条（B-018 幂等是后加的）→ 取最新一条，不依赖清理历史。"""
         self._write(self.gdir / "daily_diary.jsonl", [
-            {"day": "2026-09-13", "group_id": "g1", "summary": "旧",
+            {"day": "2026-09-13", "group_id": "g1", "body": "旧",
              "created_at": "2026-09-14T02:05:00Z"},
-            {"day": "2026-09-13", "group_id": "g1", "summary": "新",
+            {"day": "2026-09-13", "group_id": "g1", "body": "新",
              "created_at": "2026-09-14T02:06:00Z"},
         ])
         got = gather_diaries(self.td.name, "g1")
         self.assertEqual(len(got), 1)
-        self.assertEqual(got[0]["summary"], "新")
+        self.assertEqual(got[0]["body"], "新")
 
     def test_reads_both_locations(self):
         """取材位置有两个（现行 logs/<gid>/ 与早期根目录）—— 都要读。"""
         self._write(self.gdir / "daily_diary.jsonl",
-                    [{"day": "2026-09-13", "group_id": "g1", "summary": "群目录"}])
+                    [{"day": "2026-09-13", "group_id": "g1", "body": "群目录"}])
         self._write(Path(self.td.name) / "daily_diary.jsonl",
-                    [{"day": "2026-09-12", "group_id": "g1", "summary": "根目录"}])
+                    [{"day": "2026-09-12", "group_id": "g1", "body": "根目录"}])
         got = gather_diaries(self.td.name, "g1")
         self.assertEqual([d["day"] for d in got], ["2026-09-12", "2026-09-13"])
 
     def test_filters_other_groups(self):
         self._write(self.gdir / "daily_diary.jsonl", [
-            {"day": "2026-09-13", "group_id": "other", "summary": "别人的"},
-            {"day": "2026-09-13", "group_id": "g1", "summary": "我的"},
+            {"day": "2026-09-13", "group_id": "other", "body": "别人的"},
+            {"day": "2026-09-13", "group_id": "g1", "body": "我的"},
         ])
         got = gather_diaries(self.td.name, "g1")
-        self.assertEqual([d["summary"] for d in got], ["我的"])
+        self.assertEqual([d["body"] for d in got], ["我的"])
 
     def test_tolerates_corrupt_lines(self):
         p = self.gdir / "daily_diary.jsonl"
-        p.write_text('{坏行\n{"day":"2026-09-13","group_id":"g1","summary":"好的"}\n\n',
+        p.write_text('{坏行\n{"day":"2026-09-13","group_id":"g1","body":"好的"}\n\n',
                      encoding="utf-8")
         self.assertEqual(len(gather_diaries(self.td.name, "g1")), 1)
 
     def test_fewer_than_seven_is_fine(self):
         """不足 7 篇按实际数量做（用户明确），不报错。"""
         self._write(self.gdir / "daily_diary.jsonl",
-                    [{"day": "2026-09-13", "group_id": "g1", "summary": "只有一篇"}])
+                    [{"day": "2026-09-13", "group_id": "g1", "body": "只有一篇"}])
         self.assertEqual(len(gather_diaries(self.td.name, "g1")), 1)
 
     def test_no_diaries_returns_empty(self):
@@ -167,7 +169,7 @@ class TestDreamMaker(unittest.TestCase):
         gdir = Path(self.td.name) / "logs" / "g1"
         gdir.mkdir(parents=True)
         rows = [{"day": f"2026-09-{d:02d}", "group_id": "g1",
-                 "summary": LONG, "created_at": f"2026-09-{d:02d}T03:00:00Z"}
+                 "body": LONG, "created_at": f"2026-09-{d:02d}T03:00:00Z"}
                 for d in range(8, 15)]
         (gdir / "daily_diary.jsonl").write_text(
             "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
@@ -176,40 +178,21 @@ class TestDreamMaker(unittest.TestCase):
     def tearDown(self):
         self.td.cleanup()
 
-    def test_two_stage_flow(self):
+    def test_single_stage_flow(self):
         seen = {}
-
-        async def anchor_fn(sys_p, prompt):
-            seen["anchor_sys"] = sys_p
-            seen["anchor_prompt"] = prompt
-            # 锚点阶段用**自由文本**（2026-09-14 用户指出：问题不是格式而是预算）
-            return "低烧不退\n凌晨的屏幕光"
 
         async def dream_fn(sys_p, prompt):
             seen["dream_sys"] = sys_p
             seen["dream_prompt"] = prompt
             return "我梦见了那些傍晚。光像融化的糖浆。"
 
-        mk = DreamMaker(self.td.name, anchor_fn=anchor_fn, dream_fn=dream_fn, seed=1)
+        mk = DreamMaker(self.td.name, dream_fn=dream_fn, seed=1)
         res = asyncio.run(mk.make("g1"))
         self.assertEqual(res.diaries_used, 7)
         self.assertIn("糖浆", res.text)
-        self.assertIn("低烧", res.anchors)
-        # 锚点结果必须进入做梦提示词（这正是子代理指出的"意象源"缺口）
-        self.assertIn("低烧", seen["dream_prompt"])
-        self.assertIn("感觉锚点", seen["dream_prompt"])
-        self.assertIn("身体和感官", seen["anchor_sys"])
-        # ⚠️ 故意**不**约定 JSON：实测真正的问题是 max_tokens 给太紧，不是格式。
-        # 约定格式在高温度下会破坏生成质量，且 LLM 不保证遵守（用户指出）。
-        self.assertNotIn("JSON", seen["anchor_sys"])
-
-    def test_parse_anchors_still_tolerates_json(self):
-        """`parse_anchors` 保留 JSON 兼容（万一模型自发输出 JSON），但**不要求** JSON。"""
-        from services.dream import parse_anchors
-        self.assertEqual(parse_anchors("自由文本一行\n第二行"), "自由文本一行\n第二行")
-        self.assertEqual(parse_anchors('{"anchors": ["甲", "乙"]}'), "甲\n乙")
-        self.assertEqual(parse_anchors(""), "")
-        self.assertEqual(parse_anchors("  低烧  \n  屏幕光  ").strip(), "低烧  \n  屏幕光")
+        # C33⑤：锚点阶段已删 —— 提示词里**不得**再出现"感觉锚点"段
+        self.assertNotIn("感觉锚点", seen["dream_prompt"])
+        self.assertNotIn("anchors", json.dumps(res.stats, ensure_ascii=False))
 
     def test_budgets_are_generous(self):
         """🔴 回归：预算必须给足（用户 2026-09-14 的核心批评）。
@@ -222,20 +205,6 @@ class TestDreamMaker(unittest.TestCase):
         p = _os.path.join(_os.path.dirname(__file__), "..", "_conf_schema.json")
         d = _json.load(open(p, encoding="utf-8"))["dream"]["items"]
         self.assertGreaterEqual(d["max_tokens"]["default"], 8192)
-        self.assertGreaterEqual(d["anchor_max_tokens"]["default"], 8192)
-
-    def test_anchor_failure_degrades_gracefully(self):
-        """锚点失败不致命 —— 降级为直接做梦（仍有日记原料）。"""
-        async def boom(sys_p, prompt):
-            raise RuntimeError("anchor boom")
-
-        async def dream_fn(sys_p, prompt):
-            return "梦"
-
-        mk = DreamMaker(self.td.name, anchor_fn=boom, dream_fn=dream_fn, seed=1)
-        res = asyncio.run(mk.make("g1"))
-        self.assertEqual(res.text, "梦")
-        self.assertIn("anchor_error", res.stats)
 
     def test_dream_failure_reported(self):
         async def dream_fn(sys_p, prompt):
@@ -282,7 +251,7 @@ class TestDreamMaker(unittest.TestCase):
 
     def test_prompt_has_guardrails(self):
         """防退化条款必须在（禁 AI 套语/禁元叙述/禁止照抄）。"""
-        p = build_dream_prompt([{"day": "d", "summary": "x"}], "锚点", [])
+        build_dream_prompt([{"day": "d", "text": "x"}], [])   # 冒烟：签名已无锚点参数
         # 提示词本体在 DREAM_SYSTEM 里，这里确认能拼进去
         from services.dream import DREAM_SYSTEM
         for must in ("仿佛整个世界都安静了", "梦醒了", "不要照抄", "沉降"):
@@ -291,3 +260,88 @@ class TestDreamMaker(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestC33DreamV2(unittest.TestCase):
+    """C33：dream 四项改造的回归（原料 body / §4 世界段 / 注释更正 / 删锚点）。
+
+    设计依据：`docs/specs/dream_v2.md` §5③/§8/§9/§10。
+    """
+
+    def _write_day(self, td, day, **fields):
+        gdir = Path(td) / "logs" / "g1"
+        gdir.mkdir(parents=True, exist_ok=True)
+        rec = {"day": day, "group_id": "g1", **fields}
+        with open(gdir / "daily_diary.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def test_dream_reads_body_not_digest(self):
+        """§7.3①：原料是 body（digest 不进梦）。"""
+        with tempfile.TemporaryDirectory() as td:
+            self._write_day(td, "2026-09-13", digest="一句话摘要",
+                            body="这一天发生的正文")
+            got = gather_diaries(td, "g1")
+            self.assertEqual(got[0]["body"], "这一天发生的正文")
+            self.assertEqual(got[0]["digest"], "一句话摘要")
+            self.assertFalse(got[0]["legacy_summary"])
+
+    def test_legacy_record_without_body_still_usable(self):
+        """🔴 迁移桥：旧记录只有 summary → 回落为 body 并**标出来**。
+
+        不回落的话，迁移首日 dream/周报的原料会全空，而表现是「没有日记」——
+        正是本项目反复栽的静默失效（独立核验第 1 轮风险 2）。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            self._write_day(td, "2026-09-13", summary="旧格式的那一天")
+            got = gather_diaries(td, "g1")
+            self.assertEqual(got[0]["body"], "旧格式的那一天")
+            self.assertTrue(got[0]["legacy_summary"])
+
+    def test_legacy_fallback_counted_in_stats(self):
+        """回落条数必须进 stats（降级可见，不靠人肉比对）。"""
+        with tempfile.TemporaryDirectory() as td:
+            for d in range(8, 15):
+                self._write_day(td, f"2026-09-{d:02d}", summary=LONG)
+            mk = DreamMaker(td, seed=1)
+            res, frag, _ = mk.prepare("g1")
+            self.assertEqual(res.stats.get("legacy_summary_diaries"), 7)
+            self.assertTrue(all("text" in f for f in frag))
+
+    def test_world_block_appended_to_system(self):
+        """C33④：梦的 system = DREAM_SYSTEM + §4 世界段（梦唯一的设定来源）。"""
+        from services.dream import DREAM_SYSTEM, build_dream_system
+        self.assertEqual(build_dream_system(""), DREAM_SYSTEM.strip())
+        got = build_dream_system("【我待的这个地方】\n这里是测试群")
+        self.assertIn("【我待的这个地方】", got)
+        self.assertTrue(got.startswith(DREAM_SYSTEM.strip()))
+
+    def test_maker_passes_world_block_into_system(self):
+        seen = {}
+
+        async def dream_fn(sys_p, prompt):
+            seen["sys"] = sys_p
+            return "梦"
+
+        with tempfile.TemporaryDirectory() as td:
+            self._write_day(td, "2026-09-13", body=LONG)
+            mk = DreamMaker(td, dream_fn=dream_fn, seed=1,
+                            world_block="【我待的这个地方】世界段")
+            asyncio.run(mk.make("g1"))
+            self.assertIn("【我待的这个地方】", seen["sys"])
+            self.assertNotIn("感觉锚点", seen["sys"])
+
+    def test_persist_has_no_anchors_field(self):
+        """C33③ 作废的连带：落盘记录里不该再有 anchors 字段。"""
+        with tempfile.TemporaryDirectory() as td:
+            mk = DreamMaker(td, seed=1)
+            res = DreamResult(text="梦", days=["2026-09-13"], diaries_used=1)
+            rec = persist_dream(td, "g1", res)
+            self.assertNotIn("anchors", rec)
+            self.assertIn("dream", rec)
+
+    def test_no_anchor_symbols_remain_in_module(self):
+        """删除要彻底：模块里不得再留锚点阶段的任何符号。"""
+        import services.dream as dm
+        for gone in ("ANCHOR_SYSTEM", "parse_anchors", "build_anchor_prompt"):
+            self.assertFalse(hasattr(dm, gone), f"{gone} 未删干净")
+            self.assertNotIn(gone, inspect.getsource(dm))

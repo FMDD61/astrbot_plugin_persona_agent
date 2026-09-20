@@ -72,6 +72,39 @@
     旧文案教的正是它，两条路都要能走。
   - 测试 +7 例（`TestTaggedQuoteC17`）。
 
+### Changed (2026-09-20, 提示词 v2 · 批次二b：C31 摘要 digest+body / C33 dream 四项)
+> 完成 handoff §7 的批次②（C20/C21/C32 见更早的条目，C31/C33 见本条）。
+> **不改线上即时行为**：摘要与梦都在睡眠窗（02:05–03:00）跑。
+
+- **C31 摘要改 `digest + body` 两字段**（`summary_v2.md` §2/§3/§7）：
+  - **格式约定死**（frontmatter + 正文），代码在 `---` 围栏处切开（`split_digest_body`）。
+    依据是 `vision.py` S6 的实测：自由文本可用率 **31.2%**，约定固定形状后 **100%**。
+  - **两条线不交叉**：`digest`（一句话）**只进 §3 长期记忆**；`body`（正文）**只喂上一层**
+    （周读日记 body、月读周 body、年读月 body）。**正文永不进 RP 上下文** ——
+    每天往上下文塞 200 字散文，与「把输出压回 7.9 字」的方向相反。
+  - **四个 PHI 换定稿文案**（日记/周/月/年），**一律包成末尾的 `system` 块**；
+    **原料留在 `user`**（`build_prompt` 收窄为纯原料）。整条改成 system 会让请求里
+    **没有任何非 system 消息**，部分 provider 不接受 —— 所以必须拆两半。
+  - **旧数据迁移桥**：旧记录只有 `summary` → 读侧按 `body = body or summary` 回落
+    （`list_diaries` / `list_summaries` / `dream.gather_diaries` 三处一致）。
+    不回落的话迁移首日 dream/周报原料**全空**，而表现是「没有日记」——正是静默失效。
+    回落条数进 `stats["legacy_summary_diaries"]`。
+  - 格式没遵守时**正文照收**（只记 `digest_missing`）：宁可少一句摘要，不要丢掉整篇。
+- **C33 dream 四项 + 删锚点阶段**（`dream_v2.md` §5③/§8/§9/§10）：
+  - **⑤ 删除锚点阶段**（用户 2026-09-19：「锚点直接删去…未在设计内，会对 LLM 的注意力
+    产生不确定的引导行为」）。该设计出自**子代理推理**、从未被验证；三次真实运行里
+    两次锚点为空（等于顺带跑了对照组），**没锚点那次也成立**。删后**每周只剩 1 次调用**。
+    连带作废 **③**（「锚点空返回要留痕」的存在前提就是阶段①）。
+  - **②** 取料 `summary` → **`body`**（digest 不进梦）。
+  - **④** system 加 **§4 世界段**（`build_dream_system` + `StyleProfile.world_section()`）——
+    梦唯一的设定来源；身份靠日记的第一人称隐含继承（保留朦胧感）。
+  - **①** `dreams.jsonl` 注释更正：「供 LLM 消费」是错的 —— 梦**只推送给人**，无 LLM 读者。
+  - 删除清单：`ANCHOR_SYSTEM` / `parse_anchors` / `build_anchor_prompt` / `DreamResult.anchors` /
+    `anchor_fn` / `main._dream_anchor_llm()` / 配置 `dream.anchor_temperature` + `anchor_max_tokens`
+    / 三条锚点用例。
+  - 新增 `test_no_anchor_symbols_remain_in_module`：模块里不得再留锚点阶段的任何符号。
+- 测试 731 → **745 全绿**（新增 C33 回归 7 例 + C31 回归 8 例，改写 3 例旧断言）。
+
 ### Fixed (2026-09-20, 独立核验第 3 轮：静态闸判据换 AST + N-4 范围声明)
 > 审查方核对 `acba8e5`（0 阻塞 + 4 非阻塞）。C21 这条线已关闭（三条验收 + CHANGELOG 更正到位）。
 

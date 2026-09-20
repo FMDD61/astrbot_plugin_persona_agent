@@ -16,12 +16,14 @@ if str(REPO_ROOT) not in sys.path:
 try:
     from services.summary import (
         SummaryService, weekly_window, monthly_window, list_diaries,
-        sample_days, build_prompt, append_summary,
+        sample_days, build_prompt, append_summary, build_phi,
+        split_digest_body,
     )
 except ImportError:
     from astrbot_plugin_persona_agent.services.summary import (
         SummaryService, weekly_window, monthly_window, list_diaries,
-        sample_days, build_prompt, append_summary,
+        sample_days, build_prompt, append_summary, build_phi,
+        split_digest_body,
     )
 
 
@@ -104,9 +106,14 @@ class CollectTests(unittest.TestCase):
         svc = SummaryService(str(self.dir))
         c = svc.collect("weekly", "123456789", today=date(2026, 8, 24))
         p = build_prompt(c["kind"], c["group_id"], c["label"], c["diaries"], c["samples"])
-        self.assertIn("2026-W34", p)
+        # C31：原料块只放原料（指令与格式在 build_phi 的 system 块里）
+        self.assertNotIn("2026-W34", p, "周期标签已挪进 PHI")
         self.assertIn("周一 summary", p)
         self.assertIn("今天好累哦", p)
+        phi = build_phi(c["kind"])
+        self.assertIn("【这一周结束了】", phi)
+        self.assertIn("---", phi, "格式围栏必须约定死（summary_v2 §2）")
+        self.assertIn("digest:", phi)
 
     def test_append_summary_persists(self) -> None:
         svc = SummaryService(str(self.dir))
@@ -117,7 +124,11 @@ class CollectTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         loaded = json.loads(lines[0])
         self.assertEqual(loaded["period"], "2026-W34")
-        self.assertEqual(loaded["summary"], "本周摘要正文")
+        # C31：不再写 summary —— 切开成 digest + body
+        self.assertNotIn("summary", loaded)
+        self.assertEqual(loaded["body"], "本周摘要正文")
+        self.assertEqual(loaded["digest"], "")
+        self.assertTrue(loaded.get("digest_missing"), "没按格式产出必须可统计")
 
     def test_empty_period_collect(self) -> None:
         svc = SummaryService(str(Path(tempfile.mkdtemp())))
@@ -212,3 +223,72 @@ class DiarySourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestC31DigestBody(unittest.TestCase):
+    """C31：摘要改 digest + body 两字段（summary_v2 §2/§3/§7）。"""
+
+    def test_split_with_fences(self):
+        digest, body = split_digest_body(
+            "---\ndate: 2026-09-17\ndigest: 成员戊拔智齿，大家轮流摸摸\n---\n"
+            "今天群里从早上就很热闹……")
+        self.assertEqual(digest, "成员戊拔智齿，大家轮流摸摸")
+        self.assertTrue(body.startswith("今天群里"))
+
+    def test_split_tolerates_missing_fences(self):
+        """格式没遵守 → **正文照收**，只是没有 digest（不能整篇丢掉）。"""
+        digest, body = split_digest_body("今天就这样过去了。")
+        self.assertEqual(digest, "")
+        self.assertEqual(body, "今天就这样过去了。")
+
+    def test_split_tolerates_fences_without_digest_key(self):
+        digest, body = split_digest_body("---\ndate: 2026-09-17\n---\n正文")
+        self.assertEqual(digest, "")
+        self.assertEqual(body, "正文")
+
+    def test_split_strips_code_fence(self):
+        """模型把整段包进代码围栏时先剥掉（围栏字符用 chr 拼，避免与源码样式冲突）。"""
+        fence = chr(96) * 3
+        digest, body = split_digest_body(
+            fence + "\n---\ndigest: 一句话\n---\n正文\n" + fence)
+        self.assertEqual(digest, "一句话")
+        self.assertEqual(body, "正文")
+
+    def test_append_keeps_digest_and_body(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "weekly_summary.jsonl"
+            rec = append_summary(p, "weekly", "g1", "2026-W37",
+                                 "---\nweek: W37\ndigest: 一句话\n---\n正文内容", {})
+            self.assertEqual(rec["digest"], "一句话")
+            self.assertEqual(rec["body"], "正文内容")
+            self.assertFalse(rec.get("digest_missing"))
+
+    def test_append_body_only_uses_digest_as_body(self):
+        """只有 digest 没有正文 → 正文回落 digest，别让上一层拿到空原料。"""
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "weekly_summary.jsonl"
+            rec = append_summary(p, "weekly", "g1", "2026-W37",
+                                 "---\ndigest: 只有一句话\n---\n", {})
+            self.assertEqual(rec["body"], "只有一句话")
+            self.assertTrue(rec.get("body_from_digest"))
+
+    def test_list_summaries_reads_body_with_legacy_fallback(self):
+        from services.summary import list_summaries
+        from datetime import date as _d
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "monthly_summary.jsonl"
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"kind": "monthly", "group_id": "g1",
+                                    "period": "2026-08", "body": "新格式正文"},
+                                   ensure_ascii=False) + "\n")
+                f.write(json.dumps({"kind": "monthly", "group_id": "g1",
+                                    "period": "2026-07", "summary": "旧格式正文"},
+                                   ensure_ascii=False) + "\n")
+            got = list_summaries(p, "g1", _d(2026, 1, 1), _d(2026, 12, 31))
+            self.assertEqual([r["body"] for r in got], ["旧格式正文", "新格式正文"])
+
+    def test_each_kind_has_its_own_phi(self):
+        for kind, marker in (("daily", "【今天结束了】"), ("weekly", "【这一周结束了】"),
+                             ("monthly", "【这个月结束了】"), ("yearly", "【这一年结束了】")):
+            self.assertIn(marker, build_phi(kind))
+        self.assertEqual(build_phi("unknown"), "")

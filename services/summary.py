@@ -14,6 +14,7 @@ LLM 改写由 main 注入（本模块只做：窗口计算 / 数据收集 / prom
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
@@ -22,10 +23,111 @@ DIARY_FILE = "daily_diary.jsonl"
 WEEKLY_FILE = "weekly_summary.jsonl"
 MONTHLY_FILE = "monthly_summary.jsonl"
 YEARLY_FILE = "yearly_summary.jsonl"
-_PRELUDE = (
-    "请把过去一段时间群里发生的事写成一段简短摘要（第一人称、本人语气），"
-    "按时间顺序包含主要话题与群友互动，不要列条、不要编造日日记与原文里没有的事。"
-)
+# ---------------------------------------------------------------- C31：格式与 PHI
+#
+# 设计依据 `docs/specs/summary_v2.md`：
+#   §2  **格式必须约定死**（frontmatter + 正文）—— vision S6 的教训：
+#       自由文本可用率 31.2%，约定固定形状后 100%；
+#   §3  **正文永不进 RP 上下文**（每天往 §3 塞 200 字散文，与"把输出压回 7.9 字"
+#       的方向相反）→ digest 进 §3，body 只喂上一层；
+#   §7  PHI **包成末尾的 system 块**；原料留在 user（部分 provider 不接受全 system 请求）。
+
+#: digest 与 body 之间的围栏（模型照抄的格式）
+DIGEST_FENCE = "---"
+
+
+def split_digest_body(text: str) -> tuple[str, str]:
+    """把模型输出按 ``---`` 围栏切成 ``(digest, body)``（C31）。
+
+    期望形状（summary_v2 §2）：
+
+    ```
+    ---
+    date: 2026-09-17
+    digest: 一句话
+    ---
+    正文……
+    ```
+
+    容错：
+      * 没有围栏 → ``("", 全文)`` —— **正文照收**，只是这一篇没有 digest。
+        宁可少一句摘要，也不要因为格式没遵守就丢掉整篇（那会让上一层原料凭空变少，
+        而表现是"今天没发生什么"）；
+      * 有围栏但缺 ``digest:`` 行 → 同上；
+      * 模型把整段包进 ``` 代码围栏 → 先剥掉。
+    """
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t).strip()
+    lines = t.splitlines()
+    idx = [i for i, ln in enumerate(lines) if ln.strip() == DIGEST_FENCE]
+    if len(idx) < 2:
+        return "", t
+    head_lines = lines[idx[0] + 1:idx[1]]
+    body = "\n".join(lines[idx[1] + 1:]).strip()
+    digest = ""
+    for ln in head_lines:
+        m = re.match(r"^\s*digest\s*[:：]\s*(.+?)\s*$", ln)
+        if m:
+            digest = m.group(1).strip()
+            break
+    return digest, body
+
+
+#: 四个 PHI（summary_v2 §5 定稿文案；一律作为**末尾的 system 块**）
+DIARY_PHI = """【今天结束了】
+把今天群里发生的事记成一篇日记，就按这个格式：
+
+---
+date: 今天的绝对日期
+digest: 一句话，说清今天最值得记的事
+---
+正文，平实记述今天聊了什么、谁做了什么。
+
+只写真的发生过的。"""
+
+WEEKLY_PHI = """【这一周结束了】
+下面是我这一周每天的日记。把这一周的事写成一篇周记，就按这个格式：
+
+---
+week: 周次
+range: 起止日期
+digest: 一句话，说清这一周最值得记的事
+---
+正文，把这一周的脉络写连贯，不要逐日罗列。
+
+只写真的发生过的。"""
+
+MONTHLY_PHI = """【这个月结束了】
+下面是我这个月每周的记录。把这一个月的事写成一篇月记，就按这个格式：
+
+---
+month: 月份
+digest: 一句话，说清这一个月最值得记的事
+---
+正文，把这一个月的脉络写连贯，不要逐周罗列。
+
+只写真的发生过的。"""
+
+YEARLY_PHI = """【这一年结束了】
+下面是我这一年每个月的记录。把这一年的事写成一篇年记，就按这个格式：
+
+---
+year: 年份
+digest: 一句话，说清这一年最值得记的事
+---
+正文，把这一年的脉络写连贯，不要逐月罗列。
+
+只写真的发生过的。"""
+
+PHI_BY_KIND = {"daily": DIARY_PHI, "weekly": WEEKLY_PHI,
+               "monthly": MONTHLY_PHI, "yearly": YEARLY_PHI}
+
+
+def build_phi(kind: str) -> str:
+    """该层的 PHI（末尾 system 块）。**不含原料** —— 原料走 user（C31）。"""
+    return PHI_BY_KIND.get(kind, "")
 
 
 def weekly_window(today: date) -> tuple[date, date, str]:
@@ -87,10 +189,12 @@ def list_summaries(path: Path, group_id: str, start: date, end: date,
         period = str(rec.get("period") or "")
         if prefix and not period.startswith(prefix):
             continue
-        summary = str(rec.get("summary") or "").strip()
-        if not summary:
+        # C31：年报读月报的 **body**（digest 只进 §3）
+        body = str(rec.get("body") or rec.get("summary") or "").strip()
+        if not body:
             continue
-        out.append({"period": period, "summary": summary})
+        out.append({"period": period, "body": body,
+                    "digest": str(rec.get("digest") or "").strip()})
     out.sort(key=lambda r: r["period"])
     return out
 
@@ -111,7 +215,11 @@ def list_diaries(path: Path, group_id: str, start: date, end: date) -> list[dict
                 continue
             if str(rec.get("day", "")) not in wanted:
                 continue
-            if (rec.get("summary") or "").strip():
+            # C31：新记录是 body/digest；旧记录只有 summary（= 当时的正文）
+            body = str(rec.get("body") or rec.get("summary") or "").strip()
+            if body:
+                rec["body"] = body
+                rec["digest"] = str(rec.get("digest") or "").strip()
                 out.append(rec)
     except OSError:
         return []
@@ -174,34 +282,32 @@ def sample_days(data_dir: str, group_id: str, start: date, end: date,
 def build_prompt(kind: str, group_id: str, label: str, diaries: list[dict],
                  samples: list[str], max_chars: int = 800,
                  monthlies: Optional[list[dict]] = None) -> str:
-    """组装摘要提示词。
+    """组装**原料块**（进 user；指令与格式在 `build_phi()` 的 system 块里）。
 
-    `yearly` 走**月报**作原料（`monthlies`），其余走日日记 + 原文抽样。
+    C31（`summary_v2.md` §7.2）把原来那条"原料 + 指令"的混合消息**拆成两半**：
+      * 原料（日日记 / 各月月记 / 原文抽样）留在 **user**；
+      * 指令与格式要求（PHI）挪到 **末尾的 system 块**。
+    为什么必须拆：整条改成 system 会让请求里**没有任何非 system 消息**，
+    部分 provider 不接受。拆完三个调用（日记/周月年记）形状完全同构。
+
+    `yearly` 走**月报的 body** 作原料（定案：周/月读上一层 body，digest 只进 §3）。
+    函数名保留 `build_prompt`（调用点与既有测试都在用），语义已收窄为"原料"。
     """
-    label_cn = {"weekly": "一周", "monthly": "一个月",
-                "yearly": "一年"}.get(kind, "一段时间")
     if kind == "yearly":
-        lines = [
-            f"（请为群 {group_id} 写 {label_cn}（{label}）的本人语气回顾，"
-            f"约 {max(min(max_chars, 800), 120)} 字以内。）",
-            "【各月月记】",
-        ]
+        lines = ["【各月月记】"]
         ml = monthlies or []
         if ml:
             for rec in ml:
-                lines.append(f"- {rec.get('period')}: {str(rec.get('summary'))[:300]}")
+                text = str(rec.get("body") or rec.get("summary") or "")
+                lines.append(f"- {rec.get('period')}: {text[:300]}")
         else:
             lines.append("（无）")
-        lines.append("\n请把这一年的脉络写成一段连贯的回顾，不要逐月罗列。")
         return "\n".join(lines)
-    lines = [
-        f"（请为群 {group_id} 写 {label_cn}（{label}）的本人语气摘要，"
-        f"约 {max(min(max_chars, 800), 120)} 字以内。）",
-        "【日日记】",
-    ]
+    lines = ["【日日记】"]
     if diaries:
         for rec in diaries:
-            lines.append(f"- {rec.get('day')}: {str(rec.get('summary'))[:300]}")
+            text = str(rec.get("body") or rec.get("summary") or "")
+            lines.append(f"- {rec.get('day')}: {text[:300]}")
     else:
         lines.append("（无）")
     lines.append("【原文抽样（防失真，可引用其语气但不要复读整段）】")
@@ -213,17 +319,38 @@ def build_prompt(kind: str, group_id: str, label: str, diaries: list[dict],
     return "\n".join(lines)
 
 
-def append_summary(path: Path, kind: str, group_id: str, label: str, summary: str, meta: dict) -> dict:
+def append_summary(path: Path, kind: str, group_id: str, label: str,
+                   summary: str, meta: dict) -> dict:
+    """落盘一条摘要记录（C31：**digest + body 两字段**）。
+
+    参数名保留 `summary`（调用点语义是"模型这次输出的全文"），但落盘时**切开**：
+      * `digest` —— 一句话，只进 §3 长期记忆；
+      * `body`   —— 正文，只喂**上一层**总结（周读日记 body、月读周 body…）；
+      * **不再写 `summary`**（旧字段）。旧记录只有 `summary` 时，读侧按
+        "body = body or summary" 回落（见 `list_diaries`）—— 迁移期不能凭空少原料。
+    """
     import time as _time
+    digest, body = split_digest_body(summary)
     record = {
         "kind": kind,
         "group_id": group_id,
         "period": label,
-        "summary": summary,
+        "digest": digest,
+        "body": body,
         "n_diaries": int(meta.get("n_diaries", 0)),
         "n_samples": int(meta.get("n_samples", 0)),
         "created_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
     }
+    if not digest:
+        # 格式没遵守：正文照收，但这件事必须可统计（summary_v2 §2 的可用率口径）
+        record["digest_missing"] = True
+    if not body:
+        record["body_missing"] = True
+    if not body and digest:
+        # 极端兜底：只有 digest 没有正文 → 正文用 digest，别让上一层拿到空原料
+        record["body"] = digest
+        record["body_from_digest"] = True
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
     return record

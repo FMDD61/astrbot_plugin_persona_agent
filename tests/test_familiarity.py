@@ -472,13 +472,23 @@ class TestYearlyWindow(unittest.TestCase):
             self.assertEqual(got["n_diaries"], 1)
 
     def test_yearly_prompt_uses_monthlies(self):
-        from services.summary import build_prompt
+        from services.summary import build_phi, build_prompt
         p = build_prompt("yearly", "g1", "2025", [], [],
-                         monthlies=[{"period": "2025-01", "summary": "一月的"}])
+                         monthlies=[{"period": "2025-01", "body": "一月的"}])
         self.assertIn("各月月记", p)
         self.assertIn("一月的", p)
-        self.assertIn("不要逐月罗列", p)
         self.assertNotIn("【日日记】", p)
+        # C31：指令（含「不要逐月罗列」）挪进了年记 PHI，不再混在原料里
+        phi = build_phi("yearly")
+        self.assertIn("不要逐月罗列", phi)
+        self.assertIn("【这一年结束了】", phi)
+
+    def test_yearly_materials_tolerate_legacy_summary_records(self):
+        """旧记录只有 summary（没有 body）时，原料不能凭空变空。"""
+        from services.summary import build_prompt
+        p = build_prompt("yearly", "g1", "2025", [], [],
+                         monthlies=[{"period": "2025-02", "summary": "旧格式"}])
+        self.assertIn("旧格式", p)
 
     def test_yearly_output_path(self):
         import tempfile as _tf
