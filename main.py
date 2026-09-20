@@ -963,6 +963,13 @@ class PersonaAgent(Star):
 
         # v3: sleep window — bot stays silent (mimics human rest) but the
         # message has already joined the session/memory for the new day.
+        #
+        # 🔒 用户 2026-09-20 明确（**不要再当 bug 修**）：
+        #   「半夜有人 at 也不要紧，轮转组装期间视作 bot 睡觉了，有消息也不回，
+        #    起床后也不会回复旧消息。」
+        # 即：睡眠窗内 **@ 也不回**（这里的 stop_event 无条件，不看 is_at），
+        # 消息照常入会话（记忆完整），但**不做爬楼式补回** —— 与 D24「bot 是即时回复者」
+        # 一致。轮转/组装正好利用这段窗口（02:05–07:00 零 RP 调用）。
         if self._is_sleeping():
             self._log_decision({
                 "action": "silent",

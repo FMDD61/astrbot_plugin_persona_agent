@@ -479,3 +479,92 @@ class TestDigestHardening(unittest.TestCase):
         sp.memory_layers()
         self.assertTrue(sp.last_memory_generated_at, "generated_at 必须被读出来")
         self.assertEqual(sp.last_memory_layers_n, 1)
+
+
+class TestCrossYear(unittest.TestCase):
+    """跨年核查（用户 2026-09-20 点名要核）。
+
+    两处容易错的地方：
+      ① **ISO 周的周边界跨年** —— 2026-W01 其实是 2025-12-29 .. 2026-01-04（周一在去年）；
+      ② **年/月/日三层的边界**在 1 月初同时生效，容易漏层或重层。
+    """
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.gid = "g1"
+        d = Path(self.td.name) / "logs" / self.gid
+        d.mkdir(parents=True)
+        self.diary_path = d / "daily_diary.jsonl"
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _w(self, name, rows):
+        (Path(self.td.name) / name).write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+            encoding="utf-8")
+
+    def test_iso_week_1_spans_the_year_boundary(self):
+        """2026-W01 = 2025-12-29 .. 2026-01-04 → 12-30 归它、01-05 不归它。"""
+        from services.summary import build_digest_layers
+        self._w("weekly_summary.jsonl", [
+            {"kind": "weekly", "group_id": self.gid, "period": "2026-W01",
+             "digest": "跨年那周"}])
+        self.diary_path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in [
+            {"day": "2025-12-30", "group_id": self.gid, "digest": "周内"},
+            {"day": "2026-01-05", "group_id": self.gid, "digest": "周后"},
+        ]) + "\n", encoding="utf-8")
+        res = build_digest_layers(self.td.name, self.gid)
+        self.assertEqual([x.split()[0] for x in res["layers"]["recent_days"]], ["01-05"],
+                         "12-30 在 W01 覆盖期内 → 该退场；01-05 在期外 → 留下")
+        self.assertEqual(res["layers"]["recent_weeks"], ["2026-W01 跨年那周"])
+
+    def test_year_boundary_keeps_each_layer_once(self):
+        """1 月初：年/月/周/日四层的边界同时生效 —— **不重不漏**。"""
+        from services.summary import build_digest_layers
+        self._w("yearly_summary.jsonl", [
+            {"kind": "yearly", "group_id": self.gid, "period": "2025",
+             "digest": "二〇二五"}])
+        self._w("monthly_summary.jsonl", [
+            {"kind": "monthly", "group_id": self.gid, "period": "2025-12",
+             "digest": "去年十二月"},
+            {"kind": "monthly", "group_id": self.gid, "period": "2026-01",
+             "digest": "今年一月"}])
+        self._w("weekly_summary.jsonl", [
+            {"kind": "weekly", "group_id": self.gid, "period": "2025-W52",
+             "digest": "去年最后一周"},
+            {"kind": "weekly", "group_id": self.gid, "period": "2026-W02",
+             "digest": "今年第二周"}])
+        self.diary_path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in [
+            {"day": "2026-01-05", "group_id": self.gid, "digest": "周内"},
+            {"day": "2026-01-12", "group_id": self.gid, "digest": "周后"},
+        ]) + "\n", encoding="utf-8")
+        res = build_digest_layers(self.td.name, self.gid)
+        L2 = res["layers"]
+        # 年记只留 2025；月记只留 2026-01（2025-12 被年记覆盖）
+        self.assertEqual(L2["older"], ["2025 二〇二五"])
+        self.assertEqual(L2["recent_months"], ["2026-01 今年一月"])
+        # 周记层**为空**：W52 结束于 2025-12-28（被 2025 年记覆盖）；
+        # W02（01-05..01-11）落在已存在的 2026-01 月记覆盖月**之内** —— 两层都不该出现。
+        # 这不是漏洞：这段时间由**月记那一层**代表（下一条断言它在）。
+        self.assertEqual(L2["recent_weeks"], [])
+        self.assertIn("2026-01 今年一月", L2["recent_months"])
+        # 日记只留 01-12（01-05 在 W02=01-05..01-11 之内）
+        self.assertEqual([x.split()[0] for x in L2["recent_days"]], ["01-12"])
+        # 每层最多一次、没有重复行
+        all_lines = [x for v in L2.values() for x in v]
+        self.assertEqual(len(all_lines), len(set(all_lines)))
+
+    def test_window_functions_at_new_year(self):
+        """周/月/年窗口在 1 月 1 日的行为（年记读**上一个完整自然年**）。"""
+        from services.summary import monthly_window, weekly_window, yearly_window
+        from datetime import date as _d
+        self.assertEqual(monthly_window(_d(2026, 1, 1))[2], "2025-12")
+        self.assertEqual(yearly_window(_d(2026, 1, 1))[2], "2025")
+        s, e, label = weekly_window(_d(2026, 1, 1))
+        self.assertEqual(e, _d(2025, 12, 31))
+        self.assertEqual(s, _d(2025, 12, 25))
+        # ⚠️ ISO 周边界的坑：2025-12-31 落在 **2026 年的第 1 个 ISO 周**
+        # （周一起于 2025-12-29）→ 标签是 2026-W01，不是 2025-W52。
+        # 人读 §3 会觉得别扭，但这是 ISO 标准，且与 `_week_end("2026-W01")=2026-01-04` 自洽。
+        self.assertEqual(label, "2026-W01")
