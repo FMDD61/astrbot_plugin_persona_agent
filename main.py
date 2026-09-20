@@ -1456,6 +1456,19 @@ class PersonaAgent(Star):
                         f"[selfcheck] ⚠️ 人格提示词 {sp_len} 字符偏大 → 每轮进前缀，"
                         f"检查 persona/ 段文件（或 system_prompt_fragments.json）是否失控"
                     )
+                # C22 的 Gate 头部：**接线前它没有别的消费点**，而
+                # `StyleProfile.last_gate_fallback` 是"降级必须可见"的标记 ——
+                # 只设不读等于没留痕（独立核验 R4）。启动时取一次并报出来。
+                try:
+                    self.style.gate_system_prompt()
+                    _gfb = getattr(self.style, "last_gate_fallback", "")
+                    if _gfb:
+                        logger.warning(
+                            f"[selfcheck] ⚠️ Gate 冻结头部装配失败（{_gfb}）→ 退回裁判 system；"
+                            f"C22 的『Gate 用 §1+§2+§4+决策段』未生效"
+                        )
+                except Exception as e:
+                    logger.warning(f"[selfcheck] Gate 头部自检失败: {e}")
                 # C7/C10：段级清单 —— B-037 的病根是"丢了 14 个键却没人知道"，
                 # 所以这里把"哪些段进、哪些段缺、哪些段来自文件"逐条打出来。
                 try:
@@ -1615,6 +1628,24 @@ class PersonaAgent(Star):
         if not lines:
             return ""
         return "［可用的表达标记］\n" + "\n".join(f"- {l}" for l in lines)
+
+    def _summary_system_prompt(self) -> str:
+        """总结类调用的 system（C32）+ **回退留痕**。
+
+        独立核验 R4：`StyleProfile.last_summary_fallback` 曾经"设了没人读" ——
+        等于 docstring 承诺的"让『这一篇总结用了全量人格』在日志里看得见"没兑现。
+        这里是它唯一的出口；两处调用（日记 / 周月年记）都走这里，避免再漂移。
+        """
+        if self.style is None:
+            return ""
+        text = self.style.summary_system_prompt()
+        fb = getattr(self.style, "last_summary_fallback", "")
+        if fb:
+            logger.warning(
+                f"[persona] ⚠️ 总结 system 回退（{fb}）→ 这一篇用的是全量人格，"
+                f"C32 的收窄**未生效**"
+            )
+        return text
 
     def _build_turn_block(self, turn_lines: list[str], ctx: dict) -> str:
         """S2：构造「现在要回应的」块（pipeline 的 turn_block 回调）。
@@ -2595,7 +2626,7 @@ class PersonaAgent(Star):
             # ① §6/§7/§8 是「怎么说话」，与「记什么」无关；
             # ② D30：提示词措辞会被模仿，聊天腔会让总结层层累积；
             # ③ 工具标记（[emote:]）有被照抄进日记正文的风险。
-            sys_prompt = self.style.summary_system_prompt() if self.style else ""
+            sys_prompt = self._summary_system_prompt()
             contexts = [dict(m) for m in msgs]
             # 逐轮易变量（时间）同样挪到上下文末尾 —— 保持 system prompt 恒定，
             # 让「归档日会话」这段前缀可被网关缓存复用（v3 设计意图）。
@@ -2828,7 +2859,7 @@ class PersonaAgent(Star):
                    if kind == "yearly" else {}),
             )
             # C32：同上 —— 周/月/年记的 system 也收窄成 §1+§2。
-            sys_prompt = self.style.summary_system_prompt()
+            sys_prompt = self._summary_system_prompt()
             try:
                 resp = await self.context.llm_generate(
                     chat_provider_id=provider,

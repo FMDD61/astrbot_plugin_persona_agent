@@ -541,6 +541,10 @@ class ReplayRuntime:
             gate_recent_n=int(gate_cfg.get("recent_n", 15)),
             debounce_sec=0.0,  # 离线重放不做 500ms 模拟等待
             rag_enabled=rag_on,
+            # D42 / C16：与 main 同源读 rag.display_enabled（独立核验 R2）。
+            # 此前离线台不传它 → 恒为默认关，display=ON 那一臂根本复现不了，
+            # 而 schema 的 hint 明写这个开关用于 A/B 与归因。
+            kg_display=int(rag_cfg.get('display_enabled', 0)) == 1,
             now_utc_fn=self.clock,
         )
 

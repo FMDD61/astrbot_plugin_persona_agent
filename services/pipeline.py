@@ -559,8 +559,12 @@ class PersonaPipeline:
         # 仍由 rag.score_threshold 控制，只是判断依据不再给模型看。
         # 降级必须可见：kg_tail **保留**，写"已禁用"也算留痕（§13.8③）。
         kg_content = ""
+        # 🔴 两个键**无条件写**（独立核验 R1）：改造前 `kg_tail` 是无条件写的，
+        # 若只在分支里写，"display=1 且 kg_provider=None"（离线/未接线）就会出现
+        # **两个键都没有** 的 trace —— 那是留痕回归。
+        trace["kg_display"] = bool(self._kg_display)
+        trace["kg_tail"] = ""
         if not self._kg_display:
-            trace["kg_display"] = False
             trace["kg_tail"] = (
                 "（已禁用：D42 KG/RAG 展示移除）" if self.kg_provider is not None else ""
             )
@@ -585,7 +589,6 @@ class PersonaPipeline:
                 kg_content = kg_result.content if kg_result else ""
             except Exception as e:
                 trace["kg_error"] = f"{type(e).__name__}: {e}"
-            trace["kg_display"] = True
             trace["kg_tail"] = kg_content[:400]
 
         # ---- 上下文装配（S4：RP 与 Gate **共用同一份**）----

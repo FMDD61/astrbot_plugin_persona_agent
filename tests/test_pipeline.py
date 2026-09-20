@@ -1493,6 +1493,22 @@ class TestKgRagDisplayRemovedC16(unittest.TestCase):
         _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
         self.assertEqual(len(gate.seen.get("rag_hits") or []), 1)
 
+
+    def test_constructor_default_is_off(self):
+        """R3：构造默认值必须自己有用例（否则 False→True 的变异无人发现）。"""
+        from services.pipeline import PersonaPipeline
+        p = PersonaPipeline()          # 全默认
+        self.assertFalse(p._kg_display)
+
+    def test_both_trace_keys_always_written(self):
+        """R1：kg_display / kg_tail 必须**无条件**出现在 trace 里。"""
+        # display=ON 且 kg_provider=None（离线/未接线）：改造前这两个键一个都没有
+        p = _pipeline(kg=None, kg_display=True)
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "a")))
+        self.assertIn("kg_display", si.trace)
+        self.assertIn("kg_tail", si.trace)
+        self.assertTrue(si.trace["kg_display"])
+
     def test_display_switch_defaults_off_in_schema(self):
         """配置默认必须是 0（D42 已定），否则线上还是老行为。"""
         import json as _json, os as _os
@@ -1585,3 +1601,4 @@ class TestTaggedQuoteC17(unittest.TestCase):
         si = _run(p.run(PipelineInput("g1", "hi", False, "1", "甲",
                                       message_id="M1")))
         self.assertIsNone(si.quote_id)
+

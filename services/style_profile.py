@@ -85,13 +85,13 @@ _PERSONA_README = """# 人格段文件（C10）
 
 Gate 的冻结头部 = §1 + §2 + §4 ＋ 插件内置的 GATE 决策段（`services/persona_sections.py`）。
 
-改完保存即生效（mtime 热重载）。启动日志里有装配清单（`[persona] …`），
+改完保存即生效（每次调用现读，无缓存）。启动日志里有装配清单（`[persona] …`），
 能看到哪些段来自文件、哪些来自默认。
 """
 
 
 
-#: 八段文案目录（C10）：`<data_dir>/persona/sN.md`。文件存在即覆盖内置默认。
+#: 八段文案目录（C10）：`<data_dir>/persona/sN.md`。**文件有内容**即覆盖内置默认（空文件不算）。
 PERSONA_DIR = "persona"
 
 #: 记忆摘要快照（C4/C31）：`<data_dir>/memory_digest.json`
@@ -116,8 +116,6 @@ class StyleProfile:
         self._cache: dict[str, dict] = {}
         # C7/C10: 人格装配模式 —— "v2"（八段现场组装）/"legacy"（旧键元组，回退开关）
         self._sections_mode = "legacy" if str(sections_mode).strip().lower() == "legacy" else "v2"
-        self._sections_cache: Optional[dict[str, str]] = None
-        self._sections_sig: tuple = ()
         #: 最近一次装配的留痕（供启动自检 / trace；降级必须可见）
         self.last_persona_report: dict = {}
         #: 降级留痕（各自独立，避免"一个字段承担两种失效形态"）
@@ -248,7 +246,7 @@ class StyleProfile:
             self.last_persona_report = rep
             return self._legacy_system_prompt()
         rep = self.persona_manifest(
-            texts=texts, memory_block=memory_block, assembled=text, used=used)
+            texts=texts, memory_block=memory_block, assembled=text)
         rep["memory_lines"] = len(memory_block.splitlines())
         self.last_persona_report = rep
         return text
@@ -322,7 +320,7 @@ class StyleProfile:
     # **正确性优先**。若将来段文件变大，再考虑内容哈希或显式失效。
 
     def persona_section_texts(self) -> dict[str, str]:
-        """段 id -> 文案。**数据目录 `persona/sN.md` 存在即覆盖内置默认**。
+        """段 id -> 文案。**数据目录 `persona/sN.md` 有内容即覆盖内置默认**（空文件不算）。
 
         `sched`（作息）**没有内置默认**：沿用旧人格文件的 `schedule` 键 ——
         它在 v1 一直是生效段（`docs/specs/prompt_v2_rp.md` §2 的八段之外），
@@ -357,6 +355,7 @@ class StyleProfile:
         返回本次新建的文件名（空列表 = 无需动作）。
         """
         created: list[str] = []
+        failed: list[str] = []
         self.last_materialize_error = ""
         try:
             self.persona_dir().mkdir(parents=True, exist_ok=True)
@@ -368,25 +367,31 @@ class StyleProfile:
             path = self._persona_path(sid)
             if path.exists():
                 continue
-            written = self._atomic_write(path, default + "\n")
-            if written:
+            if self._atomic_write(path, default + "\n"):
                 created.append(path.name)
+            else:
+                failed.append(path.name)
         # sched 无内置默认：仅当旧人格文件里有 schedule 时才物化
         sched_path = self._persona_path("sched")
         if not sched_path.exists():
             legacy = self._legacy_schedule()
-            if legacy and self._atomic_write(sched_path, legacy + "\n"):
-                created.append(sched_path.name)
+            if legacy:
+                if self._atomic_write(sched_path, legacy + "\n"):
+                    created.append(sched_path.name)
+                else:
+                    failed.append(sched_path.name)
         readme = self.persona_dir() / "README.md"
-        if not readme.exists() and self._atomic_write(readme, _PERSONA_README):
-            created.append(readme.name)
-        if created:
-            pass                  # 无需失效：段文案每次调用都现读
-        else:
-            # 一个都没写成：要么文件都在（正常），要么**全部写失败**（磁盘满/只读）
-            # —— 后者必须留痕（N11）。用"目录是否可写"区分这两者。
-            if not os.access(self.persona_dir(), os.W_OK):
-                self.last_materialize_error = f"persona 目录不可写: {self.persona_dir()}"
+        if not readme.exists():
+            if self._atomic_write(readme, _PERSONA_README):
+                created.append(readme.name)
+            else:
+                failed.append(readme.name)
+        # R8：**部分**文件写失败（目录可写、单个文件写不进去）此前完全静默。
+        # 段文案仍有内置默认兜底，危害有限，但"物化没做成"必须说出来。
+        if failed:
+            self.last_materialize_error = (
+                f"{len(failed)} 个文件写失败（沿用内置默认）: {', '.join(sorted(failed))}"
+            )
         return created
 
     @staticmethod
@@ -475,8 +480,7 @@ class StyleProfile:
 
     def persona_manifest(self, *, texts: Optional[dict] = None,
                        memory_block: Optional[str] = None,
-                       assembled: str = "",
-                       used: Optional[tuple] = None) -> dict:
+                       assembled: str = "") -> dict:
         """装配清单（启动自检 / trace 共用 —— 降级必须可见，但**不许恒亮**）。
 
         调用方（``system_prompt()``）会把刚算出的 texts/memory_block 传进来，
@@ -627,55 +631,6 @@ class StyleProfile:
         if mood:
             lines.append(f"当前心情：{mood}")
         return "\n".join(lines)
-
-    def _build_alias_block(self) -> str:
-        """关系图谱块 —— **按文件顺序输出，保证"只在尾部追加"**。
-
-        ## 为什么不再按亲疏分段分组（S9，2026-09-14）
-
-        原实现把成员分进 `【熟人】/【认识】/【新人】` 三段再输出。后果：块内顺序
-        与文件顺序**不一致**，任何中段插入都会让其后全部内容位移 →
-        整块之后的前缀（session 全量，实测 8 万 token）缓存失效。
-
-        而实测 `member_relations.json` 的**文件顺序本身就是追加式的**：
-
-            [0..109]   人工策展的 close/known 混合（含少量 new）
-            [110..184] 全部 `auto_added=True`，清一色 new —— 自动入列追加在尾部
-
-        所以**按文件顺序输出**即天然满足"只在尾部追加"：新成员永远出现在块尾，
-        前面逐字节不变 → 前缀稳定（这正是用户要的 skill-catalog 语义）。
-
-        取舍：不再有 `【熟人】` 分段标题。但亲疏**没丢** —— 每个成员行的
-        `[熟人]/[认识]/[新人]` 标签保留，LLM 照样能判断关系远近。
-        """
-        members = self._iter_members()
-        if not members:
-            return ""
-        lines: list[str] = []
-        seen_aliases: set[str] = set()
-        # ⚠️ 不排序、不分组：严格按 `_iter_members()` 的顺序（= 文件顺序）
-        for m in members:
-            uin = str(m.get("uin", ""))
-            alias = (m.get("alias") or "").strip()
-            if not uin or not alias:
-                continue
-            if self.is_bot_member(m):
-                continue
-            if alias in seen_aliases:
-                continue
-            seen_aliases.add(alias)
-            other_names = m.get("other_names") or []
-            closeness = (m.get("closeness") or "known").strip()
-            label = CLOSENESS_LABEL.get(closeness, closeness)
-            line = f"  {uin}: {alias}"
-            if other_names:
-                line += f" (也常被叫作: {'、'.join(other_names)})"
-            line += f"  [{label}]"
-            lines.append(line)
-        if not lines:
-            return ""
-        return ("群友识别（按 QQ 号，优先用别名称呼；列表按入群先后排列，"
-                "**[熟人] 是关系最近的人**）：\n" + "\n".join(lines))
 
     def _hourly_local(self) -> dict:
         """按**本地小时**索引的 hourly 分布（兼容历史 UTC 文件）。

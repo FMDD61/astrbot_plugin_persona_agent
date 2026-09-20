@@ -319,14 +319,17 @@ class TestReviewRound1Fixes(unittest.TestCase):
             self.assertNotIn("persona_degraded", si.trace)
 
     def test_real_missing_does_reach_trace(self):
-        """反向：真丢段时 trace 必须报（不能因为修 B1 就把信号关掉）。"""
+        """反向：真丢段时 trace 必须报（不能因为修 B1 就把信号关掉）。
+
+        用**生产可达**的场景：`sched`（作息）没有内置默认，数据目录没给
+        `persona/sched.md`、旧人格文件里也没有 `schedule` 键 → 该段真丢失。
+        （独立核验建议：别用 monkeypatch 造缺失，那离生产太远。）
+        """
         import asyncio
         from services.pipeline import PersonaPipeline, PipelineInput
         with tempfile.TemporaryDirectory() as td:
-            sp = _mk(td)
-            texts = dict(P.SECTION_TEXT)
-            texts["s6_behavior"] = ""
-            sp.persona_section_texts = lambda: texts
+            sp = _mk(td)                      # 不写 fragments、不写 sched.md
+            self.assertIn("sched", sp.persona_manifest()["missing"])
             # 先算一次填 last_persona_report（session_mgr=None 的离线路径下
             # _assemble_base 不会去算人格——那是生产路径才有的副作用）
             sp.system_prompt()
@@ -336,7 +339,7 @@ class TestReviewRound1Fixes(unittest.TestCase):
                                 postprocess=lambda s: s.strip(), debounce_sec=0.0)
             si = asyncio.run(p.run(PipelineInput("g1", "hi", False, "1", "甲")))
             degraded = si.trace.get("persona_degraded") or {}
-            self.assertIn("s6_behavior", degraded.get("missing", []))
+            self.assertIn("sched", degraded.get("missing", []))
 
     # ---- B2：legacy 回退的仪表盘不得说谎 ----
 

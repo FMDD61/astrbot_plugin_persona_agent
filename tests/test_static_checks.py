@@ -96,5 +96,53 @@ class TestNoUndefinedNames(unittest.TestCase):
         self.assertNotIn("os.path.exists(os", src)   # 顺带防止写错
 
 
+class TestInstrumentationHasReaders(unittest.TestCase):
+    """**只写不读的仪表盘 = 没有仪表盘**（2026-09-20 独立核验 R4 的教训）。
+
+    `StyleProfile` 上的降级留痕字段（`last_summary_fallback` / `last_gate_fallback` / …）
+    曾经"设了但全仓无人读"：docstring 承诺"日志里看得见"没兑现 —— 而这类失效**不会报错**，
+    只会让运维在真降级时一无所获。本测试用最粗的判据把它钉住：
+    **每个留痕字段必须在 `services/style_profile.py` 之外至少有一个出现点**（即真有人读）。
+    """
+
+    #: 字段必须**直接被别处读**（属性名出现在别的模块里）
+    DIRECT_FIELDS = ("last_summary_fallback", "last_gate_fallback",
+                     "last_persona_report")
+    #: 字段经由 `persona_manifest()` 出到清单，再由消费方读**清单键**
+    MANIFEST_FIELDS = (("last_memory_error", "memory_error"),
+                       ("last_materialize_error", "materialize_error"))
+
+    def _sources(self):
+        out = [REPO / "main.py"]
+        out += sorted((REPO / "services").glob("*.py"))
+        out += sorted((REPO / "tools").glob("*.py"))
+        return [p for p in out if p.is_file()]
+
+    def _readers(self, needle: str) -> list:
+        return [p.relative_to(REPO) for p in self._sources()
+                if needle in p.read_text(encoding="utf-8")
+                and p.name != "style_profile.py"]
+
+    def test_each_fallback_marker_has_a_reader(self):
+        for field in self.DIRECT_FIELDS:
+            self.assertTrue(
+                self._readers(field),
+                f"{field} 只写不读（无仪表盘）：给它一个出口（日志/trace），或删掉它",
+            )
+
+    def test_manifest_surfaced_markers_have_readers(self):
+        for field, key in self.MANIFEST_FIELDS:
+            self.assertTrue(
+                self._readers(f'"{key}"'),
+                f"{field} 只经 manifest 输出为 {key!r}，但没人读那个键 → 仍是没有仪表盘",
+            )
+
+    def test_checker_actually_catches_write_only_field(self):
+        """自证：凭空造的字段名应当找不到读者（否则本测试是空转的）。"""
+        readers = [p for p in self._sources()
+                   if "last_nonexistent_marker" in p.read_text(encoding="utf-8")]
+        self.assertEqual(readers, [])
+
+
 if __name__ == "__main__":
     unittest.main()
