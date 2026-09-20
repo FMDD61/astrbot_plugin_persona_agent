@@ -103,7 +103,10 @@
     `anchor_fn` / `main._dream_anchor_llm()` / 配置 `dream.anchor_temperature` + `anchor_max_tokens`
     / 三条锚点用例。
   - 新增 `test_no_anchor_symbols_remain_in_module`：模块里不得再留锚点阶段的任何符号。
-- 测试 731 → **745 全绿**（新增 C33 回归 7 例 + C31 回归 8 例，改写 3 例旧断言）。
+- **连带补漏（自查发现）**：`services/familiarity.py:167` 的关系提案提示词仍在读 `d['summary']` ——
+  C31 之后新记录没有这个键 → 模型看到的会是**空日记**，而表现只是「提案质量变差」，不会报错。
+  已改为 `body or summary`，并补一条回归用例。
+- 测试 731 → **746 全绿**（新增 C33 回归 7 例 + C31 回归 8 例 + 提案提示词 1 例，改写 3 例旧断言）。
 
 ### Fixed (2026-09-20, 独立核验第 3 轮：静态闸判据换 AST + N-4 范围声明)
 > 审查方核对 `acba8e5`（0 阻塞 + 4 非阻塞）。C21 这条线已关闭（三条验收 + CHANGELOG 更正到位）。

@@ -164,7 +164,10 @@ def build_proposal_prompt(relations_block: str, diaries: list[dict],
     parts.append(relations_block.strip() or "（空）")
     parts.append("\n## 本周日记\n")
     for d in diaries:
-        parts.append(f"［{d.get('day')}］\n{d.get('summary')}\n")
+        # C31：摘要记录改 digest + body 两字段后，这里必须读 **body**（旧记录回落 summary）。
+        # 不改的话模型看到的是**空日记**——而表现是"提案质量变差"，不会报错。
+        parts.append(
+            f"［{d.get('day')}］\n{d.get('body') or d.get('summary') or ''}\n")
     parts.append("\n请只对**日记里出现过的**群友判断，输出 JSON。")
     return "\n".join(parts)
 

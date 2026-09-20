@@ -496,3 +496,15 @@ class TestYearlyWindow(unittest.TestCase):
         with _tf.TemporaryDirectory() as td:
             p = SummaryService(td).output_path("yearly")
             self.assertEqual(p.name, "yearly_summary.jsonl")
+
+    def test_proposal_prompt_reads_body_after_c31(self):
+        """C31 之后日记记录是 digest+body：提案提示词必须读 body（回落 summary）。
+
+        不读的话模型看到的是**空日记** —— 而表现只是「提案质量变差」，不会报错。
+        """
+        from services.familiarity import build_proposal_prompt
+        p = build_proposal_prompt("（图谱）", [{"day": "2026-09-13", "body": "新格式正文"}], {})
+        self.assertIn("新格式正文", p)
+        p2 = build_proposal_prompt("（图谱）",
+                                   [{"day": "2026-09-13", "summary": "旧格式正文"}], {})
+        self.assertIn("旧格式正文", p2)
