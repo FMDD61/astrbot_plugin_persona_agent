@@ -292,3 +292,131 @@ class TestC31DigestBody(unittest.TestCase):
                              ("monthly", "【这个月结束了】"), ("yearly", "【这一年结束了】")):
             self.assertIn(marker, build_phi(kind))
         self.assertEqual(build_phi("unknown"), "")
+
+
+class TestDigestLayers(unittest.TestCase):
+    """C4：§3「历史群聊摘要」的四层组装（`summary_v2.md` §4.2：**各层不重叠**）。
+
+    为什么要不重叠：越久远越粗，才有**遗忘痕迹**；重叠会让同一件事在上下文里说两遍，
+    而 §3 是**冻结头部**、一天付一次钱，重复是纯浪费。
+    """
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.gid = "g1"
+        d = Path(self.td.name) / "logs" / self.gid
+        d.mkdir(parents=True)
+        self.diary_path = d / "daily_diary.jsonl"
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _diary(self, rows):
+        self.diary_path.write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+            encoding="utf-8")
+
+    def _layer(self, name, rows):
+        p = Path(self.td.name) / name
+        p.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+                     encoding="utf-8")
+
+    def test_diaries_only(self):
+        self._diary([{"day": f"2026-09-{d:02d}", "group_id": self.gid,
+                      "digest": f"第{d}天的事"} for d in range(10, 21)])
+        from services.summary import build_digest_layers
+        res = build_digest_layers(self.td.name, self.gid)
+        days = res["layers"]["recent_days"]
+        self.assertEqual(len(days), 7, "上限 7 条")
+        self.assertTrue(days[0].startswith("09-14 "), days[0])
+        self.assertTrue(days[-1].startswith("09-20 "), days[-1])
+        for k in ("recent_weeks", "recent_months", "older"):
+            self.assertEqual(res["layers"][k], [], f"{k} 无内容时整段不出现")
+
+    def test_weekly_pushes_diaries_out(self):
+        """日记层只报**最近一篇周记结束日之后**的那些天。"""
+        self._diary([{"day": "2026-09-10", "group_id": self.gid, "digest": "周内"},
+                     {"day": "2026-09-14", "group_id": self.gid, "digest": "周后"}])
+        # ISO 2026-W37 = 09-07 .. 09-13
+        self._layer("weekly_summary.jsonl",
+                    [{"kind": "weekly", "group_id": self.gid,
+                      "period": "2026-W37", "digest": "那一周"}])
+        from services.summary import build_digest_layers
+        res = build_digest_layers(self.td.name, self.gid)
+        days = res["layers"]["recent_days"]
+        self.assertEqual([d.split()[0] for d in days], ["09-14"],
+                         "已被周记覆盖的那天不该再出现（各层不重叠）")
+        self.assertEqual(res["layers"]["recent_weeks"], ["2026-W37 那一周"])
+
+    def test_monthly_pushes_weeks_out(self):
+        self._layer("weekly_summary.jsonl", [
+            {"kind": "weekly", "group_id": self.gid, "period": "2026-W30",
+             "digest": "七月那周"},
+            {"kind": "weekly", "group_id": self.gid, "period": "2026-W38",
+             "digest": "九月那周"},
+        ])
+        self._layer("monthly_summary.jsonl", [
+            {"kind": "monthly", "group_id": self.gid, "period": "2026-08",
+             "digest": "八月"},
+        ])
+        from services.summary import build_digest_layers
+        res = build_digest_layers(self.td.name, self.gid)
+        self.assertEqual(res["layers"]["recent_weeks"], ["2026-W38 九月那周"],
+                         "八月（含 W30）已由月记覆盖")
+        self.assertEqual(res["layers"]["recent_months"], ["2026-08 八月"])
+
+    def test_yearly_pushes_months_out(self):
+        self._layer("monthly_summary.jsonl", [
+            {"kind": "monthly", "group_id": self.gid, "period": "2025-06",
+             "digest": "去年六月"},
+            {"kind": "monthly", "group_id": self.gid, "period": "2026-01",
+             "digest": "今年一月"},
+        ])
+        self._layer("yearly_summary.jsonl", [
+            {"kind": "yearly", "group_id": self.gid, "period": "2025",
+             "digest": "二〇二五"},
+        ])
+        from services.summary import build_digest_layers
+        res = build_digest_layers(self.td.name, self.gid)
+        self.assertEqual(res["layers"]["recent_months"], ["2026-01 今年一月"])
+        self.assertEqual(res["layers"]["older"], ["2025 二〇二五"])
+
+    def test_records_without_digest_are_skipped_and_counted(self):
+        """「无 digest 视作空」（用户定案）：旧记录（只有 summary）不进 §3。
+
+        但跳过的条数**必须可统计** —— 否则「长期记忆一直是空的」看不出原因。
+        """
+        self._diary([
+            {"day": "2026-09-19", "group_id": self.gid, "summary": "旧格式正文"},
+            {"day": "2026-09-20", "group_id": self.gid, "digest": "新格式"},
+        ])
+        from services.summary import build_digest_layers
+        res = build_digest_layers(self.td.name, self.gid)
+        self.assertEqual(res["layers"]["recent_days"], ["09-20 新格式"])
+        self.assertEqual(res["stats"].get("skipped_no_digest"), 1)
+
+    def test_empty_when_no_data(self):
+        from services.summary import build_digest_layers
+        res = build_digest_layers(self.td.name, self.gid)
+        self.assertEqual(res["stats"]["total_lines"], 0)
+        self.assertTrue(all(v == [] for v in res["layers"].values()))
+
+    def test_caps_are_enforced(self):
+        self._diary([{"day": f"2026-08-{d:02d}", "group_id": self.gid,
+                      "digest": f"d{d}"} for d in range(1, 29)])
+        from services.summary import build_digest_layers
+        res = build_digest_layers(self.td.name, self.gid)
+        self.assertEqual(len(res["layers"]["recent_days"]), 7)
+
+    def test_write_memory_digest_is_atomic_and_readable(self):
+        """落盘形态必须能被 StyleProfile.memory_layers() 直接读。"""
+        self._diary([{"day": "2026-09-20", "group_id": self.gid, "digest": "今天"}])
+        from services.summary import write_memory_digest
+        write_memory_digest(self.td.name, self.gid)
+        p = Path(self.td.name) / "memory_digest.json"
+        self.assertTrue(p.exists())
+        self.assertFalse(p.with_suffix(".json.tmp").exists(), "临时文件必须已 rename")
+        from services.style_profile import StyleProfile
+        sp = StyleProfile(self.td.name)
+        self.assertEqual(sp.memory_layers().get("recent_days"), ["09-20 今天"])
+        self.assertIn("09-20 今天", sp.system_prompt())

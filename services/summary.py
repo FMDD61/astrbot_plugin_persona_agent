@@ -356,6 +356,190 @@ def append_summary(path: Path, kind: str, group_id: str, label: str,
     return record
 
 
+# ---------------------------------------------------------------- C4：§3 记忆摘要的分层组装
+
+#: 各层条数上限（summary_v2 §4.2：越久远越粗 → 遗忘痕迹成立）
+DIGEST_CAPS = {"recent_days": 7, "recent_weeks": 4,
+              "recent_months": 11, "older": 2}
+
+
+def _week_end(label: str) -> Optional[date]:
+    """把 "2026-W37" 还原成那一周的**结束日**（周日）。解析失败返回 None。"""
+    m = re.match(r"^(\d{4})-W(\d{1,2})$", (label or "").strip())
+    if not m:
+        return None
+    try:
+        return date.fromisocalendar(int(m.group(1)), int(m.group(2)), 7)
+    except ValueError:
+        return None
+
+
+def _month_end(label: str) -> Optional[date]:
+    """把 "2026-08" 还原成那个月的**最后一天**。"""
+    m = re.match(r"^(\d{4})-(\d{2})$", (label or "").strip())
+    if not m:
+        return None
+    y, mo = int(m.group(1)), int(m.group(2))
+    if not 1 <= mo <= 12:
+        return None
+    nxt = date(y + (mo // 12), (mo % 12) + 1, 1)
+    return nxt - timedelta(days=1)
+
+
+def _year_end(label: str) -> Optional[date]:
+    """把 "2025" 还原成那一年的**最后一天**。"""
+    m = re.match(r"^(\d{4})$", (label or "").strip())
+    return date(int(m.group(1)), 12, 31) if m else None
+
+
+def _read_records(path: Path, group_id: str,
+                 period_key: str = "period") -> list[dict]:
+    """读一层摘要 jsonl（容错，按 period 升序）。
+
+    ⚠️ `period_key`：**日记用 `day`，周/月/年用 `period`** —— 字段名不同，
+    写死一个会让日记层永远为空（表现成「长期记忆里没有最近几天」，不报错）。
+    """
+    out: list[dict] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("group_id", "")) != str(group_id):
+            continue
+        period = str(rec.get(period_key) or "").strip()
+        if not period:
+            continue
+        out.append({"period": period,
+                    "digest": str(rec.get("digest") or "").strip()})
+    out.sort(key=lambda r: r["period"])
+    return out
+
+
+def build_digest_layers(data_dir: "str | Path", group_id: str,
+                        caps: Optional[dict] = None) -> dict:
+    """组装 §3「历史群聊摘要」的四层（C4，`summary_v2.md` §4.2/§4.4）。
+
+    **各层不重叠**（这是这一版相对上一版的关键更正）：
+
+    ```
+    日记：最近一篇周记结束日**之后**的每一天        （≤7 条）
+    周记：最近一篇月记覆盖月**之后**的每一周        （≤4）
+    月记：最近一篇年记覆盖年**之后**的每一月        （≤11）
+    年记：更早的年份                              （≤2）
+    ```
+
+    越久远越粗 → **遗忘痕迹**成立；总量恒定（约 20 行）。
+    没有内容的层**整段不出现**（不产生空标题）。
+
+    ⚠️ 「无 digest 视作空」（用户定案）：旧记录（只有 `summary`）**不**拿来当一句话摘要 ——
+    那是 100~200 字的正文，塞进 §3 与「把输出压回 7.9 字」的方向相反。
+    被跳过的条数记在 `stats` 里（降级必须可见）。
+    """
+    caps = {**DIGEST_CAPS, **(caps or {})}
+    base = Path(data_dir)
+    stats: dict = {}
+
+    yearlies = _read_records(base / YEARLY_FILE, group_id)
+    monthlies = _read_records(base / MONTHLY_FILE, group_id)
+    weeklies = _read_records(base / WEEKLY_FILE, group_id)
+    diaries = _read_records(base / "logs" / str(group_id) / DIARY_FILE, group_id,
+                          period_key="day")
+    if not diaries:
+        diaries = _read_records(base / DIARY_FILE, group_id, period_key="day")
+
+    # 边界：上一层覆盖到哪里，下一层就只报之后的
+    y_end = _year_end(yearlies[-1]["period"]) if yearlies else None
+    m_end = _month_end(monthlies[-1]["period"]) if monthlies else None
+    w_end = _week_end(weeklies[-1]["period"]) if weeklies else None
+
+    def _keep_months() -> list[dict]:
+        if y_end is None:
+            return monthlies
+        return [r for r in monthlies
+                if (_month_end(r["period"]) or date.min) > y_end]
+
+    def _keep_weeks() -> list[dict]:
+        if m_end is None:
+            return weeklies
+        return [r for r in weeklies if (_week_end(r["period"]) or date.min) > m_end]
+
+    def _keep_days() -> list[dict]:
+        if w_end is None:
+            return diaries
+        return [r for r in diaries
+                if _parse_day(r["period"]) is not None
+                and _parse_day(r["period"]) > w_end]
+
+    def _fmt(rows: list[dict], limit: int, label_fn) -> list[str]:
+        kept = rows[-limit:] if limit else []
+        out: list[str] = []
+        skipped = 0
+        for r in kept:
+            if not r["digest"]:
+                skipped += 1
+                continue
+            out.append(f"{label_fn(r['period'])} {r['digest']}")
+        if skipped:
+            stats["skipped_no_digest"] = stats.get("skipped_no_digest", 0) + skipped
+        return out
+
+    layers = {
+        "recent_days": _fmt(_keep_days(), caps["recent_days"],
+                            lambda p: p[5:] if len(p) >= 10 else p),        # 09-17
+        "recent_weeks": _fmt(_keep_weeks(), caps["recent_weeks"], lambda p: p),
+        "recent_months": _fmt(_keep_months(), caps["recent_months"], lambda p: p),
+        "older": _fmt(yearlies, caps["older"], lambda p: p),
+    }
+    stats["counts"] = {k: len(v) for k, v in layers.items() if v}
+    stats["total_lines"] = sum(len(v) for v in layers.values())
+    return {"layers": layers, "stats": stats}
+
+
+def _parse_day(day: str) -> Optional[date]:
+    try:
+        return date.fromisoformat((day or "").strip())
+    except ValueError:
+        return None
+
+
+def write_memory_digest(data_dir: "str | Path", group_id: str) -> dict:
+    """组装并**原子落盘** `<data_dir>/memory_digest.json`（C4）。
+
+    落盘形态（`StyleProfile.memory_layers()` 的读侧口径）：
+    `{"layers": {...}, "generated_at": ..., "stats": {...}}`。
+    原子写（tmp + os.replace）：这是会话冻结头部的原料，半截文件会让 §3 静默消失。
+    """
+    import os as _os
+    import time as _time
+    res = build_digest_layers(data_dir, group_id)
+    res["generated_at"] = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+    res["group_id"] = str(group_id)
+    p = Path(data_dir) / "memory_digest.json"
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps(res, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        _os.replace(tmp, p)
+    except OSError:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return res
+
+
 class SummaryService:
     def __init__(self, data_dir: str) -> None:
         self._dir = Path(data_dir)

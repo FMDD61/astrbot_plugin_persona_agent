@@ -2601,7 +2601,48 @@ class PersonaAgent(Star):
             if old_msgs:
                 logger.info(f"[persona_agent] daily rotation: group={gid} msgs={len(old_msgs)}")
                 if self._diary_enabled:
-                    asyncio.create_task(self._generate_diary(gid, old_msgs))
+                    # 🔴 C23-b / C4（2026-09-20）：**先总结、后组装**。
+                    # 这里以前是 `asyncio.create_task(...)`（发出去就不管）——
+                    # 于是新一天的 §3「历史群聊摘要」可能在日记落盘**之前**就被组装，
+                    # 长期记忆里永远缺最近一天/一周/一月/一年。
+                    # 睡眠窗 02:00–07:00 足够大（实测零调用），await 是安全的；
+                    # 而且它必须在**当日首次 RP 调用之前**完成 —— 那才是冻结时刻。
+                    # ⚠️ 给一个上界（5 分钟）：日记 LLM 若卡死，不能让**整天**的 §3
+                    # 都组装不出来 —— 超时就跳过总结、照常组装（有内容就装配）。
+                    try:
+                        await asyncio.wait_for(
+                            self._generate_diary(gid, old_msgs), timeout=300)
+                    except asyncio.TimeoutError:
+                        logger.warning("[persona_agent] 日记生成超时 300s（跳过，继续组装）")
+                    except Exception as e:
+                        logger.warning(f"[persona_agent] 日记生成失败（继续组装）：{e}")
+                # C4：总结完了再**动态组装**「历史群聊摘要」→ memory_digest.json。
+                # 组装失败的后果是 §3 整段不出现（不是静默：自检与 manifest 都看得见）。
+                self._rebuild_memory_digest(gid)
+
+    def _rebuild_memory_digest(self, group_id: str) -> None:
+        """组装并落盘 `<data_dir>/memory_digest.json`（C4 的"组装"那一步）。
+
+        调用时机（`summary_v2.md` §4.3 的时序）：**每日轮转的总结全部跑完之后**、
+        当日首次 RP 调用**之前**。落点是会话冻结头部里的 §3，所以只要赶在
+        第一次生成之前写好就行（睡眠窗 02:00–07:00 保证这一点）。
+        """
+        try:
+            from .services.summary import write_memory_digest
+            res = write_memory_digest(str(self.data_dir), group_id)
+            _st = res.get("stats") or {}
+            logger.info(
+                f"[persona_agent] memory digest 已组装："
+                f"{_st.get('counts') or '（无内容）'} "
+                f"共 {_st.get('total_lines', 0)} 行"
+                + (f"，跳过无 digest 的 {_st['skipped_no_digest']} 条"
+                   if _st.get("skipped_no_digest") else "")
+            )
+        except Exception as e:
+            logger.warning(
+                f"[persona_agent] memory digest 组装失败：{type(e).__name__}: {e} "
+                f"→ 新一天的 §3 历史群聊摘要会是空的"
+            )
 
     def _update_cache_stats(self, group_id: str) -> None:
         """把前缀缓存探针聚合成**长期留存**的日汇总（用户 2026-09-14 要求）。
@@ -2933,7 +2974,11 @@ class PersonaAgent(Star):
                 f"[persona_agent] {kind} summary written: group={gid} "
                 f"period={record['period']} n_diaries={record['n_diaries']} "
                 f"n_samples={record['n_samples']}"
+                + (f" digest={'有' if record.get('digest') else '缺'}")
             )
+            # C4：上一层写完了就重算 §3 —— 周/月/年记会改变金字塔的分层边界
+            # （例：写了周记，被它覆盖的那几天就该从「这几天」里退场）。
+            self._rebuild_memory_digest(gid)
             # 推送到**合并后的** admin_binding（S12：推送目标 = 权限来源）
             head = {"weekly": "周记", "monthly": "月记",
                     "yearly": "年记"}.get(kind, kind)

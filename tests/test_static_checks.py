@@ -218,3 +218,48 @@ class TestInstrumentationHasReaders(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRotationOrderC4(unittest.TestCase):
+    """🔴 C23-b / C4：轮转必须**先总结、后组装**（`summary_v2.md` §4.3 的时序）。
+
+    旧实现是 `asyncio.create_task(self._generate_diary(...))` —— **发出去就不管**，
+    于是新一天的 §3「历史群聊摘要」可能在日记落盘**之前**就被组装 →
+    长期记忆里永远缺最近一天/一周/一月/一年（而表现只是「它记性不太好」）。
+
+    `main.py` 不被测试导入（依赖 astrbot 运行时），所以这里用 AST 静态查**顺序**。
+    """
+
+    SRC = REPO / "main.py"
+
+    def _fn(self, name):
+        tree = ast.parse(self.SRC.read_text(encoding="utf-8"), filename=str(self.SRC))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == name:
+                return node
+        self.fail(f"{name} 不见了")
+
+    def _calls(self, node):
+        return [(n.lineno, n.func.attr) for n in ast.walk(node)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+
+    def test_diary_is_awaited_not_fire_and_forget(self):
+        fn = self._fn("_daily_rotation_job")
+        src = ast.get_source_segment(self.SRC.read_text(encoding="utf-8"), fn) or ""
+        self.assertIn("await asyncio.wait_for", src,
+                      "日记必须被 await（有上界），不能 create_task 发出去就不管")
+        self.assertNotIn("create_task(self._generate_diary", src.replace(" ", ""),
+                         "不许再回到 fire-and-forget 的写法")
+
+    def test_digest_is_rebuilt_after_the_diary(self):
+        calls = self._calls(self._fn("_daily_rotation_job"))
+        diary = [ln for ln, name in calls if name == "_generate_diary"]
+        digest = [ln for ln, name in calls if name == "_rebuild_memory_digest"]
+        self.assertTrue(diary, "轮转里必须生成日记")
+        self.assertTrue(digest, "轮转里必须组装 memory digest")
+        self.assertGreater(min(digest), max(diary), "组装必须在总结之后")
+
+    def test_period_summary_rebuilds_digest(self):
+        names = [name for _ln, name in self._calls(self._fn("_period_summary"))]
+        self.assertIn("_rebuild_memory_digest", names,
+                      "周/月/年记写完也要重算 §3（它会改变分层边界）")
