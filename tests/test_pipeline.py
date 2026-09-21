@@ -1669,7 +1669,7 @@ class TestEmotionBlockedWiring(unittest.TestCase):
       ③ 被拦但 **want=True** 才扣（blocked 本身就是"想说但被挡"）。
     """
 
-    def _run_with_gate(self, blocked, want=False, fallback=False, is_at=False):
+    def _run_with_gate(self, blocked, want=False, fallback=False, is_at=False,                       cached=False):
         calls = []
 
         class _E:
@@ -1687,7 +1687,8 @@ class TestEmotionBlockedWiring(unittest.TestCase):
             async def decide(self, *a, **kw):
                 from services.gate import GateDecision
                 return GateDecision(reply=False, reason="x", want=want,
-                                    blocked=blocked, fallback=fallback)
+                                    blocked=blocked, fallback=fallback,
+                                    cached=cached)
 
         p = _pipeline(gate=_G(), emotion=_E())
         si = _run(p.run(PipelineInput("g1", "hi", is_at, "1", "甲",
@@ -1724,6 +1725,31 @@ class TestEmotionBlockedWiring(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0][0].startswith("unknown"))
 
+
+
+    # ---- 第 2 轮复核 N-1：这两条判据此前**零覆盖**（我声称加了用例但没加）----
+
+    def test_cached_decision_does_not_charge_twice(self):
+        """🔴 冷却窗内复用同一条 decision → **只扣一次**。
+
+        实测（审查第 1 轮）：8s 窗口里几条消息会让 1 次 LLM 调用触发 3 次扣分，
+        而幂等键是 message_id（每条都不同）挡不住 → 分数可瞬间打到 0，
+        `emotion_v2` §7.2 的悬崖把 RAG 通道关掉。
+        """
+        calls, _ = self._run_with_gate("topic", want=True, cached=True)
+        self.assertEqual(calls, [], "缓存复用的判定不得重复扣分")
+
+    def test_want_false_does_not_charge(self):
+        """`want=False` = 压根不想说 → 禁令没有造成损失，不该扣分。"""
+        for reason in ("conflict", "topic", "pda"):
+            calls, _ = self._run_with_gate(reason, want=False)
+            self.assertEqual(calls, [], reason)
+
+    def test_unknown_blocked_is_counted(self):
+        """未知取值 fail-closed 时必须**可统计**（否则「bot 变安静」查不出原因）。"""
+        calls, _ = self._run_with_gate("unknown:键政", want=True)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][0].startswith("unknown"))
 
 class TestNoTextToImageChannel(unittest.TestCase):
     """C25：文生图通道整条废弃（B-053）—— SendIntent 不再有 sticker_prompt。"""

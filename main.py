@@ -1168,8 +1168,13 @@ class PersonaAgent(Star):
         # ---- S7 主动戳人：[poke:名字] → 校验 → group_poke action ----
         # 与贴纸**不同**：不 yield 消息段，而是直接调 action（段通道在协议端会被丢弃）。
         # 也不需要 stop_event（那是被动回戳为阻止内置 LLM 兜底才要的）。
+        _poked = False
         if send_intent.poke:
-            await self._send_proactive_poke(event, group_id, send_intent, trace)
+            # N-3（审查第 2 轮）：该函数**本来就有 bool 返回值**，此前被丢掉 →
+            # 「打算戳」被当成「发出去了」：戳失败也会记账，戳成功则把动作记成
+            # 「（发了一张表情包）」（记错动作）。
+            _poked = bool(await self._send_proactive_poke(
+                event, group_id, send_intent, trace))
 
         # 🔴 C18 阻塞修复（独立审查第 1 轮）：**什么都没发出去时不许记账**。
         # 贴纸没选到（0 次 yield）而正文本身为空 → 这一轮实际是静默，
@@ -1177,7 +1182,7 @@ class PersonaAgent(Star):
         #   · 违反 `interjection.register_reply` 的契约（after the bot actually sent）；
         #   · RP 与 Gate 共用同一份 session → 双方都看到一条**从未发生**的发言；
         #   · 记账还会刷新 last_reply_ts / 推后 cold_start（参与量读数被污染）。
-        if not reply_text and not _sticker_sent and not send_intent.poke:
+        if not reply_text and not _sticker_sent and not _poked:
             logger.info(
                 "[persona_agent] 本轮无正文且贴纸未发出（%s）→ 不记账、不写会话"
                 % (send_intent.silent_reason or "sticker_miss")
@@ -1197,7 +1202,12 @@ class PersonaAgent(Star):
         # → 被 `_public` 剥离 → **不进 LLM 上下文**（避免信噪比退化）。
         # C18：纯贴纸回复没有正文 —— 用占位文本记一条，否则这一轮在会话里**凭空消失**
         # （下一轮 RP 看不到自己刚发过表情包，会重复发）。占位写法与识图/表情同族。
-        _session_text = reply_text or "（发了一张表情包）"
+        if reply_text:
+            _session_text = reply_text
+        elif _sticker_sent:
+            _session_text = "（发了一张表情包）"
+        else:
+            _session_text = "（戳了一下群友）"
         self.session_mgr.append(
             group_id, "assistant", _session_text,
             reasoning=str((trace or {}).get("reasoning") or ""),

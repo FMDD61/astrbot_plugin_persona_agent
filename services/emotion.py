@@ -166,6 +166,13 @@ class EmotionProvider(ABC):
     # ---- v2（C24）附带接口：默认「中性空实现」 ----
     # pipeline/main 可以**无条件**调用（emotion.enabled=0 时退化成满格且完全静默），
     # 不必在每个调用点写 hasattr / try-except。
+    def note_blocked_unknown(self) -> None:
+        """Gate 给了没见过的 blocked 取值（已按被挡处理）。基类空实现。"""
+
+    def note_blocked_unwanted(self) -> None:
+        """有禁令但 want=False（未扣分）—— 不扣也要能看见，否则无法区分
+        "接线断了"与"本来就不想说"。基类空实现。"""
+
     def register_blocked(
         self, reason: str = "", *, group_id: str = "", event_key: str = "", now=None
     ) -> float:
@@ -301,7 +308,11 @@ class ScoreEmotionProvider(EmotionProvider):
             "duplicate_skipped": 0,
             "recovery_events": 0,
             "recovered_total": 0.0,
-            "cliff_closed": 0,       # 跨过 0.40 悬崖（RAG 通道关闭）次数
+            # 审查第 2 轮点名：这两个计数缺了就无法区分「没被拦 / 被拦但不想说 /
+            # 接线断了」—— score 恒 1.0 时三种情况在日志上完全一样。
+            "blocked_unknown": 0,   # Gate 给了没见过的 blocked 取值（fail-closed 计过）
+            "blocked_unwanted": 0,  # 有禁令但 want=False（不扣分，但要能看见）
+            "cliff_closed": 0,      # 跨过悬崖（RAG 通道关闭）的次数
             "clock_backwards": 0,
             "queries": 0,
         }
@@ -418,6 +429,23 @@ class ScoreEmotionProvider(EmotionProvider):
                     multiplier_for_score(after),
                 )
             return after
+
+    def note_blocked_unknown(self) -> None:
+        """fail-closed 计过一笔 —— **必须可聚合**，否则"bot 变安静"查不出原因。"""
+        with self._lock:
+            self.stats["blocked_unknown"] = int(self.stats.get("blocked_unknown", 0)) + 1
+            n = self.stats["blocked_unknown"]
+        if n in (1, 10, 100):
+            logger.warning(
+                "[emotion] ⚠️ Gate 连续给出未知 blocked 取值（累计 %d 次）——"
+                "提示词与模型可能对不上（例如模型写中文取值），此时一律 fail-closed"
+                " = bot 会变安静，请查 decision_log 的 blocked 字段", n)
+
+    def note_blocked_unwanted(self) -> None:
+        """有禁令但 want=False：不扣分，只计数（区分"没被拦"与"被拦但不想说"）。"""
+        with self._lock:
+            self.stats["blocked_unwanted"] = int(self.stats.get("blocked_unwanted", 0)) + 1
+
 
     # ---- 内部：惰性时间恢复（调用方必须持锁） ----
     def _advance_locked(self, now: float) -> float:

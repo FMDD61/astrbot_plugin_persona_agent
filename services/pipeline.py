@@ -591,6 +591,17 @@ class PersonaPipeline:
             #   · `gate_d.fallback`（超时/坏 JSON）也不算 —— 否则一次 Gate 故障
             #     就把分数打到下限，连带把 RAG 通道关掉（静默失效的典型形态）。
             _blk = getattr(gate_d, "blocked", False)
+            # 可观测缺口（审查第 2 轮点名，优先级最高）：这两种情况**不扣分，但必须计数** ——
+            # 否则 score 恒 1.0 时无法区分"没被拦 / 被拦但不想说 / 接线断了"。
+            if _blk is not False and _blk and self.emotion is not None:
+                try:
+                    if str(_blk).startswith("unknown"):
+                        self.emotion.note_blocked_unknown()
+                    elif not gate_d.want:
+                        self.emotion.note_blocked_unwanted()
+                except Exception:
+                    pass        # 计数失败不得影响决策
+
             # 🔴 独立审查第 1 轮的三条修正（缺任何一条都会把读数搞坏）：
             #   · `not gate_d.cached` —— 冷却窗内复用同一条 decision，
             #     不排掉就会「一次判定扣 N 次分」（实测 1 次 LLM 调用扣 3 次），

@@ -11,6 +11,21 @@
 
 ## [Unreleased]
 
+### Fixed (2026-09-21 · 批次三 上线前 · 独立审查两轮的收尾)
+- **C22 的 system 位**（审查第 1 轮阻塞 1）：Gate 的冻结头部此前只进 `messages[0]`，
+  而 system 位上仍是旧「参与度与安全分析师」提示词 → 一次请求两套身份 + 两套输出格式，
+  `topic`/`pda` 永不被判出且 trace 无任何降级标记。改走 `decide(system_prompt=)`，并补接线测试。
+- **C24 重复扣分**（阻塞 2）：Gate 冷却窗复用同一 decision，判据漏了 `cached` →
+  实测「1 次 LLM 调用扣 3 次分」，可瞬间打到 0 并关掉 RAG 通道。判据补 `want`/`fallback`/`cached` 三条。
+- **C27 存量缓存**（阻塞 3）：缓存键无管线版本 → 老图永远命中旧首帧描述。加 `VISION_PREP_VERSION` + 离线 `desc_v`。
+- **C18 幽灵条目**（阻塞 4）：贴纸没发出仍写会话 + `register_reply` → RP 与 Gate 都看到一条从未发生的发言。
+  加「真的发出去了才记账」守卫；戳人臂改用 `_send_proactive_poke` 的真实返回值（N-3）。
+- **可观测补洞**（审查：score 恒 1.0 时三种情况在日志上无法区分）：新增 `blocked_unknown` /
+  `blocked_unwanted` 计数（前者累计到 1/10/100 落 WARNING）。
+- **阈值不再写死**（用户口径：本项目没有可长期不变的度量值）：emotion 的 RAG 悬崖改由
+  `rag.score_threshold` **注入**后现算，改阈值不用改代码；`requirements.txt` 补 Pillow（C27 硬前提）。
+
+
 ### Changed (2026-09-21 · 批次三「行为放开」—— C15/C18/C3/C22/C23/C24/C25/C27)
 > 用户口径：「emoji 和 @ 都打开，我们留给 RP 更大的发挥空间」。
 > **本批会立刻改变线上行为**（参与量、消息形态、裁判上下文），须单独观察。
@@ -22,12 +37,15 @@
 - **C18 允许纯贴纸回复**（`main.py`）：早退条件从 `if not reply_text` 改为
   `if not reply_text and not send_intent.emote` —— 旧写法让「说不出完整的话时只发一张表情包」
   **永远走不到**（正文空就早退，连贴纸都不发）。纯贴纸轮在会话里记 `（发了一张表情包）` 占位，
-  否则这一轮对下一轮的 RP **凭空消失**（会重复发同一张）。
+  否则这一轮对下一轮的 RP **凭空消失**（会重复发同一张）。⚠️ 但**只有真的发出去了才记账**：
+  贴纸没选到 / 戳失败时不得写会话、不得 `register_reply`（否则是「幽灵发言」，RP 与 Gate 都会看到）。
 - **C3 时间分时段 + PHI 压成一行**（D13/D38/D41/D43）：`【当下】现在本地时间 16 时。当前心情：轻松调侃`
   → `【当下】下午，心情轻快`（5 档覆盖 24 小时；**时间永远在**，心情空只省后半句）；
   PHI 去掉重复的 `发话人：` 行，被 @ 时在**同一行**补 `（@ 了你）`，这一行同时是 `[r]` 的指认对象。
 - **C22 Gate 冻结头部独立化**（`services/pipeline.py`）：`shared_context()` 从「RP 前缀原样」
-  改为 **Gate 自己的上下文**（Gate 头部 + 关系图谱 + 全天消息），**不再带 RP 的工具语法块与示例块**
+  改为 **Gate 自己的上下文**（关系图谱 + 全天消息），**不再带 RP 的工具语法块与示例块**；
+  Gate 的冻结头部走 **`decide(system_prompt=)` 的 system 位**（不是塞进 messages —— 那样 system 位上会残留旧裁判提示词，
+  实测导致 `topic`/`pda` 永不被判出；见下方 09-21 修复条目）
   （§4：那是「怎么回」，与「接不接」无关）。连带修正 4 处「两边逐字节相同」的陈旧注释（B-030 那一族）。
   Gate 拿不到头部时回退旧裁判 system，并**逐轮写进 `trace["gate_head_fallback"]`**（N-4 的出口）。
 - **C23 GATE 输出改两问**（`services/gate.py`）：`{reply, conflict}` → `{want, blocked}`；
@@ -39,7 +57,8 @@
   超时、缓存、解析）；新口径 = 初始 1.0 / 每次 Gate 判 `blocked` −0.1 / 恢复 +0.1 每分钟 / 范围 0~1；
   **乘子 = 0.6 + 0.4×score**（进硬闸）。参数**可配置**（`emotion.*`）且每次扣分落 INFO 日志；
   代码注释写明 `score < 0.40 ⇒ 乘子 < 0.76 ⇒ raw 上限 0.79 下 RAG 通道数学上不可能触发`。
-  接线判据：**只在 `gate_d.blocked is not False` 且非 `fallback`** 时扣分
+  接线判据（四条，缺一条读数就废）：`gate_d.blocked is not False` 且 `want=True`，
+  且**非** `fallback`、**非** `cached`（冷却窗复用同一 decision，「一次判定扣 N 次」）
   （`not reply` 会把「压根不想说」也算上；`fallback` 会把一次 Gate 故障变成分数打到底 → 静默失效）。
 - **C25 废弃文生图通道**（B-053）：删 `EmotionState.sticker`、`SendIntent.sticker_prompt`、
   `main.py` 的 `Comp.Image.fromText` 段（含吞异常的 `except: pass`），配套清理过渡桥与死代码（-36 行）。
@@ -47,7 +66,9 @@
   一律抽 **6 帧**（长边 320）拼 **2×3 网格**（JPEG q82）+ **网格专用提示词**（静图版不变）；
   抽帧移入 `asyncio.to_thread`（实测最坏 680ms 会把事件循环钉死）。181 张真实贴纸实测：
   首帧降级 50 张 → **0 张**，载荷 65.0MB → 15.9MB（−75.5%），旧首帧组 47/48 找回帧间差异。
-  离线工具 `tools/build_sticker_index.py` 同步改（按 `meta["gif_grid"]` 选提示词，避免"离线一套线上一套"）。→ B-049 结案。
+  离线工具 `tools/build_sticker_index.py` 同步改（按 `meta["gif_grid"]` 选提示词）。→ B-049 结案。
+  🔴 **缓存/索引带版本戳**（`VISION_PREP_VERSION` 折进缓存键、索引记 `desc_v`）：
+  否则"见过的图"永远命中旧描述，B-049 对存量等于没修（离线 `manual` 人工修正不动）。
 
 ⚠️ **行为提醒（需观察后再定参数）**：emotion 乘子由旧 LLM 版的中位 0.80 变为**满格 1.0**（分数长期钉在 1.0）
 → 非 @ 的 Gate 触发量预计上升约 25%。**本轮不动 `rag.score_threshold`（0.60）**：按项目纪律先跑几天、
