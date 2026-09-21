@@ -112,10 +112,17 @@ command -v "$GIT_BIN" >/dev/null || die "找不到 $GIT_BIN"
 cd "$PLUGIN_DIR" || die "进不去 $PLUGIN_DIR"
 
 if [ "$ALLOW_DIRTY" != 1 ]; then
-  if [ -n "$("$GIT_BIN" status --porcelain)" ]; then
-    "$GIT_BIN" status --short | tee -a "$LOG_FILE" >&2
-    die "工作树不干净 → 拒绝部署（人工先处理；或 --allow-dirty 强制）"
+  # ⚠️ 只看**已跟踪文件**的改动：未跟踪文件（运行时产物如 memory_store.db、
+  # style_drift_report.json）不会被快进合并覆盖，也不该拦住部署 ——
+  # 实测：用 `git status --porcelain` 会把它们一并算成"脏"，**部署直接被拒绝**。
+  DIRTY="$("$GIT_BIN" status --porcelain --untracked-files=no)"
+  if [ -n "$DIRTY" ]; then
+    printf '%s\n' "$DIRTY" | tee -a "$LOG_FILE" >&2
+    die "工作树有**已跟踪文件**的改动 → 拒绝部署（人工先处理；或 --allow-dirty 强制）"
   fi
+  UNTRACKED="$("$GIT_BIN" ls-files --others --exclude-standard | head -5 | tr '\n' ' ')"
+  [ -n "$UNTRACKED" ] && log "（未跟踪文件，不影响部署）：$UNTRACKED"
+  true
 fi
 
 OLD_HEAD="$("$GIT_BIN" rev-parse --verify HEAD 2>/dev/null || true)"

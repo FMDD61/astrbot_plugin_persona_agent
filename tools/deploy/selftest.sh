@@ -70,7 +70,7 @@ echo '── 1) 工作树脏 → 拒绝（不重启、不改动）'
 echo dirty >> "$WORK/plugin/version.txt"
 touch "$WORK/start.sh"; run 'dirty' 1
 check 'dirty 未重启' "$(restarted)" no
-check 'dirty 有明确原因' "$(grep -c '工作树不干净' "$WORK/out.txt")" 1
+check 'dirty 有明确原因' "$(grep -c '已跟踪文件' "$WORK/out.txt")" 1
 git -C "$WORK/plugin" checkout -q -- version.txt
 
 echo '── 2) --check-only：只看不动'
@@ -136,6 +136,17 @@ echo '── 11) fetch 失败：不带 --force-restart → 中止、不重启'
 run 'fetch-fail-plain' 1
 check 'fetch 失败且无 force → 不重启' "$(restarted)" no
 git -C "$WORK/plugin" remote set-url origin "$WORK/remote.git"
+
+echo '── 12) 未跟踪文件不该拦住部署；已跟踪文件的改动必须拦住'
+echo scratch > "$WORK/plugin/memory_store.db"          # 模拟运行时产物（未跟踪）
+cd "$WORK/src" && echo v5 > version.txt && git commit -qam 'v5' && git push -q origin main
+run 'untracked-ok' 0
+check '未跟踪文件不影响部署' "$(restarted)" yes
+echo tampered >> "$WORK/plugin/version.txt"            # 改已跟踪文件
+cd "$WORK/src" && echo v6 > version.txt && git commit -qam 'v6' && git push -q origin main
+run 'tracked-dirty-blocked' 1
+check '已跟踪改动 → 拒绝' "$(restarted)" no
+git -C "$WORK/plugin" checkout -q -- version.txt
 echo
 echo "==== 自测结果：$PASS 通过 / $FAIL 失败 ===="
 [ "$FAIL" = 0 ] || exit 1
