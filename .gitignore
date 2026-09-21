@@ -7,3 +7,7 @@ __pycache__/
 *.log
 *.tmp
 .venv/
+
+# 运行时产物（曾在插件目录里留下过残渣，见 CHANGELOG 2026-09-21）
+memory_store.db
+style_drift_report.json
