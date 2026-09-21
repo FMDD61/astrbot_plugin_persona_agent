@@ -2,7 +2,7 @@
 """C7 / C10：八段人格装配的回归测试。
 
 **这一批测试的存在理由**（`BUGS.md` B-037 的四条盲区，见
-`scratch/prompt_v2_recon/R1_persona_assembly.md` §6.2）：
+`docs/archive/prompt_v2_batch1/R1_persona_assembly.md` §6.2）：
 
 1. 旧测试**没有任何"键覆盖率"断言**，全是反向约束（"不得含 X"）→
    22 键丢了 14 个、持续数月无人发现；

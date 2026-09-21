@@ -357,7 +357,7 @@
 - 测试 726 → **731 全绿**。
 
 ### Fixed (2026-09-20, 独立核验第 1 轮：C7/C10 的 2 阻塞 + 11 非阻塞全收)
-> 审查方对 `ebb8f1e` 的**冻结快照**逐行核验（报告 `scratch/prompt_v2_recon/REVIEW_round1_C7C10.md`）。
+> 审查方对 `ebb8f1e` 的**冻结快照**逐行核验（报告 `docs/archive/prompt_v2_batch1/REVIEW_round1_C7C10.md`）。
 > 两条阻塞都不是功能 bug，而是**仪表盘说谎**：会让运维得出错误结论。
 
 - **🔴 trace 每轮误报降级（B1）**：`manifest()` 用 `used` 反推 `missing`，把「**按设计省略**」
