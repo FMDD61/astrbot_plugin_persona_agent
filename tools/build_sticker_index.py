@@ -66,6 +66,16 @@ DESCRIBE_TIMEOUT_SEC = 180.0
 # 描述可用率仅 31.2%。约定 JSON schema 后 reasoning 从顶格降到 p50≈150，
 # 可用率 **100%**（n=144，0 截断）。温度不是因素（JSON 下 0.0/0.3/0.7 均 100%），
 # 取 0.0 求可复现；`reasoning_effort` **必须显式发 low**（不发更糟：p95 10.0s vs 5.9s）。
+#: 描述版本（C27 阻塞修复，独立审查第 1 轮）：**预处理管线变了就必须 +1**。
+#: 索引里记 `desc_v`；缺失或过期的条目会被**重新描述**，否则存量 GIF 会永远
+#: 沿用旧首帧描述（B-049 对老图的修法等于没做）。**不提供 --force 清理**：
+#: 那会连人工修正一起清掉。
+try:
+    from services.vision import VISION_PREP_VERSION as DESC_V
+except Exception:          # 离线环境缺依赖时退化为 2（与 C27 同代）
+    DESC_V = 2
+
+
 VISION_SYS = (
     "你是图片标注器。看图片，只输出**一个 JSON 对象**，不要任何解释、不要 markdown 代码块。"
     '格式固定为：{"desc": "图片描述", "tags": ["关键词1", "关键词2"]}\n'
@@ -271,7 +281,18 @@ def describe_all(items: list[dict], *, library_dir: Path, api_base: str, api_key
     merge 后的条目只保证有 file/sha256（曾经因为依赖 it["path"] 而 KeyError）。
     workers 默认 2：4 核机器别打满。
     """
-    todo = [it for it in items if not it.get("desc")]
+    # C27：`desc_v` 缺失/过期 → 视为 stale（用旧管线描述过的存量图必须重来）。
+    # 人工修正过的条目（`manual` 标记）**不动** —— 人的修正优先于管线版本。
+    def _stale(it: dict) -> bool:
+        if it.get("manual"):
+            return False
+        if not it.get("desc"):
+            return True
+        return int(it.get("desc_v") or 0) != int(DESC_V)
+    todo = [it for it in items if _stale(it)]
+    n_stale = sum(1 for it in items if it.get("desc") and _stale(it))
+    if n_stale:
+        print(f"  其中 {n_stale} 张是旧管线（desc_v != {DESC_V}）描述过的，按 C27 重描述")
     if not todo:
         return 0
     print(f"  视觉描述 {len(todo)} 张（并发 {workers}，模型 {model}）…")
@@ -285,6 +306,7 @@ def describe_all(items: list[dict], *, library_dir: Path, api_base: str, api_key
             try:
                 _d, _t = fut.result()
                 it["desc"] = _d
+                it["desc_v"] = DESC_V
                 if _t:
                     it["tags"] = _t          # 模型给的结构化关键词优先于正则抽取
             except Exception as e:
@@ -415,6 +437,7 @@ def merge(existing: dict, scanned: list[dict], *, force: bool) -> tuple[list[dic
             "sha256": s["sha256"],
             "bytes": s["bytes"],
             "desc": "" if force or not prev else prev.get("desc", ""),
+            "desc_v": 0 if (force or not prev) else prev.get("desc_v", 0),
             "tags": ([] if force or not prev else prev.get("tags") or []),
             "embedding": None if force else (prev or {}).get("embedding"),
             "added_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),

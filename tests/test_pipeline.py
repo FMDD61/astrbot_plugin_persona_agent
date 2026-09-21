@@ -90,10 +90,13 @@ class _FakeGate:
         self.calls = []
 
     async def decide(self, group_id, recent_msgs, speaker, text, rag_hits=None,
-                     is_at=False, contexts=None):
-        # S4: pipeline 现在传 contexts（共享上下文）—— 替身要接受并留证
+                     is_at=False, contexts=None, system_prompt=None):
+        # S4/C22：替身必须跟上真实签名 —— 否则 pipeline 传新参数这里直接 TypeError，
+        # 而「测试绿」就变成假象（替身与接线不一致是历史坑）。
         self.calls.append((group_id, text, is_at))
         self.last_contexts = contexts
+        #: C22：Gate 请求的 **system 位**（冻结头部），不是 messages[0]
+        self.last_system_prompt = system_prompt
         from services.gate import GateDecision
         return GateDecision(reply=self._reply, conflict=self._conflict,
                             reason=self._reason, ts=__import__("time").time())
@@ -868,8 +871,13 @@ class TestSharedContextS4(unittest.TestCase):
         self.assertIsNotNone(gate.last_contexts, "Gate 必须收到 contexts")
         self.assertTrue(gate.last_contexts)
         joined = [str(m.get("content")) for m in gate.last_contexts]
-        # ① Gate 自己的头部在最前
-        self.assertIn("名字：成员丁", joined[0])
+        # ① 🔴 C22 阻塞修复（独立审查第 1 轮）：头部走 **decide 的 system 位**，
+        #    不再塞进 messages —— 旧写法会让 system 位上仍压着旧分析师提示词，
+        #    一次请求里两套身份 + 两套输出格式（旧格式下 topic/pda 永不出现）。
+        self.assertEqual(gate.last_system_prompt, "【我是谁】\n名字：成员丁",
+                         "Gate 请求的 system 必须是冻结头部")
+        self.assertFalse(any("名字：成员丁" in c for c in joined),
+                         "头部不该同时出现在 messages 里（同一份内容发两遍）")
         # ② 全天历史共用（同一视野）
         self.assertTrue(any("历史甲" in c for c in joined), "S15 后为 甲：历史甲")
         self.assertIn("机器人的旧回复", joined)
@@ -1482,7 +1490,7 @@ class TestKgRagDisplayRemovedC16(unittest.TestCase):
             self.seen = {}
 
         async def decide(self, group_id, recent, speaker, text, rag_hits=None,
-                         is_at=False, contexts=None):
+                         is_at=False, contexts=None, system_prompt=None):
             from services.gate import GateDecision
             self.seen["rag_hits"] = rag_hits
             return GateDecision(reply=True, reason="ok")

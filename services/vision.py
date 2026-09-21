@@ -299,6 +299,14 @@ def _looks_like_leaked_prompt(text: str) -> bool:
     return any(m in t for m in _LEAK_MARKERS)
 
 
+#: 预处理管线版本（C27 阻塞修复，独立审查第 1 轮）。
+#: **只要"同一份字节送到模型前被怎么处理"变了，就必须 +1** —— 缓存键含它，
+#: 否则老图会永远命中旧描述：C27 把 GIF 从"首帧静图"改成"6 帧网格"后，
+#: 所有见过的 GIF 仍返回旧首帧描述（B-049 对存量完全没修，且无任何痕迹）。
+#:   v1 = 原图/降采样；v2 = GIF 抽帧拼网格（C27）
+VISION_PREP_VERSION = 2
+
+
 class VisionService:
     """Vision description with per-image hash cache (TTL) and timeout.
 
@@ -515,6 +523,8 @@ class VisionService:
         if diag is not None:
             diag["hash"] = h[:16]
             diag["bytes"] = len(data)
+        # C27 阻塞修复：缓存键 = 内容 sha256 + **预处理版本**（见 VISION_PREP_VERSION）
+        h = f"v{VISION_PREP_VERSION}:{h}"
         with self._lock:
             hit = self._cache.get(h)
             if hit and time.time() - hit[0] < self._cache_ttl:

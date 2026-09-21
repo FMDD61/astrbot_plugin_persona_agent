@@ -358,7 +358,7 @@ class TestReplayRun(unittest.TestCase):
 
         class FakeGate:
             async def decide(self, group_id, recent_msgs, speaker, text,
-                             rag_hits=None, is_at=False):
+                             rag_hits=None, is_at=False, system_prompt=None):
                 return GateDecision(reply=False, conflict=False,
                                     reason="gate 不接", ts=1.0)
 

@@ -561,9 +561,12 @@ class TestVisionPersistLRU(unittest.TestCase):
                 self.assertEqual(len(v._persist), 3)
                 self.assertTrue(v._evicted >= 2)
                 # \u547d\u4e2d img2 \u5237\u65b0 last_ts \u2192 \u540e\u7eed\u518d\u63d2\u4e0d\u6dd8\u6c70\u5b83
-                v._persist[hashlib.sha256(imgs[2]).hexdigest()]["last_ts"] = _time.time() + 999
+                # C27 阻塞修复：缓存键现在是 **版本前缀 + sha256**（见 VISION_PREP_VERSION）
+                from services.vision import VISION_PREP_VERSION as _V
+                _k = "v%d:%s" % (_V, hashlib.sha256(imgs[2]).hexdigest())
+                v._persist[_k]["last_ts"] = _time.time() + 999
                 await v.describe_bytes(PNG + bytes([99]))  # \u65b0\u56fe\u89e6\u53d1\u6dd8\u6c70
-                self.assertIn(hashlib.sha256(imgs[2]).hexdigest(), v._persist)
+                self.assertIn(_k, v._persist)
 
         asyncio.run(go())
 
@@ -651,3 +654,36 @@ class TestExtractCompletionText(unittest.TestCase):
         self.assertEqual(self._e({"choices": [{"message": {}}]}), "")
         self.assertEqual(self._e({"choices": []}), "")
         self.assertEqual(self._e({}), "")
+
+
+class TestCacheVersionStampC27(unittest.TestCase):
+    """🔴 独立审查第 1 轮阻塞 3：**改了预处理就必须换缓存键**。
+
+    没有版本戳时，C27 对「见过的 GIF」完全无效 —— 缓存命中即 return（抽帧在更后面），
+    所有老图继续用旧首帧描述，而 stats/diag/trace 一个提示都没有。
+    """
+
+    def test_version_constant_exists_and_is_folded_into_key(self):
+        """键 = 版本前缀 + 内容 sha256。"""
+        import inspect
+        from services import vision as V
+        self.assertIsInstance(V.VISION_PREP_VERSION, int)
+        self.assertGreaterEqual(V.VISION_PREP_VERSION, 2, "C27 起必须 ≥2")
+        src = inspect.getsource(V.VisionService.describe_bytes)
+        self.assertIn("v{VISION_PREP_VERSION}:", src,
+                      "缓存键必须含版本前缀（否则老图永远命中旧描述）")
+
+    def test_version_bump_invalidates_old_entries(self):
+        """模拟：老版本写下的裸 hash 键，升级后不得命中。"""
+        import time
+        from services import vision as V
+        svc = V.VisionService.__new__(V.VisionService)
+        svc._cache = {"deadbeef": (time.time(), "旧首帧描述")}
+        svc._cache_ttl = 3600
+        svc._persist = {}
+        svc._persist_path = ""
+        svc._lock = __import__("threading").Lock()
+        svc.stats = {}
+        svc.last_error = None
+        new_key = "v%d:deadbeef" % V.VISION_PREP_VERSION
+        self.assertNotIn(new_key, svc._cache, "带版本的键不该命中老条目")

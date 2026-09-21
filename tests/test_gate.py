@@ -231,3 +231,90 @@ class TestConflictSafety(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestC23WantBlocked(unittest.TestCase):
+    """🔴 C23 新契约的**牙**（独立审查第 1 轮：此前新格式零测试 ——
+    把 fail-closed 拆掉、把 unknown 改成不拦，863 全绿）。
+
+    契约：`{want, blocked, reason}`；`reply = want 且未被挡`；
+    `blocked ∈ {false, "conflict", "topic", "pda"}`；未知取值 **按被挡处理**。
+    """
+
+    def test_want_true_not_blocked_replies(self):
+        d = GateService._parse('{"want": true, "blocked": false, "reason": "有话想说"}')
+        self.assertTrue(d.want)
+        self.assertIs(d.blocked, False)
+        self.assertTrue(d.reply)
+        self.assertFalse(d.conflict)
+
+    def test_want_true_blocked_topic_does_not_reply(self):
+        d = GateService._parse('{"want": true, "blocked": "topic"}')
+        self.assertTrue(d.want)
+        self.assertEqual(d.blocked, "topic")
+        self.assertFalse(d.reply)
+        self.assertFalse(d.conflict, "topic 不是冲突")
+
+    def test_want_false_is_not_a_reply(self):
+        d = GateService._parse('{"want": false, "blocked": false}')
+        self.assertFalse(d.reply)
+
+    def test_blocked_conflict_sets_conflict_flag(self):
+        """旧的 `conflict` 通知链路（main 的 30 分钟冷却）必须仍然拿得到。"""
+        d = GateService._parse('{"want": true, "blocked": "conflict"}')
+        self.assertTrue(d.conflict)
+        self.assertFalse(d.reply)
+
+    def test_pda_blocked(self):
+        d = GateService._parse('{"want": true, "blocked": "pda"}')
+        self.assertEqual(d.blocked, "pda")
+        self.assertFalse(d.reply)
+
+    def test_unknown_string_fails_closed(self):
+        """模型写中文/自由文本（如「键政」）→ **按被挡处理**，不能当没被挡。"""
+        for raw in ('{"want": true, "blocked": "键政"}',
+                    '{"want": true, "blocked": "conflict "}'):
+            d = GateService._parse(raw)
+            self.assertIsNotNone(d, raw)
+            self.assertNotEqual(d.blocked, False, "未知取值必须按被挡处理：" + raw)
+            if "conflict " in raw:
+                self.assertEqual(d.blocked, "conflict", "空白要容忍")
+            else:
+                self.assertTrue(str(d.blocked).startswith("unknown:"), raw)
+            self.assertFalse(d.reply, raw)
+
+    def test_blocked_true_bool_fails_closed(self):
+        """`blocked: true`（被挡但没说原因）→ 仍然不接，并留 `unspecified`。"""
+        d = GateService._parse('{"want": true, "blocked": true}')
+        self.assertEqual(d.blocked, "unspecified")
+        self.assertFalse(d.reply)
+
+    def test_want_must_be_booleanish_or_none(self):
+        self.assertIsNone(GateService._parse('{"want": "maybe", "blocked": false}'))
+        self.assertIsNone(GateService._parse('{"blocked": "topic"}'), "want 缺失 → 畸形")
+
+    def test_legacy_format_still_maps(self):
+        d = GateService._parse('{"reply": true, "conflict": false, "reason": "x"}')
+        self.assertTrue(d.want)
+        self.assertTrue(d.reply)
+        self.assertIs(d.blocked, False)
+        d2 = GateService._parse('{"reply": true, "conflict": true}')
+        self.assertEqual(d2.blocked, "conflict")
+        self.assertFalse(d2.reply, "冲突中强制不发言")
+
+    def test_to_log_carries_both_questions(self):
+        """「想说但被拦」与「压根不想说」必须能**分别统计**（C23 的全部理由）。"""
+        d = GateService._parse('{"want": true, "blocked": "topic", "reason": "禁令"}')
+        log = d.to_log("g1", "u1")
+        self.assertTrue(log["want"])
+        self.assertEqual(log["blocked"], "topic")
+        self.assertFalse(log["reply"])
+        self.assertFalse(log["conflict"])
+
+    def test_phi_advertises_new_schema(self):
+        """PHI 必须教新格式 —— 教旧格式的话模型只会答 reply/conflict。"""
+        from services.gate import GATE_PHI, GATE_OUTPUT_SPEC
+        self.assertIn('"want"', GATE_OUTPUT_SPEC)
+        self.assertIn("blocked", GATE_OUTPUT_SPEC)
+        self.assertNotIn('"reply"', GATE_OUTPUT_SPEC)
+        self.assertIn("轮到我表态了", GATE_PHI)

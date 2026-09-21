@@ -299,10 +299,10 @@ class PersonaPipeline:
         现在两边用的是**同一个人的两套文本**（§1/§2 逐字相同 + Gate 决策段），
         身份正确而职责不同。
         """
+        # 🔴 C22 阻塞修复：头部**不放进 messages** —— 它要走 `decide(system_prompt=)`，
+        # 即 Gate 请求的 **system 位**。放进 messages 只是"又一条上下文"，
+        # 而 system 位上仍压着旧分析师提示词（审查第 1 轮实测抓到）。
         msgs: list[dict] = []
-        head = self._current_gate_head()
-        if head:
-            msgs.append({"role": "system", "content": head})
         # 关系图谱：与 RP 用同一份**冻结块**（同一视野，D39）
         rel_block = (
             self._relations_block() if self._relations_block is not None else ""
@@ -564,6 +564,9 @@ class PersonaPipeline:
                     # （B-039），且中位分 0.40、94% 在 0.6 以下。开关：kg_display。
                     rag_hits=(hits if (hits and self._kg_display) else None),
                     is_at=inp.is_at,
+                    # C22：**逐轮**把冻结头部放到 Gate 请求的 system 位；
+                    # 取不到（空串）时 GateService 自己退回旧裁判 system，并留痕。
+                    system_prompt=self._current_gate_head() or None,
                     # C22（2026-09-21）：**不再与 RP 共享前缀** —— Gate 有自己
                     # 的冻结头部（§1+§2+§4+决策段），两边从第一个字节起分叉
                     # （`prompt_v2_gate.md` §2：各自冻结、各自命中，仍是缓存价）。
@@ -588,7 +591,17 @@ class PersonaPipeline:
             #   · `gate_d.fallback`（超时/坏 JSON）也不算 —— 否则一次 Gate 故障
             #     就把分数打到下限，连带把 RAG 通道关掉（静默失效的典型形态）。
             _blk = getattr(gate_d, "blocked", False)
-            if _blk is not False and _blk and not gate_d.fallback \
+            # 🔴 独立审查第 1 轮的三条修正（缺任何一条都会把读数搞坏）：
+            #   · `not gate_d.cached` —— 冷却窗内复用同一条 decision，
+            #     不排掉就会「一次判定扣 N 次分」（实测 1 次 LLM 调用扣 3 次），
+            #     而幂等键是 message_id（每条都不同）挡不住；恢复只有 +0.1/分，
+            #     几个窗口就能把分数打到 0 → 顺手关掉 RAG 通道（§7.2 悬崖）。
+            #   · `gate_d.want` —— 只统计「**有话想说但被拦**」。
+            #     `want=False` 说明本来就不想说，禁令没有造成损失，不该扣分；
+            #     这也正是 C23 把两问拆开的用意（要能量出"拦过头"）。
+            #   · `not gate_d.fallback` —— 超时/坏 JSON 不是被拦。
+            if _blk is not False and _blk and gate_d.want \
+                    and not gate_d.fallback and not getattr(gate_d, "cached", False) \
                     and self.emotion is not None:
                 try:
                     self.emotion.register_blocked(

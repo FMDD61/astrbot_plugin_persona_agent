@@ -1152,9 +1152,11 @@ class PersonaAgent(Star):
         #   · 与正文**分两条消息**发出（"一个文本消息 + 一个表情消息"）
         #   · 选不中/库为空/文件缺失/**超配额** → 静默跳过，正文照发（正文为空则回归静默）
         #   · 每次尝试都落 sticker_log.jsonl（S0 教训：降级必须可见）
+        _sticker_sent = 0
         if send_intent.emote:
             # 异步生成器 → async for（每个 yield 是一条独立出站消息）
             async for _sticker_result in self._send_sticker(event, group_id, send_intent):
+                _sticker_sent += 1
                 yield _sticker_result
 
         # ---- S7 主动戳人：[poke:名字] → 校验 → group_poke action ----
@@ -1162,6 +1164,20 @@ class PersonaAgent(Star):
         # 也不需要 stop_event（那是被动回戳为阻止内置 LLM 兜底才要的）。
         if send_intent.poke:
             await self._send_proactive_poke(event, group_id, send_intent, trace)
+
+        # 🔴 C18 阻塞修复（独立审查第 1 轮）：**什么都没发出去时不许记账**。
+        # 贴纸没选到（0 次 yield）而正文本身为空 → 这一轮实际是静默，
+        # 但旧顺序会无条件 register_reply + 往会话里写「（发了一张表情包）」：
+        #   · 违反 `interjection.register_reply` 的契约（after the bot actually sent）；
+        #   · RP 与 Gate 共用同一份 session → 双方都看到一条**从未发生**的发言；
+        #   · 记账还会刷新 last_reply_ts / 推后 cold_start（参与量读数被污染）。
+        if not reply_text and not _sticker_sent and not send_intent.poke:
+            logger.info(
+                "[persona_agent] 本轮无正文且贴纸未发出（%s）→ 不记账、不写会话"
+                % (send_intent.silent_reason or "sticker_miss")
+            )
+            event.stop_event()
+            return
 
         # register reply + persist session/buffer (main-side side effects)
         trigger = (trace.get("hard_gate") or {}).get("trigger", "rag_hit")

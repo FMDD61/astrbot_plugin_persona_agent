@@ -362,6 +362,7 @@ class GateService:
         rag_hits: Optional[list[dict]] = None,
         is_at: bool = False,
         contexts: Optional[list[dict]] = None,
+        system_prompt: Optional[str] = None,
     ) -> GateDecision:
         """Return a decision; never raises (conservative silent on failure).
 
@@ -396,8 +397,15 @@ class GateService:
                 messages = self._build_shared_messages(
                     contexts, current_speaker, current_text, rag_hits, is_at=is_at)
                 raw = await asyncio.wait_for(
-                    self._llm_fn(None, messages=messages,
-                                 system_prompt=self._shared_system_prompt),
+                    self._llm_fn(
+                        None, messages=messages,
+                        # 🔴 C22 阻塞修复（独立审查第 1 轮）：**system 位上必须是冻结头部**。
+                        # 此前 pipeline 把头部塞进 messages[0]、这里仍传旧 `GATE_SYSTEM_PROMPT`
+                        # → 一次请求里两套身份 + 两套输出格式（旧的还写着「克制优先：拿不准就选不回」），
+                        # 直接废掉 C22 的身份改造，并让 `topic`/`pda` 永不出现（模型照旧格式答）。
+                        system_prompt=(system_prompt if system_prompt is not None
+                                       else self._shared_system_prompt),
+                    ),
                     timeout=self._timeout)
             else:
                 prompt = self._build_prompt(recent_msgs, current_speaker, current_text,
