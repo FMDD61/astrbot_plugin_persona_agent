@@ -69,10 +69,33 @@ logger = logging.getLogger(__name__)
 MULTIPLIER_BASE = 0.6
 MULTIPLIER_SPAN = 0.4
 
-RAG_EFFECTIVE_THRESHOLD = 0.60   # services/interjection.py 的 rag_score_threshold（生产值）
-RAG_RAW_SCORE_MAX = 0.79         # B-044：实测原始相似度上限
-RAG_CLIFF_SCORE = (RAG_EFFECTIVE_THRESHOLD / RAG_RAW_SCORE_MAX - MULTIPLIER_BASE) / MULTIPLIER_SPAN
-# ↑ = 0.39873…：低于它，0.79 × 乘子 < 0.60，RAG 通道数学上不可能触发（§7.2 写作 0.40）
+# ⚠️ 用户口径（2026-09-21）：「RAG 设定值从来没有固定的生产值……本项目几乎没有
+# 可定为长期不变的度量值，一切都还有待长期数据统计。」
+# 所以**这里不写死任何生产阈值**：
+#   · `RAG_EFFECTIVE_THRESHOLD` 由调用方从 `rag.score_threshold` **注入**
+#     （main.py 传进来），阈值改了悬崖自动跟着走；
+#   · `RAG_RAW_SCORE_MAX` 只是**当前数据的实测参考上限**（B-044），
+#     不是恒定值 —— 长期统计一变就要跟着更新。
+RAG_EFFECTIVE_THRESHOLD_DEFAULT = 0.60   # 仅作缺省（无注入时用），不是"生产值"
+RAG_RAW_SCORE_MAX = 0.79                 # 实测参考上限（非恒定，需随数据更新）
+
+
+def cliff_score(rag_threshold: float, raw_max: float = RAG_RAW_SCORE_MAX) -> float:
+    """分数低于它 → 乘子把 raw 压到阈值之下 → **RAG 通道数学上不可能触发**。
+
+    由 `rag_threshold` 与实测 `raw_max` 反解：需要 `mult ≥ threshold / raw_max`，
+    即 `score ≥ (threshold/raw_max − 0.6) / 0.4`。
+    （emotion_v2 §7.2 的书面口径 0.40 就是按 0.60 / 0.79 算出来的 0.39873…）
+    """
+    try:
+        need = float(rag_threshold) / float(raw_max)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+    return max(0.0, min(1.0, (need - MULTIPLIER_BASE) / MULTIPLIER_SPAN))
+
+
+#: 兼容旧名（0.60 缺省下的悬崖值）。**新代码请用 cliff_score(阈值)**。
+RAG_CLIFF_SCORE = cliff_score(RAG_EFFECTIVE_THRESHOLD_DEFAULT)
 
 # §8 映射表：阈值（含）→ 心情词。**只用情绪词，不用意愿词**
 # （意愿词会让 RP"演一个不想说话的人"，用户早先明确反对把闸门参数投影到表演层）。
@@ -210,6 +233,8 @@ class ScoreEmotionProvider(EmotionProvider):
         min_score: float = DEFAULT_MIN_SCORE,
         max_score: float = DEFAULT_MAX_SCORE,
         recovery_log_step: float = DEFAULT_RECOVERY_LOG_STEP,
+        #: RAG 触发阈值（**由调用方注入**，不写死 —— 见模块顶部"用户口径"）
+        rag_threshold: float = RAG_EFFECTIVE_THRESHOLD_DEFAULT,
         now_utc_fn=None,
         recent_events: int = 50,
         event_key_memory: int = 256,
@@ -224,6 +249,7 @@ class ScoreEmotionProvider(EmotionProvider):
         ):
             if not math.isfinite(float(value)):
                 raise ValueError(f"emotion 参数非法：{name}={value!r} 不是有限数")
+        self._rag_threshold = float(rag_threshold or RAG_EFFECTIVE_THRESHOLD_DEFAULT)
         self.min_score = float(min_score)
         self.max_score = float(max_score)
         if not (0.0 <= self.min_score <= self.max_score <= 1.0):
@@ -301,6 +327,9 @@ class ScoreEmotionProvider(EmotionProvider):
             if cfg.get(key) is not None:
                 kw[key] = float(cfg[key])
         kw.update(extra)
+        # 阈值由调用方注入（不写死）：见本模块顶部"用户口径"注释
+        if kw.get("rag_threshold") is None:
+            kw["rag_threshold"] = RAG_EFFECTIVE_THRESHOLD_DEFAULT
         return cls(now_utc_fn=now_utc_fn, **kw)
 
     # ---- 纯查询 ----
@@ -377,13 +406,16 @@ class ScoreEmotionProvider(EmotionProvider):
                 mood_for_score(before), mood_for_score(after),
                 reason or "-", group_id or "-",
             )
-            if before >= RAG_CLIFF_SCORE > after:
+            _cliff = cliff_score(self._rag_threshold, RAG_RAW_SCORE_MAX)
+            if before >= _cliff > after:
                 self.stats["cliff_closed"] += 1
                 logger.warning(
-                    "[emotion] ⚠️ RAG 通道关闭：score %.3f→%.3f < 悬崖 %.4f ⇒ 乘子 %.4f < 0.76 "
-                    "⇒ raw 上限 0.79 也够不到阈值 0.60 —— 只剩 @ 路径"
-                    "（emotion_v2 §7.2 的有意行为，不是 bug）",
-                    before, after, RAG_CLIFF_SCORE, multiplier_for_score(after),
+                    "[emotion] ⚠️ RAG 通道关闭：score %.3f→%.3f < 悬崖 %.4f "
+                    "（按当前注入的阈值 %.3f 与实测上限 %.3f 反解）⇒ 乘子 %.4f "
+                    "⇒ 非 @ 的 RAG 通道数学上不可达，只剩 @ 路径"
+                    "（emotion_v2 §7.2 的有意行为，不是 bug；阈值一变悬崖跟着变）",
+                    before, after, _cliff, self._rag_threshold, RAG_RAW_SCORE_MAX,
+                    multiplier_for_score(after),
                 )
             return after
 

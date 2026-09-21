@@ -7,7 +7,7 @@
 |-----------|------|------|
 | SessionManager | services/session_manager.py | Per-group daily-rotating session; `name` 区分发言人；自动恢复；`_mid`/`_uin` 引用元数据（对外出口剥离）；空 content 自愈（B-002） |
 | KGProvider | services/kg_provider.py | MultiSignalKGProvider (dense+BGE + BM25+FTS5 + entity); injects style guidance |
-| EmotionProvider | services/emotion.py | LLMEmotionProvider v1: 3-dimension (willingness/mood/sticker_prompt)，30s 同群缓存，**超时须 ≥ 模型耗时 4–8s（默认 30s）**，降级中性并记 `last_error`/`stats` → `trace.emotion_degraded` |
+| EmotionProvider | services/emotion.py | ScoreEmotionProvider C24 代码计算: 3-dimension (willingness/mood/sticker_prompt)，30s 同群缓存，**超时须 ≥ 模型耗时 4–8s（默认 30s）**，降级中性并记 `last_error`/`stats` → `trace.emotion_degraded` |
 | InterjectionManager | services/interjection.py | **S2 定位：结构过滤器 + 音量阀**（睡眠/冷却/@冷却/日程/预算 + RAG 预筛控制 Gate 调用量）；`min_gap_sec` 是真实输出的硬天花板 |
 | MemoryStore | services/memory_store.py | SQLite ADD-only entity+relation graph + FTS5 BM25 |
 | ConflictDetector | services/conflict_detector.py | 3-stage conflict (keyword+burst+LLM verify)——**仅 gate.enabled=0 时兜底**（A7④）；gate.enabled=1 时 conflict 由 GateLLM 承担 |

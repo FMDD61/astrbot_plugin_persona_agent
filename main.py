@@ -240,7 +240,13 @@ class PersonaAgent(Star):
             # 且"模型正常输出中性"与"调用失败"在日志上不可区分。
             # 新口径（emotion_v2.md §6）：初始 1.0 / 每次 Gate 判 blocked −0.1 /
             # 恢复 +0.1 每分钟 / 范围 0~1；乘子 = 0.6 + 0.4×score（进硬闸）。
-            self._emotion = ScoreEmotionProvider.from_config(emotion_cfg)
+            # 阈值从配置注入（**不写死**）：用户 2026-09-21「RAG 设定值从来没有固定的
+            # 生产值……一切都还有待长期数据统计」→ 改了阈值，emotion 的"悬崖告警"自动跟着走。
+            _rag_cfg = self.config.get("rag", {}) or {}
+            self._emotion = ScoreEmotionProvider.from_config(
+                emotion_cfg,
+                rag_threshold=float(_rag_cfg.get("score_threshold", 0.60)),
+            )
             logger.info("[persona_agent] emotion 改为代码计算（C24；参数见 emotion.*）")
         else:
             self._emotion = DefaultEmotionProvider()

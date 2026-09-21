@@ -5,3 +5,7 @@ chromadb==0.5.23
 sentence-transformers==3.3.1
 FlagEmbedding>=1.2.0
 numpy>=1.26.0
+
+# C27：GIF 抽帧拼网格的硬前提。缺了不会崩，但所有 GIF 会静默回退首帧
+# （= B-049 复发），只在 warning/diag/stats 里留痕。
+Pillow>=10.0.0

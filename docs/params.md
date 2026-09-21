@@ -10,7 +10,10 @@
 |---|---|
 | `test_mode` | 0（生产群 100000001）|
 | `active_interjection` | 0（只 @ 才回，不主动插话）|
-| `rag.score_threshold` | 0.55（用户后改）|
+| `rag.score_threshold` | **0.55（可调，非"生产值"）** —— 用户 2026-09-21：
+「RAG 设定值从来没有固定的生产值……本项目几乎没有可定为长期不变的度量值，
+一切都还有待长期数据统计。」⇒ 下表所有数值都按"**当前取值**"读，不是恒定基线。
+该阈值只控制 **Gate 调用量**，不做「该不该回」的判断（见 AGENTS.md 三层链）。|
 | `interjection.min_gap_sec` | 5 |
 | `gate.enabled` | 1 |
 | `sticker.enabled` / `teach` | 1 / 1 |
@@ -19,7 +22,10 @@
 | `summary.weekly_enabled` / `monthly_enabled` / `yearly_enabled` | 1 / 1 / 1 |
 | `llm.max_tokens` | 512（需容纳 200–800 思考 token）|
 | `vision.model` | `deepseek/deepseek-v4.1-flash`（**须带网关命名空间前缀**）|
-| `emotion.timeout_sec` / `gate.timeout_sec` | 30 / 30（须 ≥ 模型耗时 4–8s）|
+| `gate.timeout_sec` | 30（须 ≥ 模型耗时 4–8s）|
+| `emotion.*`（C24 起）| **不再有 LLM 调用**（`timeout_sec`/`cache_ttl_sec`/`temperature`/`reasoning_effort` 已删）；
+现有旋钮：`initial_score` / `blocked_penalty` / `recovery_per_min` / `min_score` / `max_score` / `recovery_log_step`。
+⚠️ 阈值不再写死在代码里 —— `rag.score_threshold` 改了就注入 emotion 的"悬崖"换算。|
 | `*.reasoning_effort` | `low`（**off 会被网关拒**，见下）|
 | `llm.provider_id` | `commandcode/deepseek/deepseek-v4.1-flash` |
 | `privileged_qq` | 100000002 |
