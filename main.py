@@ -56,7 +56,9 @@ from .services.json_store import JsonStore, find_jsonl_record
 from .services.context_buffer import ContextBuffer
 from .services.session_manager import SessionManager
 from .services.kg_provider import KGProvider, MultiSignalKGProvider
-from .services.emotion import EmotionProvider, DefaultEmotionProvider, EmotionState, LLMEmotionProvider, EMOTION_SYSTEM_PROMPT
+from .services.emotion import (
+    DefaultEmotionProvider, EmotionProvider, EmotionState, ScoreEmotionProvider,
+)
 from .services.gate import GateService, GATE_SYSTEM_PROMPT
 from .services.pipeline import PersonaPipeline, PipelineInput, SendIntent
 from .services.vision import VisionService, face_name
@@ -233,12 +235,13 @@ class PersonaAgent(Star):
         )
         emotion_cfg = self.config.get("emotion", {}) or {}
         if int(emotion_cfg.get("enabled", 1)) == 1:
-            self._emotion = LLMEmotionProvider(
-                self._emotion_llm,
-                timeout=float(emotion_cfg.get("timeout_sec", 3)),
-                cache_ttl=float(emotion_cfg.get("cache_ttl_sec", 30)),
-            )
-            logger.info("[persona_agent] LLM emotion provider enabled (v1, G10)")
+            # 🔴 C24（2026-09-21）：emotion **改代码计算**，不再调 LLM。
+            # 实测原 LLM 版：超时/解析失败会静默回退中性值（B-006 那一族藏了十几天），
+            # 且"模型正常输出中性"与"调用失败"在日志上不可区分。
+            # 新口径（emotion_v2.md §6）：初始 1.0 / 每次 Gate 判 blocked −0.1 /
+            # 恢复 +0.1 每分钟 / 范围 0~1；乘子 = 0.6 + 0.4×score（进硬闸）。
+            self._emotion = ScoreEmotionProvider.from_config(emotion_cfg)
+            logger.info("[persona_agent] emotion 改为代码计算（C24；参数见 emotion.*）")
         else:
             self._emotion = DefaultEmotionProvider()
 
@@ -471,6 +474,9 @@ class PersonaAgent(Star):
             tool_syntax_block=self._tool_syntax_block,
             relations_block=(self.style.relations_block if self.style is not None else None),
             system_prompt=(self.style.system_prompt if self.style is not None else None),
+            # C22：Gate 的**冻结头部**（§1+§2+§4+决策段）—— 与 RP 那份不是同一个文本。
+            # 装配失败时 StyleProfile 会退回旧裁判 system 并留痕，pipeline 把它写进 trace。
+            gate_system_prompt=(self.style.gate_system_prompt if self.style is not None else None),
             relations_delta=self._relations_delta_block,
             postprocess=self._postprocess_plain,
             temperature_for=self._temperature_for,
@@ -1127,13 +1133,19 @@ class PersonaAgent(Star):
 
         # ---- reply: send per SendIntent ----
         reply_text = send_intent.text
-        if not reply_text:
+        # 🔴 C18（2026-09-21）：**允许纯贴纸回复**。
+        # 旧条件 `if not reply_text: return` 让 §7「说不出完整的话时，只发一张
+        # 表情包即可」**永远走不到** —— 正文为空就直接早退，连贴纸都不发
+        # （`docs/specs/rp_examples_draft_v1.md` §E-3 实测指出的）。
+        # 依据：风格源当天 **30.7%** 的消息是纯媒体；这是「一个动作」而非「一句话」。
+        if not reply_text and not send_intent.emote:
             event.stop_event()
             return
-        if send_intent.quote_id:
-            yield event.chain_result([Comp.Reply(id=send_intent.quote_id), Comp.Plain(reply_text)])
-        else:
-            yield event.plain_result(reply_text)
+        if reply_text:
+            if send_intent.quote_id:
+                yield event.chain_result([Comp.Reply(id=send_intent.quote_id), Comp.Plain(reply_text)])
+            else:
+                yield event.plain_result(reply_text)
 
         # ---- 动作链路（S3③）：[emote:意图] → 贴纸库选图 → 随正文同发 ----
         # 设计取舍（docs/specs/s3-action-channel.md §4.3）：
@@ -1151,13 +1163,6 @@ class PersonaAgent(Star):
         if send_intent.poke:
             await self._send_proactive_poke(event, group_id, send_intent, trace)
 
-        if send_intent.sticker_prompt:
-            # 旧的 emotion.sticker → 文生图通道：保留但不再是贴纸主路径
-            try:
-                yield event.chain_result([Comp.Image.fromText(send_intent.sticker_prompt)])
-            except Exception:
-                pass
-
         # register reply + persist session/buffer (main-side side effects)
         trigger = (trace.get("hard_gate") or {}).get("trigger", "rag_hit")
         self.interjection.register_reply(
@@ -1166,10 +1171,13 @@ class PersonaAgent(Star):
             trigger=trigger,
             sender_uin=sender_uin,
         )
-        # S16: 思维链**存进 session**（供人工查看），但 `_reasoning` 是内部键
+        # S16: 思维链**存进会话**（供人工查看），但 `_reasoning` 是内部键
         # → 被 `_public` 剥离 → **不进 LLM 上下文**（避免信噪比退化）。
+        # C18：纯贴纸回复没有正文 —— 用占位文本记一条，否则这一轮在会话里**凭空消失**
+        # （下一轮 RP 看不到自己刚发过表情包，会重复发）。占位写法与识图/表情同族。
+        _session_text = reply_text or "（发了一张表情包）"
         self.session_mgr.append(
-            group_id, "assistant", reply_text,
+            group_id, "assistant", _session_text,
             reasoning=str((trace or {}).get("reasoning") or ""),
         )
         if self.buffer is not None:
@@ -1178,7 +1186,7 @@ class PersonaAgent(Star):
                 group_id=str(event.get_group_id() or ""),
                 sender_id=self.bot_qq,
                 sender_name="<bot>",
-                text=reply_text,
+                text=_session_text,
                 message_id="",
                 message_type="bot",
             )
@@ -1495,9 +1503,9 @@ class PersonaAgent(Star):
                         f"[selfcheck] ⚠️ 人格提示词 {sp_len} 字符偏大 → 每轮进前缀，"
                         f"检查 persona/ 段文件（或 system_prompt_fragments.json）是否失控"
                     )
-                # C22 的 Gate 头部：**接线前它没有别的消费点**，而
-                # `StyleProfile.last_gate_fallback` 是"降级必须可见"的标记 ——
-                # 只设不读等于没留痕（独立核验 R4）。启动时取一次并报出来。
+                # C22 的 Gate 头部：启动时取一次并报回退。
+                # （自 C22 接线起，**逐轮**的出口在 pipeline `_current_gate_head()` →
+                #  trace["gate_head_fallback"]；这里保留的是"开机即坏"的早期告警。）
                 #
                 # ⚠️ **覆盖范围有限**（独立核验第 3 轮实测）：这里只在 initialize()
                 # 跑一次，而 gate_system_prompt() 是**逐轮现读**段文件的 —— 当前之所以
@@ -1709,13 +1717,18 @@ class PersonaAgent(Star):
     def _build_turn_block(self, turn_lines: list[str], ctx: dict) -> str:
         """S2：构造「现在要回应的」块（pipeline 的 turn_block 回调）。
 
-        拼成**一条** system 消息，让模型一眼看到"该回哪句、对谁、什么状态"：
+        拼成**一条** system 消息，让模型一眼看到「该回哪句、对谁、什么状态」：
 
-            【现在要回应的】本条消息 @ 了你，通常应当回应。
-            发话人：成员丙(100000002)
-            成员丙：你好！
+            【现在要回应的】成员丙：你好！（@ 了你）
             ［图片］一只橘猫趴在键盘上，表情嫌弃
-            【当下】现在本地时间 16 时。当前心情：轻松调侃
+            【当下】下午，心情轻快
+
+        ⚠️ C3（2026-09-21，D38/D41/D43）把这里压成一行：
+          · 删掉 `发话人：xxx` 那行 —— 别名已在下一行重复，白占 token；
+          · 被 @ 时在**同一行**补「（@ 了你）」（D38 的第三个格式化字段）；
+          · 这一行同时是 `[r]` 的**指认对象**（D43：打标制只靠 PHI 指认），
+            所以它每轮都必须在；
+          · `【当下】` 改为「时段，心情」一行（D13/D41，见 volatile_line）。
 
         设计依据（实测）：
           - 决策窗口 96 条的文本 **59% 已在 session 里** → 不再重复注入窗口，
@@ -1727,13 +1740,15 @@ class PersonaAgent(Star):
         """
         uin = str(ctx.get("sender_uin") or "")
         alias = ctx.get("sender_alias") or (f"群友{uin}" if uin else "群友")
-        head = "【现在要回应的】"
+        # C3/D43：**一行搞定** —— `【现在要回应的】别名：正文（@ 了你）`。
+        # turn_lines[0] 已经是「别名：正文」（pipeline 组装），后面跟的是
+        # ［图片］/［表情］这类附加行。
+        first = turn_lines[0] if turn_lines else f"{alias}："
+        head = "【现在要回应的】" + first
         if ctx.get("is_at"):
-            head += "本条消息 @ 了你，通常应当回应。"
-        # 只写别名：QQ 号对"怎么回这句话"没有帮助（别名已是唯一标识），
-        # 且与下一行的「别名：内容」重复，白占 token。
-        lines = [head, f"发话人：{alias}"]
-        lines.extend(turn_lines)
+            head += "（@ 了你）"
+        lines = [head]
+        lines.extend(turn_lines[1:])
         # 情绪由 _pipeline_generate 在调用生成前写入（pipeline 的 turn_block
         # 回调签名只带 turn_lines/ctx，情绪在 generate 回调那侧拿得到）
         mood = getattr(self._turn_block_emotion, "current_mood", "") or ""
@@ -2339,25 +2354,6 @@ class PersonaAgent(Star):
         if pid:
             self._last_provider_id = pid
         return pid
-
-    async def _emotion_llm(self, prompt: str) -> str:
-        """G10: emotion analysis call (3s timeout enforced by the provider).
-
-        A7④: 结构化 JSON 任务 → 低温(0.2) + 思考 off（配置可调），输出稳定。
-        """
-        provider = await self._resolve_provider_id()
-        if not provider:
-            raise RuntimeError("no LLM provider available for emotion")
-        ecfg = self.config.get("emotion", {}) or {}
-        _erv = reasoning_value(ecfg.get("reasoning_effort", "low"))
-        resp = await self.context.llm_generate(
-            chat_provider_id=provider,
-            prompt=prompt,
-            system_prompt=EMOTION_SYSTEM_PROMPT,
-            temperature=float(ecfg.get("temperature", 0.2)),
-            **({"reasoning_effort": _erv} if _erv else {}),
-        )
-        return (getattr(resp, "completion_text", "") or "").strip()
 
     async def _dream_llm(self, system_prompt: str, prompt: str) -> str:
         """做梦阶段②：写梦境（**温度 1.3**、思考 low —— 用户 2026-09-14 指定）。

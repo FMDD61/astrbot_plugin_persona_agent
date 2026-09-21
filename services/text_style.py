@@ -236,20 +236,34 @@ def collapse_newlines(text: str, max_lines: int = 8) -> str:
 
 def postprocess(text: str) -> str:
     """Full output sanitation chain (AI-phrase removal, markers, koupi cap,
-    emoji strip, newline collapse, length caps)."""
+    newline collapse, length caps).
+
+    ## C15（2026-09-21）：**放开 emoji 与 @** —— 删掉了两步
+
+    原先这里还有 `strip_at_mentions()` 与 `strip_emoji()`，两者是 S0 的
+    **预防性**收口（怕模型把 AI 味的 emoji/乱 @ 发出去）。但实测后果是：
+    提示词 §7【句末的表情】与 §6「@ 他一句」两处教学**自上线起不可能生效**
+    （实测 bot 输出 465 条：含 emoji **0**、含 @ **0**；而风格源 2337 条里
+    含 emoji 112（4.8%）、含 @ 50（2.1%））→ `BUGS.md` **B-048**。
+
+    用户 2026-09-21：「**emoji 和 @ 都打开，我们留给 RP 更大的发挥空间**」。
+
+    ⚠️ 放开后要观察一段时间（这两步原本防的是 emoji 滥用与误 @ 人）：
+    观测口径 = 出站文本里 emoji / @ 的**出现率**（trace 的 `final_text` 可直接统计）。
+    """
     if not text:
         return ""
     out = text.strip()
     for b in _AI_PHRASES:
         out = out.replace(b, "")
-    out = strip_at_mentions(out)
+    # C15：不再 strip_at_mentions（@ 是 §6 教的表达手段之一）
     out = strip_meta_parens(out)
     out = RE_REPLY_MARKER.sub("", out)
     out = RE_ASTRBOT_MARKER.sub("", out)
     out = RE_TOOL_INTENT_MARK.sub("", out)
     out = re.sub(r"(?<=[\u4e00-\u9fff]) +(?=[\u4e00-\u9fff])", "", out)
     out = cap_koupi(out)
-    out = strip_emoji(out)
+    # C15：不再 strip_emoji（§7【句末的表情】教的就是它）
     out = collapse_newlines(out)
     if len(out) > 400:
         out = out[:400].rstrip()

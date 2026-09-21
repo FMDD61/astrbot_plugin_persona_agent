@@ -61,11 +61,25 @@ class _FakeRag:
 
 
 class _FakeEmotion:
+    """C24 起 emotion 还有 register_blocked/score/multiplier（替身必须跟上，
+    否则真实调用会被 try/except 吞掉 → 测试与线上接线不一致）。"""
+
     def __init__(self, state=None):
         self._state = state or EmotionState.neutral()
+        self.blocked_calls = []
 
     async def query(self, group_id, recent_msgs, kg_ctx=None):
         return self._state
+
+    def register_blocked(self, reason, *, group_id="", event_key="", now=None):
+        self.blocked_calls.append((reason, group_id, event_key))
+        return True
+
+    def score(self):
+        return getattr(self._state, "emotion_score", 1.0)
+
+    def multiplier(self):
+        return getattr(self._state, "global_willingness", 1.0)
 
 
 class _FakeGate:
@@ -127,6 +141,8 @@ def _pipeline(**over):
         tool_syntax_block=over.get("tool_syntax_block", None),
         relations_block=over.get("relations_block", None),
         relations_delta=over.get("relations_delta", None),
+        # C22 新增：Gate 自己的冻结头部（**必须转发**，否则"测试绿但接线漏了"）
+        gate_system_prompt=over.get("gate_system_prompt", None),
         postprocess=lambda s: s.strip(),
         temperature_for=lambda trig: 0.8,
         turn_block=over.get("turn_block", None),
@@ -809,16 +825,17 @@ class TestToolIntentsS3(unittest.TestCase):
 
 
 class TestSharedContextS4(unittest.TestCase):
-    """S4：Gate 与 RP 共享**逐字节相同**的上下文前缀。
+    """C22（2026-09-21）：Gate **不再**与 RP 共享前缀 —— 这条线取代了旧的 S4 契约。
 
-    动机（用户 2026-09-13）：Gate 要看到全量群友关系图谱与 RP 的人格设定，
-    判断上文要尽量长，否则"Gate 本身会降低回复质量"。实测发现
-    `system_prompt` 里**已含全部 163 人的别名关系块**（157/163 命中），
-    所以 Gate 只要拿到 RP 的 system prompt + 同一份上下文即可。
+    | | 旧（S4，2026-09-13） | 新（C22，2026-09-21） |
+    |---|---|---|
+    | Gate 的 system | RP 的人格（同一份） | **Gate 自己的冻结头部**（§1+§2+§4+决策段） |
+    | 前缀 | 与 RP **逐字节相同**（求缓存复用） | **从第一个字节起分叉**（各自冻结各自命中） |
+    | 工具语法/示例块 | 进 Gate | **不进**（§4：那是「怎么回」，与「接不接」无关） |
+    | session 历史 | 共用 | **共用**（同一视野，D39） |
 
-    两个收益：
-      ① 质量：Gate 判断依据与 RP 同级（此前只有 740 字符小 prompt + 15 条窗口）
-      ② 成本：网关前缀缓存被 RP/Gate 两次调用复用（否则每次全价重发 ~2.8 万 token）
+    为什么要改：`prompt_v2_gate.md` §2 —— 冻结头部里要插 Gate 独有的决策段，
+    共享前缀从根上不成立；但两边**各自**仍是缓存价，代价没有原先担心的大。
     """
 
     def _setup(self, **over):
@@ -840,32 +857,46 @@ class TestSharedContextS4(unittest.TestCase):
 
         p = _pipeline(session=sm, session_append=sa, gate=gate, generate=gen,
                       examples_block=lambda: "【示例块】",
+                      gate_system_prompt=lambda: "【我是谁】\n名字：成员丁",
                       turn_block=lambda lines, ctx: "【现在要回应的】\n" + "\n".join(lines),
                       **over)
         return p, gate, captured
 
-    def test_gate_receives_shared_context(self):
+    def test_gate_receives_own_head_and_history(self):
         p, gate, _ = self._setup()
         _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
         self.assertIsNotNone(gate.last_contexts, "Gate 必须收到 contexts")
         self.assertTrue(gate.last_contexts)
         joined = [str(m.get("content")) for m in gate.last_contexts]
-        # 共享前缀应含示例块与 session 历史
-        self.assertIn("【示例块】", joined)
-        self.assertTrue(any("历史甲" in c for c in joined),
-                        "S15 后为 '甲：历史甲'，用子串匹配")
+        # ① Gate 自己的头部在最前
+        self.assertIn("名字：成员丁", joined[0])
+        # ② 全天历史共用（同一视野）
+        self.assertTrue(any("历史甲" in c for c in joined), "S15 后为 甲：历史甲")
         self.assertIn("机器人的旧回复", joined)
 
-    def test_gate_prefix_is_byte_identical_to_rp_prefix(self):
-        """核心不变式：Gate 的 contexts 必须是 RP contexts 的**前缀**。"""
+    def test_gate_context_has_no_rp_only_blocks(self):
+        """§4：工具语法块与示例块**不进 Gate**（那是「怎么回」）。"""
+        p = _pipeline(gate=_FakeGate(), examples_block=lambda: "【示例块】",
+                      tool_syntax_block=lambda: "【工具语法】",
+                      gate_system_prompt=lambda: "【我是谁】")
+        joined = [str(m.get("content")) for m in p.shared_context("g1")]
+        self.assertNotIn("【示例块】", joined)
+        self.assertNotIn("【工具语法】", joined)
+
+    def test_gate_prefix_is_not_the_rp_prefix(self):
+        """核心不变式（C22）：两边前缀**必须不同** —— 相同就说明改造没生效。"""
         p, gate, captured = self._setup()
         _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
         g = [str(m.get("content")) for m in gate.last_contexts]
         rp = [str(m.get("content")) for m in captured["ctx"]]
-        self.assertEqual(g, rp[:len(g)],
-                         "Gate contexts 必须是 RP contexts 的逐字节前缀（缓存复用的前提）")
+        self.assertNotEqual(g[:1], rp[:1], "Gate 首条是它自己的头部，不是 RP 的人格")
+        # 但历史仍是同一份（同一视野）
+        self.assertIn("机器人的旧回复", rp)
+        self.assertIn("机器人的旧回复", g)
 
     def test_current_message_not_in_gate_context(self):
+        """Gate 判「这一条该不该接」，所以它看到的本条之前的世界。"""
+
         """Gate 判"这一条该不该接"，所以它看到的本条之前的世界。"""
         p, gate, _ = self._setup()
         _run(p.run(PipelineInput("g1", "当前这条", False, "u3", "丙")))
@@ -882,7 +913,11 @@ class TestSharedContextS4(unittest.TestCase):
                          [str(m.get("content")) for m in gate.last_contexts])
 
     def test_shared_system_prompt_is_rp_persona(self):
-        """Gate 的 system prompt 必须是 RP 的人格提示词（含别名关系块）。"""
+        """C22：Gate 的 system 由**调用方给的冻结头部**决定（不再是 RP 的人格）。
+
+        旧契约（S4）要求 Gate 拿到 RP 的人格提示词；C22 起两边**从第一个字节
+        起就分叉**（`prompt_v2_gate.md` §2），Gate 用自己那份（§1+§2+§4+决策段）。
+        """
         from services.gate import GateService
         captured = {}
 
@@ -891,11 +926,18 @@ class TestSharedContextS4(unittest.TestCase):
             captured["messages"] = messages
             return '{"reply": true, "conflict": false, "reason": "ok"}'
 
-        gs = GateService(llm, timeout=5, shared_system_prompt="【人格提示词】正文")
+        gs = GateService(llm, timeout=5, shared_system_prompt="【Gate 冻结头部】")
         d = asyncio.run(gs.decide("g", [], "甲", "你好",
                                   contexts=[{"role": "user", "content": "历史"}]))
         self.assertTrue(d.reply)
-        self.assertEqual(captured["system_prompt"], "【人格提示词】正文")
+        self.assertEqual(captured["system_prompt"], "【Gate 冻结头部】")
+        # 未提供头部时退回旧裁判 system（回退面必须真的存在）
+        captured.clear()
+        gs2 = GateService(llm, timeout=5)
+        asyncio.run(gs2.decide("g", [], "甲", "你好",
+                               contexts=[{"role": "user", "content": "历史"}]))
+        from services.gate import GATE_SYSTEM_PROMPT
+        self.assertEqual(captured["system_prompt"], GATE_SYSTEM_PROMPT)
         msgs = captured["messages"]
         # 🔴 S13 回归修复：判定指令**紧贴候选消息之前**，而不是放在最前。
         #
@@ -905,10 +947,15 @@ class TestSharedContextS4(unittest.TestCase):
         self.assertEqual(msgs[0], {"role": "user", "content": "历史"},
                          "共享前缀必须原样在最前（缓存复用的前提）")
         self.assertEqual(msgs[-2]["role"], "system")
-        self.assertIn("不要引入任何其他维度", msgs[-2]["content"])
+        # C23（2026-09-21）：判定指令换成 GATE PHI（只带输出格式），
+        # 但 S13 那条位置回归**依然成立** —— 它必须紧贴候选之前。
+        self.assertIn("轮到我表态了", msgs[-2]["content"])
+        self.assertIn('"want"', msgs[-2]["content"])
+        self.assertIn("blocked", msgs[-2]["content"])
+        self.assertIn("【现在要回应的】", msgs[-1]["content"])
         # 候选消息紧随其后
         self.assertEqual(msgs[-1]["role"], "user")
-        self.assertIn("【现在要判断的这一条】", msgs[-1]["content"])
+        self.assertIn("【现在要回应的】", msgs[-1]["content"])
         self.assertNotIn("不要引入任何其他维度", msgs[-1]["content"])
 
     def test_shared_system_prompt_falls_back_when_empty(self):
@@ -1602,3 +1649,84 @@ class TestTaggedQuoteC17(unittest.TestCase):
                                       message_id="M1")))
         self.assertIsNone(si.quote_id)
 
+
+# ---------------------------------------------------------------- C24/C25 接线（emotion / 贴纸）
+class TestEmotionBlockedWiring(unittest.TestCase):
+    """C24：Gate 判「被拦」时给 emotion 记一笔 —— 且**只在这种情况**记。
+
+    三条判据（写错任何一条都会造成静默失效）：
+      ① 用 `gate_d.blocked is not False`，**不是** `not gate_d.reply`
+         —— 后者混了「有话想说但被拦」与「压根不想说」；
+      ② `gate_d.fallback`（超时/坏 JSON）**不扣分** —— 否则一次 Gate 故障就把分数打到下限；
+      ③ 被拦但 **want=True** 才扣（blocked 本身就是"想说但被挡"）。
+    """
+
+    def _run_with_gate(self, blocked, want=False, fallback=False, is_at=False):
+        calls = []
+
+        class _E:
+            def __init__(self):
+                self._state = EmotionState.neutral()
+
+            async def query(self, gid, recent, kg_ctx=None):
+                return self._state
+
+            def register_blocked(self, reason, *, group_id="", event_key="", now=None):
+                calls.append((reason, group_id, event_key))
+                return True
+
+        class _G:
+            async def decide(self, *a, **kw):
+                from services.gate import GateDecision
+                return GateDecision(reply=False, reason="x", want=want,
+                                    blocked=blocked, fallback=fallback)
+
+        p = _pipeline(gate=_G(), emotion=_E())
+        si = _run(p.run(PipelineInput("g1", "hi", is_at, "1", "甲",
+                                      message_id="MID-9")))
+        return calls, si
+
+    def test_blocked_records_once_with_message_id(self):
+        calls, si = self._run_with_gate("conflict", want=True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "conflict")
+        self.assertEqual(calls[0][1], "g1")
+        self.assertEqual(calls[0][2], "MID-9", "event_key 用 message_id（去重靠它）")
+        self.assertEqual(si.action, "silent")
+
+    def test_three_block_reasons_all_counted(self):
+        for reason in ("conflict", "topic", "pda"):
+            calls, _ = self._run_with_gate(reason, want=True)
+            self.assertEqual([c[0] for c in calls], [reason], reason)
+
+    def test_not_blocked_does_not_count(self):
+        """`blocked=False` = 没被挡 → 不扣分（哪怕 reply 也是 False）。"""
+        calls, _ = self._run_with_gate(False, want=False)
+        self.assertEqual(calls, [])
+
+    def test_gate_fallback_does_not_count(self):
+        """🔴 Gate 降级（超时/坏 JSON）**不扣分** —— 否则一次故障就关掉 RAG 通道。"""
+        calls, si = self._run_with_gate("conflict", want=True, fallback=True)
+        self.assertEqual(calls, [], "fallback 不算被拦")
+        self.assertEqual(si.action, "silent")
+
+    def test_unknown_blocked_string_still_counts(self):
+        """未知取值（模型乱写）按被拦处理（fail closed），并原样记下来供统计。"""
+        calls, _ = self._run_with_gate("unknown:whatever", want=True)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][0].startswith("unknown"))
+
+
+class TestNoTextToImageChannel(unittest.TestCase):
+    """C25：文生图通道整条废弃（B-053）—— SendIntent 不再有 sticker_prompt。"""
+
+    def test_send_intent_has_no_sticker_prompt(self):
+        from services.pipeline import SendIntent
+        self.assertNotIn("sticker_prompt", SendIntent.__dataclass_fields__)
+
+    def test_trace_emotion_has_score_not_sticker(self):
+        p = _pipeline()
+        si = _run(p.run(PipelineInput("g1", "hi", False, "1", "甲")))
+        emo = si.trace.get("emotion") or {}
+        self.assertNotIn("sticker", emo)
+        self.assertIn("willingness", emo)

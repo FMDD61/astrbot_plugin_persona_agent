@@ -9,6 +9,11 @@
 **② 自由文本 prompt → 模型把预算花在"格式谈判"上。** 191/191 条空 content 的
 响应 `finish_reason` 全是 `length`、`reasoning_tokens ≈ max_tokens`，正文一字未出；
 描述可用率仅 31.2%。约定 JSON schema 后 reasoning 降到 p50≈150，可用率 **100%**。
+
+**③ C27（2026-09-21）：GIF 一律抽帧拼网格。** 旧的体积闸门
+（`GIF_INLINE_MAX_BYTES`）把 >1.5MB 的多帧 GIF 降级成**首帧 JPEG** → 动作语义丢失
+（B-049 的根因；用户实测群内 GIF 普遍 >3MB，那条路几乎从不触发）。
+现在 6 帧 / 每帧 320px / 3 列×2 行（960×640）/ JPEG q82，**体积闸门已废**。
 """
 import io
 import json
@@ -41,6 +46,47 @@ def _img_bytes(fmt="PNG", size=(600, 400), frames=1) -> bytes:
                     duration=80, loop=0)
     else:
         Image.new("RGB", size, (120, 180, 240)).save(buf, format=fmt)
+    return buf.getvalue()
+
+
+#: 12 个互相分得开的纯色 —— 用来**反查网格里放的是第几帧**。
+_PALETTE = [(230, 30, 30), (30, 200, 30), (30, 30, 230), (230, 205, 20),
+            (230, 30, 230), (30, 200, 200), (125, 60, 20), (250, 140, 200),
+            (80, 80, 80), (205, 250, 120), (10, 90, 160), (150, 10, 90)]
+
+
+def _nearest_palette(px):
+    """把（被 JPEG 轻微改过的）像素映射回最近的调色板下标。"""
+    return min(range(len(_PALETTE)),
+               key=lambda i: sum((px[k] - _PALETTE[i][k]) ** 2 for k in range(3)))
+
+
+def _anim_gif_bytes(n_frames=12, size=(400, 300)) -> bytes:
+    """真实可解码的多帧 GIF：**第 i 帧 = _PALETTE[i]**（>12 帧则循环取色）。"""
+    from PIL import Image
+    ims = [Image.new("RGB", size, _PALETTE[i % len(_PALETTE)])
+           for i in range(n_frames)]
+    buf = io.BytesIO()
+    ims[0].save(buf, format="GIF", save_all=True, append_images=ims[1:],
+                duration=80, loop=0)
+    return buf.getvalue()
+
+
+def _noise_gif_bytes(n_frames=16, size=(360, 360)) -> bytes:
+    """**>1.5MB** 的多帧 GIF（随机调色板索引 → LZW 压不动）。
+
+    专门用来钉住"体积闸门已废"：旧代码看 `len(data) <= GIF_INLINE_MAX_BYTES`，
+    这个体积**必须**仍然走网格。
+    """
+    from PIL import Image
+    frames = []
+    for _ in range(n_frames):
+        im = Image.frombytes("P", size, os.urandom(size[0] * size[1]))
+        im.putpalette(os.urandom(256 * 3))
+        frames.append(im)
+    buf = io.BytesIO()
+    frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:],
+                   duration=40, loop=0)
     return buf.getvalue()
 
 
@@ -91,14 +137,6 @@ class TestDownscale(unittest.TestCase):
             self.assertEqual(im.size, (200, 150))
 
     @requires_pil
-    def test_multiframe_gif_sent_inline(self):
-        """多帧 GIF ≤ 闸门 → **整图直送**（保留动作语义）。"""
-        gif = _img_bytes("GIF", size=(64, 64), frames=4)
-        out, mime = prepare_bytes_for_vision(gif)
-        self.assertEqual(mime, "image/gif")
-        self.assertEqual(out, gif)
-
-    @requires_pil
     def test_single_frame_gif_downscaled(self):
         """单帧 GIF 走降采样路径（不是整图直送）。
 
@@ -143,19 +181,264 @@ class TestDownscale(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "x.gif"
             p.write_bytes(_img_bytes("GIF", size=(64, 64), frames=3))
-            out, mime = prepare_for_vision(p)
-            self.assertEqual(mime, "image/gif")
-            self.assertEqual(out, p.read_bytes())
-            # 大动图超闸门 → 回退首帧降采样
-            from services import image_prep
-            orig = image_prep.GIF_INLINE_MAX_BYTES
-            image_prep.GIF_INLINE_MAX_BYTES = 10
-            try:
-                out2, mime2 = prepare_for_vision(p)
-                self.assertEqual(mime2, "image/jpeg")
-                self.assertLess(len(out2), len(p.read_bytes()))
-            finally:
-                image_prep.GIF_INLINE_MAX_BYTES = orig
+            meta = {}
+            out, mime = prepare_for_vision(p, meta=meta)
+            # C27：路径版（离线入库工具走这条）也必须拼网格，否则离线/线上两套漂移
+            self.assertEqual(mime, "image/jpeg")
+            self.assertNotEqual(out, p.read_bytes())
+            self.assertTrue(meta.get("gif_grid"))
+            self.assertEqual(meta["path"], "gif_grid")
+
+
+class TestGifGridC27(unittest.TestCase):
+    """C27：**全部** GIF 抽帧拼网格（6 帧 / 每帧 320px / 3 列×2 行 / JPEG q82）。
+
+    钉住三件事：① 帧数与帧号（均匀抽样，含首尾）；② 网格几何（960×640、每格 320、
+    超出只缩不放）；③ **体积闸门已废** —— 1.5MB 以上的动图也必须走网格。
+    """
+
+    def test_layout_constants_match_spec(self):
+        from services import image_prep as P
+        self.assertEqual(P.GIF_GRID_FRAMES, 6)
+        self.assertEqual(P.GIF_GRID_FRAME_EDGE, 320)
+        self.assertEqual(P.GIF_GRID_COLS, 3)
+        self.assertEqual(P.GIF_GRID_ROWS, 2)
+        self.assertEqual(P.GIF_GRID_JPEG_QUALITY, 82)
+        self.assertEqual(P.GIF_GRID_COLS * P.GIF_GRID_ROWS, P.GIF_GRID_FRAMES)
+
+    def test_uniform_frame_indices_include_both_ends(self):
+        from services.image_prep import gif_frame_indices
+        self.assertEqual(gif_frame_indices(109, 6), [0, 22, 43, 65, 86, 108])
+        self.assertEqual(gif_frame_indices(12, 6), [0, 2, 4, 7, 9, 11])
+        self.assertEqual(gif_frame_indices(6, 6), [0, 1, 2, 3, 4, 5])
+        self.assertEqual(gif_frame_indices(2, 6), [0, 1])          # 帧不够 → 全取
+        self.assertEqual(gif_frame_indices(1, 6), [0])
+        self.assertEqual(gif_frame_indices(0, 6), [])
+        # 严格递增（不许抽样抽样出重复帧号 —— 那会让同一帧占两格）
+        for n in (3, 7, 17, 109, 400):
+            idx = gif_frame_indices(n, 6)
+            self.assertEqual(idx, sorted(set(idx)))
+            self.assertTrue(all(0 <= i < n for i in idx))
+
+    @requires_pil
+    def test_grid_is_2x3_of_320_cells(self):
+        from PIL import Image
+        gif = _anim_gif_bytes(12, (400, 300))
+        out, mime = prepare_bytes_for_vision(gif)
+        self.assertEqual(mime, "image/jpeg")
+        with Image.open(io.BytesIO(out)) as im:
+            self.assertEqual(im.format, "JPEG")
+            self.assertEqual(im.size, (960, 640))         # 3 列 × 2 行 × 320
+
+    @requires_pil
+    def test_grid_holds_six_sampled_frames_in_order(self):
+        """每格放的必须是**抽样帧本身**（用纯色反查帧号）。"""
+        from PIL import Image
+        gif = _anim_gif_bytes(12, (400, 300))
+        out, _ = prepare_bytes_for_vision(gif)
+        want = [0, 2, 4, 7, 9, 11]                        # gif_frame_indices(12, 6)
+        with Image.open(io.BytesIO(out)) as im:
+            rgb = im.convert("RGB")
+            for slot, frame_no in enumerate(want):
+                cx = (slot % 3) * 320 + 160
+                cy = (slot // 3) * 320 + 160
+                got = _nearest_palette(rgb.getpixel((cx, cy)))
+                self.assertEqual(
+                    got, frame_no % len(_PALETTE),
+                    f"第 {slot} 格（{cx},{cy}）应是第 {frame_no} 帧的颜色，实得 "
+                    f"{rgb.getpixel((cx, cy))}")
+
+    @requires_pil
+    def test_each_frame_long_edge_capped_at_320_and_centered(self):
+        """400×300 帧 → 320×240，竖直居中（上下留白），**不放大**。"""
+        from PIL import Image
+        gif = _anim_gif_bytes(6, (400, 300))
+        out, _ = prepare_bytes_for_vision(gif)
+        with Image.open(io.BytesIO(out)) as im:
+            rgb = im.convert("RGB")
+            self.assertEqual(rgb.getpixel((160, 20)), (255, 255, 255), "上留白")
+            self.assertEqual(rgb.getpixel((160, 300)), (255, 255, 255), "下留白")
+            self.assertNotEqual(rgb.getpixel((160, 160)), (255, 255, 255), "帧本体")
+            # 帧占满整格宽（400 的长边被压到 320）
+            self.assertNotEqual(rgb.getpixel((5, 160)), (255, 255, 255))
+
+    @requires_pil
+    def test_small_frame_is_not_upscaled(self):
+        """小帧居中留白，**不放大**（放大不加信息、只加字节）。"""
+        from PIL import Image
+        gif = _anim_gif_bytes(6, (100, 80))
+        out, _ = prepare_bytes_for_vision(gif)
+        with Image.open(io.BytesIO(out)) as im:
+            rgb = im.convert("RGB")
+            self.assertEqual(rgb.getpixel((20, 20)), (255, 255, 255), "左上留白")
+            self.assertEqual(_nearest_palette(rgb.getpixel((160, 160))), 0,
+                             "首帧应居中（且没有被放大）")
+
+    @requires_pil
+    def test_transparent_gif_composited_on_white(self):
+        """透明像素合成到**白底**：JPEG 无 alpha，直接 convert 会变黑（假信息）。"""
+        from PIL import Image, ImageDraw
+        frames = []
+        for color in ((255, 0, 0, 255), (0, 0, 255, 255)):
+            im = Image.new("RGBA", (320, 320), (0, 0, 0, 0))
+            ImageDraw.Draw(im).rectangle([110, 110, 209, 209], fill=color)
+            frames.append(im)
+        buf = io.BytesIO()
+        frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:],
+                       duration=80, loop=0)
+        out, mime = prepare_bytes_for_vision(buf.getvalue())
+        self.assertEqual(mime, "image/jpeg")
+        with Image.open(io.BytesIO(out)) as im:
+            rgb = im.convert("RGB")
+            self.assertEqual(rgb.getpixel((5, 5)), (255, 255, 255), "透明区应为白底")
+            r, g, b = rgb.getpixel((160, 160))
+            self.assertGreater(r, 180)
+            self.assertLess(g, 90)
+
+    @requires_pil
+    def test_fewer_frames_than_six_trims_blank_row(self):
+        """帧数 <6 的 GIF（实测占真实贴纸的 12%）→ 画布按**实际用到的行数**收窄。"""
+        from PIL import Image
+        meta = {}
+        out, mime = prepare_bytes_for_vision(_anim_gif_bytes(2, (400, 300)), meta=meta)
+        self.assertEqual(mime, "image/jpeg")
+        with Image.open(io.BytesIO(out)) as im:
+            self.assertEqual(im.size, (960, 320), "2 帧只占 1 行，别留整行空白")
+        self.assertEqual(meta["gif_grid"]["frames"], 2)
+        self.assertEqual(meta["gif_grid"]["rows"], 1)
+        self.assertEqual(meta["gif_grid"]["of"], 2)
+
+    @requires_pil
+    def test_volume_gate_is_gone(self):
+        """🔴 反向断言：**>1.5MB 的多帧 GIF 也必须拼网格**（B-049 的根因）。
+
+        旧行为：`len(data) <= GIF_INLINE_MAX_BYTES` 才整图直送，否则**首帧 JPEG**
+        → 动作语义丢失。这里用 LZW 压不动的随机帧把体积顶到 1.5MB 以上。
+        """
+        gif = _noise_gif_bytes()
+        self.assertGreater(len(gif), 1_500_000, "样例本身必须超过旧闸门")
+        meta = {}
+        out, mime = prepare_bytes_for_vision(gif, meta=meta)
+        self.assertEqual(mime, "image/jpeg")
+        self.assertNotEqual(out, gif, "不得整图直送")
+        self.assertTrue(meta.get("gif_grid"), "必须走网格")
+        self.assertFalse(meta.get("gif_grid_fail"))
+        from PIL import Image
+        with Image.open(io.BytesIO(out)) as im:
+            self.assertEqual(im.size, (960, 640))
+
+    @requires_pil
+    def test_gate_constant_no_longer_gates(self):
+        """旧闸门常量**已废**：改它不再改变任何行为（保留名字只为离线工具 import）。"""
+        from services import image_prep as P
+        gif = _anim_gif_bytes(8, (400, 300))
+        base, base_mime = prepare_bytes_for_vision(gif)
+        # 旧名**保留**（tools/build_sticker_index.py 还在 import 它，那文件不在本次
+        # 改动范围内）；保留的只是名字，值已经没有任何作用 —— 下面三个探针钉住这点。
+        self.assertTrue(hasattr(P, "GIF_INLINE_MAX_BYTES"))
+        orig = P.GIF_INLINE_MAX_BYTES
+        try:
+            for probe in (1, 10, 10 ** 9):
+                P.GIF_INLINE_MAX_BYTES = probe
+                out, mime = prepare_bytes_for_vision(gif)
+                self.assertEqual((out, mime), (base, base_mime),
+                                 f"闸门={probe} 竟然改变了行为 —— 闸门没废干净")
+        finally:
+            P.GIF_INLINE_MAX_BYTES = orig
+
+    @requires_pil
+    def test_non_gif_unaffected(self):
+        """非 GIF 的静图路径原样（PNG 仍走 768px 降采样 JPEG）。"""
+        from PIL import Image
+        png = _img_bytes(size=(2000, 1000))
+        meta = {}
+        out, mime = prepare_bytes_for_vision(png, meta=meta)
+        self.assertEqual(mime, "image/jpeg")
+        self.assertNotIn("gif_grid", meta)
+        self.assertNotIn("gif_grid_fail", meta)
+        self.assertEqual(meta.get("path"), "static")
+        with Image.open(io.BytesIO(out)) as im:
+            self.assertEqual(max(im.size), 768)
+
+
+class TestGifGridDegradeC27(unittest.TestCase):
+    """降级**必须留痕**：拼不出来时，理由要进 meta（线上再落到 diag/stats/log）。"""
+
+    def test_undecodable_gif_records_grid_fail(self):
+        fake_gif = b"GIF89a" + b"\x00" * 40          # 魔数对但解不开
+        meta = {}
+        out, mime = prepare_bytes_for_vision(fake_gif, meta=meta)
+        self.assertEqual(out, fake_gif)              # 回退原字节（既有行为）
+        self.assertEqual(mime, "image/gif")
+        self.assertTrue(meta.get("gif_grid_fail"), "解码失败必须留下原因")
+        self.assertEqual(meta.get("path"), "gif_firstframe_fallback")
+
+    def test_no_pil_records_grid_fail(self):
+        import sys
+        saved = sys.modules.get("PIL")
+        sys.modules["PIL"] = None                    # 模拟无 Pillow 的生产环境
+        try:
+            gif = b"GIF89a" + b"\x00" * 40
+            meta = {}
+            prepare_bytes_for_vision(gif, meta=meta)
+        finally:
+            if saved is None:
+                sys.modules.pop("PIL", None)
+            else:
+                sys.modules["PIL"] = saved
+        self.assertIn("PIL", meta.get("gif_grid_fail", ""))
+
+    @requires_pil
+    def test_single_frame_gif_is_not_a_degradation(self):
+        """单帧 GIF 不是"降级"—— 它本来就该走静图路径，不许报 fail。"""
+        gif = _img_bytes("GIF", size=(1200, 900), frames=1)
+        meta = {}
+        out, mime = prepare_bytes_for_vision(gif, meta=meta)
+        self.assertEqual(mime, "image/jpeg")
+        self.assertNotIn("gif_grid", meta)
+        self.assertNotIn("gif_grid_fail", meta, "单帧不是失败")
+        self.assertEqual(meta.get("path"), "static")
+
+    @requires_pil
+    def test_grid_failure_falls_back_to_first_frame_jpeg(self):
+        """能解码但 seek 失败的那类坏 GIF → 回退首帧 JPEG（且留痕）。"""
+        from services import image_prep as P
+        gif = _anim_gif_bytes(6, (400, 300))
+        orig = P.gif_frame_indices
+        P.gif_frame_indices = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        meta = {}
+        try:
+            out, mime = prepare_bytes_for_vision(gif, meta=meta)
+        finally:
+            P.gif_frame_indices = orig
+        self.assertEqual(mime, "image/jpeg")
+        self.assertEqual(meta.get("path"), "gif_firstframe_fallback")
+        self.assertIn("boom", meta.get("gif_grid_fail", ""))
+        from PIL import Image
+        with Image.open(io.BytesIO(out)) as im:
+            self.assertLessEqual(max(im.size), 768)   # 首帧降采样，不是网格
+
+
+class TestGifPromptFrameCountC27(unittest.TestCase):
+    """提示词必须报**这次实际**的帧数（12% 的真实 GIF 不足 6 帧，会留白）。"""
+
+    def test_default_matches_constant(self):
+        from services.vision import VISION_GIF_SYSTEM_PROMPT as D
+        from services.vision import gif_grid_system_prompt as G
+        self.assertEqual(G(6, 3, 2), D)
+        self.assertIn("共 6 帧", D)
+        self.assertNotIn("空白", D, "满格时不该提空白格")
+
+    def test_short_gif_prompt_reports_real_count_and_blanks(self):
+        from services.vision import gif_grid_system_prompt as G
+        p = G(2, 3, 1)
+        self.assertIn("共 2 帧", p)
+        self.assertNotIn("共 6 帧", p)
+        self.assertIn("3 列 × 1 行", p)
+        self.assertIn("空白", p)
+        # 输出契约不能丢（S6 的唯一主导因素）
+        for kw in ('"desc"', '"tags"', "JSON", "动图", "顺序"):
+            self.assertIn(kw, p)
 
 
 class TestParseVisionJson(unittest.TestCase):

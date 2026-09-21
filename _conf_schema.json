@@ -400,35 +400,48 @@
   },
   "emotion": {
     "type": "object",
-    "description": "情绪引擎（G10 v1：willingness/mood/sticker 三维 + 同群缓存）",
+    "description": "情绪引擎 v2（C24：代码计算，无 LLM 调用）。score 起 1.0，Gate 每判一次 blocked 扣分，随时间恢复；硬闸乘子 = 0.6 + 0.4 × score",
+    "hint": "🔴 量纲：乘子 ∈ [0.6, 1.0]，score ∈ [0, 1]，两者不是一个量。硬闸判据是 raw × 乘子 ≥ rag.score_threshold(0.6)，而 raw 实测上限 ≈0.79 → **score < 0.40（精确 0.3987）= RAG 通道数学上不可能触发，只剩 @ 路径**（有意行为，见 docs/specs/emotion_v2.md §7.2）。每次扣分都会落 INFO 日志（含 reason/前后分数），用于先跑几天量 blocked 真实频率。",
     "items": {
       "enabled": {
         "type": "int",
-        "description": "0 关闭（退回中性）/ 1 开启",
+        "description": "0 关闭（恒中性：乘子 1.0、不注入心情、零日志）/ 1 开启",
         "default": 1
       },
-      "timeout_sec": {
+      "initial_score": {
         "type": "float",
-        "description": "情绪 LLM 调用超时（秒），超时回退中性并在 trace 记 emotion_degraded",
-        "hint": "🔴 2026-09-13 修复：旧默认 3s **短于模型自身耗时**（实测同一 prompt 4.1–8.0s，思考 token 227–738）→ 每一次调用都超时、静默回退中性值，而 trace 上看起来就像「模型稳定输出中性」（2262 条无一例外）。网关不认 off，思考关不掉，故只能放宽超时。",
-        "default": 30
+        "description": "初始分数（0~1），也是恢复的上限",
+        "hint": "定案 1.0（emotion_v2 §6）。超出 [min_score, max_score] 会被钳制并落 WARNING。",
+        "default": 1.0
       },
-      "cache_ttl_sec": {
+      "blocked_penalty": {
         "type": "float",
-        "description": "同群情绪缓存时长（秒）",
-        "hint": "应 >= 模型单次耗时（4–8s），否则每条消息都重复调用。30s 同时覆盖「同群连续消息」与「缓存复用」。",
-        "default": 30
+        "description": "Gate 每判一次 blocked 扣多少分",
+        "hint": "定案 0.1（各类 blocked 一律相同，§6）。⚠️ 未定值：按 −0.1/+0.1 每分钟这组默认值，实测 RAG 命中 ≈5/小时、blocked 只是其中一小部分 → **分数会长期钉在 1.0**（§7.1，与旧 LLM 版「没有动态范围」是同一个毛病）。先跑几天拿 blocked 真实频率再定值：>1 次/分才开始明显掉分，3 次/分必然钉在下限 0.0。",
+        "default": 0.1
       },
-      "temperature": {
+      "recovery_per_min": {
         "type": "float",
-        "description": "情绪分析温度（A7④：结构化 JSON，低温保稳定）",
-        "default": 0.2
+        "description": "每分钟自然恢复多少分",
+        "hint": "定案 0.1（§6）。1 次/分 = 扣分与恢复恰好抵消（平衡点）；0.5 次/分以下必回满。§7.1 建议备选：0.1/小时量级（约 10 小时回满）。",
+        "default": 0.1
       },
-      "reasoning_effort": {
-        "type": "string",
-        "description": "情绪分析思考强度（low/medium/high/xhigh/max；off = 不发送该参数）",
-        "hint": "⚠️ 网关**不认 off**：填 off 只是「不发该参数」，模型仍按默认档思考（实测 651–738 思考 token / 4–8s），并没有真的关掉思考。",
-        "default": "low"
+      "min_score": {
+        "type": "float",
+        "description": "分数下限",
+        "hint": "⚠️ 别为了「保住 RAG 通道」把它抬到 0.40 以上还以为万事大吉：0.76 乘子只是「刚好卡在 raw 上限」，是否够用取决于真实 raw 分布。默认 0.0 = 允许完全静音（@ 仍必回）。",
+        "default": 0.0
+      },
+      "max_score": {
+        "type": "float",
+        "description": "分数上限（恢复到此为止）",
+        "default": 1.0
+      },
+      "recovery_log_step": {
+        "type": "float",
+        "description": "恢复日志步长：累计恢复达到该值才落一条 INFO（防逐条消息刷屏）",
+        "hint": "默认 0.05 = 30 秒的恢复量（0.1/分）。0 = 每次结算都落（排查用）；负数 = 关掉周期性恢复日志（跨心情档 / 跨 0.40 悬崖仍会落）。**扣分日志不受此参数影响，永远落 INFO**（测量仪器）。",
+        "default": 0.05
       }
     }
   },

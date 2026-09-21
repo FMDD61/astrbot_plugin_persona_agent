@@ -11,6 +11,49 @@
 
 ## [Unreleased]
 
+### Changed (2026-09-21 · 批次三「行为放开」—— C15/C18/C3/C22/C23/C24/C25/C27)
+> 用户口径：「emoji 和 @ 都打开，我们留给 RP 更大的发挥空间」。
+> **本批会立刻改变线上行为**（参与量、消息形态、裁判上下文），须单独观察。
+
+- **C15 放开 emoji 与 @**（`services/text_style.py`）：删掉 `postprocess` 里的 `strip_emoji()`
+  与 `strip_at_mentions()` —— 这两步是 S0 的预防性收口，代价是提示词 §7【句末的表情】与
+  §6「@ 他一句」两处教学**自上线起不可能生效**（实测 bot 输出 465 条：emoji 0 / @ 0；
+  风格源 2337 条：emoji 112 / @ 50）→ B-048 结案。防泄漏的标记剥离（`[r]`/`[emote:]`/`[poke:]`）**照旧**。
+- **C18 允许纯贴纸回复**（`main.py`）：早退条件从 `if not reply_text` 改为
+  `if not reply_text and not send_intent.emote` —— 旧写法让「说不出完整的话时只发一张表情包」
+  **永远走不到**（正文空就早退，连贴纸都不发）。纯贴纸轮在会话里记 `（发了一张表情包）` 占位，
+  否则这一轮对下一轮的 RP **凭空消失**（会重复发同一张）。
+- **C3 时间分时段 + PHI 压成一行**（D13/D38/D41/D43）：`【当下】现在本地时间 16 时。当前心情：轻松调侃`
+  → `【当下】下午，心情轻快`（5 档覆盖 24 小时；**时间永远在**，心情空只省后半句）；
+  PHI 去掉重复的 `发话人：` 行，被 @ 时在**同一行**补 `（@ 了你）`，这一行同时是 `[r]` 的指认对象。
+- **C22 Gate 冻结头部独立化**（`services/pipeline.py`）：`shared_context()` 从「RP 前缀原样」
+  改为 **Gate 自己的上下文**（Gate 头部 + 关系图谱 + 全天消息），**不再带 RP 的工具语法块与示例块**
+  （§4：那是「怎么回」，与「接不接」无关）。连带修正 4 处「两边逐字节相同」的陈旧注释（B-030 那一族）。
+  Gate 拿不到头部时回退旧裁判 system，并**逐轮写进 `trace["gate_head_fallback"]`**（N-4 的出口）。
+- **C23 GATE 输出改两问**（`services/gate.py`）：`{reply, conflict}` → `{want, blocked}`；
+  `blocked` 为 `false` 或 `conflict`/`topic`/`pda`，`reply = want 且未被挡`（**派生**，7 处消费者零改动）。
+  🔴 **未知 `blocked` 取值按「被挡」处理**（fail closed，宁可不说）并原样记进决策供统计 ——
+  这条是独立核验点名过的失效方向问题；旧格式 `{reply, conflict}` 仍兼容（回退路径）。
+  PHI 重写为「轮到我表态了 + 输出格式」，判据全部搬进冻结头部（旧版 600 字维度约束删除）。→ B-052 结案。
+- **C24 emotion 改代码计算**（`services/emotion.py`）：删掉整条 LLM 调用（含 `EMOTION_SYSTEM_PROMPT`、
+  超时、缓存、解析）；新口径 = 初始 1.0 / 每次 Gate 判 `blocked` −0.1 / 恢复 +0.1 每分钟 / 范围 0~1；
+  **乘子 = 0.6 + 0.4×score**（进硬闸）。参数**可配置**（`emotion.*`）且每次扣分落 INFO 日志；
+  代码注释写明 `score < 0.40 ⇒ 乘子 < 0.76 ⇒ raw 上限 0.79 下 RAG 通道数学上不可能触发`。
+  接线判据：**只在 `gate_d.blocked is not False` 且非 `fallback`** 时扣分
+  （`not reply` 会把「压根不想说」也算上；`fallback` 会把一次 Gate 故障变成分数打到底 → 静默失效）。
+- **C25 废弃文生图通道**（B-053）：删 `EmotionState.sticker`、`SendIntent.sticker_prompt`、
+  `main.py` 的 `Comp.Image.fromText` 段（含吞异常的 `except: pass`），配套清理过渡桥与死代码（-36 行）。
+- **C27 GIF 全部抽帧拼网格**（`services/image_prep.py` / `services/vision.py`）：废掉 1.5MB 体积闸门，
+  一律抽 **6 帧**（长边 320）拼 **2×3 网格**（JPEG q82）+ **网格专用提示词**（静图版不变）；
+  抽帧移入 `asyncio.to_thread`（实测最坏 680ms 会把事件循环钉死）。181 张真实贴纸实测：
+  首帧降级 50 张 → **0 张**，载荷 65.0MB → 15.9MB（−75.5%），旧首帧组 47/48 找回帧间差异。
+  离线工具 `tools/build_sticker_index.py` 同步改（按 `meta["gif_grid"]` 选提示词，避免"离线一套线上一套"）。→ B-049 结案。
+
+⚠️ **行为提醒（需观察后再定参数）**：emotion 乘子由旧 LLM 版的中位 0.80 变为**满格 1.0**（分数长期钉在 1.0）
+→ 非 @ 的 Gate 触发量预计上升约 25%。**本轮不动 `rag.score_threshold`（0.60）**：按项目纪律先跑几天、
+用新日志量出 `blocked` 真实频率与触发量分布，再决定是否上调（0.60 → 0.75 可抵消）。
+
+
 ### Deployed (2026-09-21 13:02 · 提示词 v2 批次一/二 **实际上线**)
 > 原计划 09-21 02:05 轮转时自动部署，**没赶上** —— 根因在开发机：这批 17 个提交
 > **从未 push**（本地分支连 upstream 都没设），GitHub 停在 `9cd70d9`，台式机 `git pull` 拉不到。

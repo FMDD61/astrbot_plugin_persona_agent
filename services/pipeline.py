@@ -62,7 +62,7 @@ class SendIntent:
     action: str               # reply / silent / topic
     text: str = ""            # 最终正文（已 postprocess、剥标记）
     quote_id: Optional[str] = None   # [r:-N] 解析出的引用消息 id
-    sticker_prompt: str = ""         # 旧文生图（过渡保留）
+    # C25（2026-09-21）：`sticker_prompt` 字段已删除 —— 文生图通道整条废弃（B-053）
     # 工具意图预留（第④步表情库/拍一拍启用）
     emote: Optional[str] = None      # [emote:意图] 解析结果
     poke: Optional[str] = None       # [poke:QQ] 解析结果
@@ -98,6 +98,9 @@ class PersonaPipeline:
         tool_syntax_block: Optional[Callable[[], str]] = None,
         # S9: 关系图谱块（独立于人格 —— 它增长、人格不增长）
         relations_block: Optional[Callable[[], str]] = None,
+        # C22（2026-09-21）：Gate 自己的冻结头部（§1+§2+§4+决策段）。
+        # 与 RP 的 system_prompt **不是**同一个文本 —— 两边从第一个字节起就分叉。
+        gate_system_prompt: Optional[Callable[[], str]] = None,
         # S14: 当前最新 system prompt（会话首条 + 变更时追加）
         system_prompt: Optional[Callable[[], str]] = None,
         # S10: 关系图谱增量（新群友/亲疏变化 → 追加到 session 尾部）
@@ -158,6 +161,9 @@ class PersonaPipeline:
         # A7③: RAG/BGE 总开关。0 时完全不查向量库（决策无分数、Gate 无参考、
         # KG 走退化分支）。与 KGProvider.dense_enabled 联动（main 构造时同源）。
         self.rag_enabled = bool(rag_enabled)
+        self._gate_system_prompt = gate_system_prompt
+        #: 本轮 Gate 头部是否走了回退（N-4：降级必须可见）
+        self._last_gate_fallback: str = ""
         #: D42：KG/RAG 块是否进上下文（默认否）。**不影响硬闸的 top_rag_score。**
         self._kg_display = bool(kg_display)
         # A7④: 时钟注入（离线重放按场景时刻决策；缺省真实时钟）
@@ -179,7 +185,7 @@ class PersonaPipeline:
         self._pending_append[str(group_id)] = (text, name, message_id, sender_uin)
 
     def _assemble_base(self, group_id: str, kg_content: str = "") -> list[dict]:
-        """装配**共享前缀**（RP 与 Gate 逐字节相同）。
+        """装配 **RP 的上下文前缀**（Gate 自 C22 起**不再共用**它）。
 
         顺序（2026-09-13 S4 定稿，恒定在前、易变在尾）：
 
@@ -273,22 +279,68 @@ class PersonaPipeline:
         return out
 
     def shared_context(self, group_id: str) -> list[dict]:
-        """给 Gate 用的上下文：**同一份历史，但不含 RP 的 system prompt**。
+        """给 Gate 用的上下文（C22，2026-09-21 重新定义）。
 
-        Gate 有自己的裁判 system（``GATE_SYSTEM_PROMPT``）。若把 RP 的人格
-        当 system 传给它，模型会**参与聊天而不是判断** —— 这是实测事故
-        （S4 引入，解析失败率 0%→45%，244 条决策退化为保守静默）。
+        设计（`prompt_v2_gate.md` §1/§2）：
 
-        与 RP **共用同一份历史**、**各用各的 system** → 符合用户"不再共用
-        缓存"的要求（前缀不同，各自独立命中）。
+        ```
+        [system] Gate 冻结头部（§1+§2+§4+决策段）   ← gate_system_prompt()
+        [system] 群友识别（关系图谱，与 RP 同一份冻结块）
+        [user]   全天群聊消息（与 RP 同一份 session，**不含 RP 的人格首条**）
+        ```
+
+        **不再与 RP 共享前缀**：Gate 的头部从 §1 之后就插自己的决策段，
+        两边**从第一个字节起就分叉**（§2 明确「不追求跨调用共享缓存」——
+        各自冻结、各自命中，仍然是缓存价）。**故也不带 RP 的工具语法块与示例块**
+        （§4：那是「怎么回」，与「接不接」无关）。
+
+        ⚠️ 历史教训（S4）：若把 RP 的人格当 Gate 的 system，模型会**参与聊天
+        而不是判断**（解析失败率 0%→45%，244 条决策退化为保守静默）。
+        现在两边用的是**同一个人的两套文本**（§1/§2 逐字相同 + Gate 决策段），
+        身份正确而职责不同。
         """
-        base = self._assemble_base(group_id)
-        # 首条就是人格（装配保证）→ 掉它。gate 用自己的裁判 system。
-        if base and isinstance(base[0], dict) and base[0].get("role") == "system":
-            content = str(base[0].get("content") or "")
-            if content == self._current_system_prompt() or "群友" in content[:40]:
-                base.pop(0)
-        return base
+        msgs: list[dict] = []
+        head = self._current_gate_head()
+        if head:
+            msgs.append({"role": "system", "content": head})
+        # 关系图谱：与 RP 用同一份**冻结块**（同一视野，D39）
+        rel_block = (
+            self._relations_block() if self._relations_block is not None else ""
+        )
+        if rel_block and self.session_mgr is not None and \
+                hasattr(self.session_mgr, "freeze_relations_block"):
+            rel_block = self.session_mgr.freeze_relations_block(group_id, rel_block)
+        if rel_block:
+            msgs.append({"role": "system", "content": rel_block})
+        # 全天消息（与 RP 同一份）—— 掉首条人格（那是 RP 的）
+        ctx = (
+            self.session_mgr.get_contexts(group_id)
+            if self.session_mgr is not None
+            else []
+        )
+        if ctx and isinstance(ctx[0], dict) and ctx[0].get("role") == "system":
+            ctx = ctx[1:]
+        msgs.extend(m for m in ctx if isinstance(m, dict))
+        return msgs
+
+    def _current_gate_head(self) -> str:
+        """Gate 冻结头部（C22）；取不到就返回空串 → GateService 退回旧裁判 system。
+
+        取用结果里的回退标记记在实例上，供 trace 用（N-4：降级必须可见）。
+        """
+        if self._gate_system_prompt is None:
+            self._last_gate_fallback = "no_hook"
+            return ""
+        try:
+            text = str(self._gate_system_prompt() or "").strip()
+        except Exception as e:                      # pragma: no cover - 防御
+            self._last_gate_fallback = f"{type(e).__name__}: {e}"
+            return ""
+        fb = ""
+        if self.style is not None:
+            fb = str(getattr(self.style, "last_gate_fallback", "") or "")
+        self._last_gate_fallback = fb
+        return text
 
     def _current_system_prompt(self) -> str:
         if self._system_prompt is None:
@@ -439,9 +491,11 @@ class PersonaPipeline:
             except Exception as e:
                 trace["emotion_error"] = f"{type(e).__name__}: {e}"
         trace["emotion"] = {
+            # C24：`score` 是代码算出的分数（0~1），`willingness` 是**乘子**
+            # （0.6+0.4×score，进硬闸）。两者量纲不同，别混着看。
+            "score": getattr(emotion_state, "emotion_score", None),
             "willingness": emotion_state.global_willingness,
             "mood": emotion_state.current_mood,
-            "sticker": emotion_state.sticker_prompt,
         }
         # S0 观测：情绪 provider **内部**吞掉的失败（超时/解析/网络）。
         # 这些失败会静默回退成中性值，且与「模型正常输出中性值」在 trace 上
@@ -510,7 +564,10 @@ class PersonaPipeline:
                     # （B-039），且中位分 0.40、94% 在 0.6 以下。开关：kg_display。
                     rag_hits=(hits if (hits and self._kg_display) else None),
                     is_at=inp.is_at,
-                    # S4：共享上下文 —— Gate 与 RP 看到逐字节相同的前缀
+                    # C22（2026-09-21）：**不再与 RP 共享前缀** —— Gate 有自己
+                    # 的冻结头部（§1+§2+§4+决策段），两边从第一个字节起分叉
+                    # （`prompt_v2_gate.md` §2：各自冻结、各自命中，仍是缓存价）。
+                    # 旧注释写的「逐字节相同」自 C22 起不成立，留着就是 B-030 那一族。
                     # （人格 + 示例 + session + KG）。此前 Gate 只有 740 字符
                     # 小 prompt + 15 条窗口，看不到人格与别名块。
                     contexts=self.shared_context(group_id),
@@ -524,6 +581,22 @@ class PersonaPipeline:
             _ginfo = getattr(self.gate, "last_error", None)
             if _ginfo:
                 trace["gate_degraded"] = str(_ginfo)
+            # 🔴 C24（2026-09-21）：Gate 判「能不能回」被挡时，给 emotion 记一笔。
+            # **判据必须落在 `gate_d.blocked`**，不能写成 `not gate_d.reply`：
+            #   · `not reply` 混了两件事 ——「有话想说但被拦」与「压根不想说」；
+            #     后者不是被拦，不该扣分（C23 把两问拆开就是为了能分别统计）。
+            #   · `gate_d.fallback`（超时/坏 JSON）也不算 —— 否则一次 Gate 故障
+            #     就把分数打到下限，连带把 RAG 通道关掉（静默失效的典型形态）。
+            _blk = getattr(gate_d, "blocked", False)
+            if _blk is not False and _blk and not gate_d.fallback \
+                    and self.emotion is not None:
+                try:
+                    self.emotion.register_blocked(
+                        str(_blk), group_id=group_id,
+                        event_key=str(getattr(inp, "message_id", "") or ""),
+                    )
+                except Exception as e:
+                    trace["emotion_blocked_error"] = f"{type(e).__name__}: {e}"
             # 安全阀：conflict=true 强制不发言（无论 reply/action，含 @ 与 topic）
             if gate_d.conflict or not gate_d.reply:
                 reason = gate_d.reason
@@ -591,10 +664,16 @@ class PersonaPipeline:
                 trace["kg_error"] = f"{type(e).__name__}: {e}"
             trace["kg_tail"] = kg_content[:400]
 
-        # ---- 上下文装配（S4：RP 与 Gate **共用同一份**）----
+        # ---- 上下文装配 ----
+        # C22：RP 与 Gate **共用同一份 session**（同一视野，D39），但**不共用前缀**：
+        # RP 走 `_assemble_base`（人格 + 工具语法 + 示例 + 图谱 + 全天消息），
+        # Gate 走 `shared_context`（Gate 头部 + 图谱 + 全天消息）—— 见各自 docstring。
         base_contexts = self._assemble_base(group_id, kg_content)
         if getattr(self, "_last_sys_sync", ""):
             trace["sys_prompt_sync"] = self._last_sys_sync
+        if getattr(self, "_last_gate_fallback", ""):
+            # N-4/C22：Gate 头部走了回退 → 必须进 trace（否则"裁判身份丢了"没人知道）
+            trace["gate_head_fallback"] = self._last_gate_fallback
         _prep = getattr(self, "_last_persona_report", None)
         if isinstance(_prep, dict) and (_prep.get("missing") or _prep.get("fallback")):
             trace["persona_degraded"] = {
@@ -832,7 +911,7 @@ class PersonaPipeline:
             action="reply",
             text=clean_text,
             quote_id=quote_id,
-            sticker_prompt=emotion_state.sticker_prompt,
+
             # S3：动作意图交给 main 旁路执行（pipeline 不做发送）
             emote=emote_intent,
             poke=poke_target,

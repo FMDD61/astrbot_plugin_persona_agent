@@ -317,7 +317,11 @@ class TestGateRpSystemSeparation(unittest.TestCase):
                 "Gate 上下文**不得**含 RP 人格（否则模型会去聊天而非判断）")
 
     def test_gate_keeps_history_and_other_blocks(self):
-        """掉掉的只是人格首条 —— 历史、示例块、关系图谱都要保留（Gate 也需要看群聊）。"""
+        """C22 契约：Gate 收 **头部 + 关系图谱 + 全天历史**；**不收** RP 的示例块。
+
+        旧断言（S4）要求示例块也在 —— 那是「怎么回」，与「接不接」无关，
+        `prompt_v2_gate.md` §4 明确不进。
+        """
         with tempfile.TemporaryDirectory() as td:
             self._mk(td)
             p, _ = self._pipeline(td, self._sm())
@@ -325,8 +329,9 @@ class TestGateRpSystemSeparation(unittest.TestCase):
             joined = json.dumps(gate, ensure_ascii=False)
             self.assertIn("甲说话", joined, "Gate 必须看得到群聊历史")
             self.assertIn("机器人的回复", joined)
-            self.assertIn("【示例块】", joined)
             self.assertIn("成员甲", joined, "Gate 要看得到关系图谱")
+            self.assertNotIn("【示例块】", joined, "示例块不进 Gate（§4）")
+            self.assertNotIn("群员成员丁", joined, "RP 的人格不进 Gate（C22）")
 
     def test_gate_and_rp_prefixes_differ(self):
         """用户要求"不再共用缓存" → 两者前缀必须不同。"""

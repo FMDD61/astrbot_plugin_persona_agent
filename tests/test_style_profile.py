@@ -216,18 +216,34 @@ class TestCacheStableSystemPrompt(unittest.TestCase):
             self.assertNotIn("现在本地时间", sp.system_prompt())
             self.assertNotIn("现在本地时间", sp.system_prompt(local_hour=9))
 
-    def test_volatile_line_carries_hour_and_mood(self):
+    def test_volatile_line_is_segment_and_mood_one_line(self):
+        """C3（D13/D41）：`下午，心情轻快` —— 分时段、一行、心情可省。"""
         with tempfile.TemporaryDirectory() as td:
             sp = self._make(td)
-            self.assertEqual(sp.volatile_line(local_hour=14), "现在本地时间 14 时。")
+            self.assertEqual(sp.volatile_line(local_hour=14), "下午")
             self.assertEqual(
                 sp.volatile_line(local_hour=3, mood="有点困"),
-                "现在本地时间 03 时。\n当前心情：有点困",
+                "凌晨，心情有点困",
             )
+            # 心情为空只省后半句 —— **时间永远在**（否则模型不知道几点）
+            self.assertEqual(sp.volatile_line(local_hour=9, mood=""), "早上")
             self.assertEqual(sp.volatile_line(local_hour=None, mood=""), "")
-            # 非法小时 → 不出时间行，只留心情
+            # 非法小时 → 不出时段词，只留心情
             self.assertEqual(sp.volatile_line(local_hour=99, mood=""), "")
-            self.assertEqual(sp.volatile_line(local_hour=None, mood="烦"), "当前心情：烦")
+            self.assertEqual(sp.volatile_line(local_hour=None, mood="烦"), "心情烦")
+
+    def test_day_segment_table_covers_24h(self):
+        """D13 的 5 档必须覆盖 0–23 且不重叠（表错就是静默失真）。"""
+        from services.style_profile import DAY_SEGMENTS, day_segment
+        covered: list[int] = []
+        for lo, hi, _word in DAY_SEGMENTS:
+            self.assertLessEqual(lo, hi)
+            covered.extend(range(lo, hi + 1))
+        self.assertEqual(sorted(covered), list(range(24)))
+        self.assertEqual(len(covered), len(set(covered)), "档位不得重叠")
+        self.assertEqual(day_segment(0), "凌晨")
+        self.assertEqual(day_segment(23), "晚上")
+        self.assertEqual(day_segment(99), "", "表外回落空串，不抛")
 
     def test_system_prompt_stable_across_hours_is_the_point(self):
         """不变式：24 小时里 system prompt 只应有一种取值。"""

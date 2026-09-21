@@ -7,7 +7,10 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from services.vision import VisionService, face_name, sniff_mime, resolve_image_bytes
+from services.vision import (  # noqa: E402
+    VISION_GIF_SYSTEM_PROMPT, VISION_SYSTEM_PROMPT, VisionService, face_name,
+    sniff_mime, resolve_image_bytes,
+)
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 JPG = b"\xff\xd8\xff\xe0" + b"\x00" * 16
@@ -114,13 +117,13 @@ class TestVisionService(unittest.TestCase):
 
         async def go():
             v = self._mk(post)
-            await v.describe_bytes(GIF)
+            await v.describe_bytes(PNG)          # C27 起 GIF 不再是"原样直送"，用静图断言
             return captured
 
         c = asyncio.run(go())
         self.assertEqual(c['url'], "https://x/v1/chat/completions")
         self.assertEqual(c['model'], "mimo-v2.5")
-        self.assertTrue(c['img'].startswith("data:image/gif;base64,"))
+        self.assertTrue(c['img'].startswith("data:image/png;base64,"))
 
     def test_timeout_fallback_none(self):
         async def post(url, payload):
@@ -282,6 +285,229 @@ class TestVisionDiagnostics(unittest.TestCase):
         asyncio.run(go())
 
 
+# ---------------------------------------------------------------- C27：GIF 网格
+try:                                          # 系统 python 无 PIL（生产/台式机有）
+    import PIL  # noqa: F401
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
+
+_requires_pil = unittest.skipUnless(_HAS_PIL, "本环境无 Pillow（生产/台式机有）")
+
+_PALETTE_C27 = [(230, 30, 30), (30, 200, 30), (30, 30, 230), (230, 205, 20),
+                (230, 30, 230), (30, 200, 200)]
+
+
+def _anim_gif(frames=6, size=(400, 300)) -> bytes:
+    """真实可解码的多帧 GIF（第 i 帧 = 第 i 个纯色）。"""
+    from PIL import Image
+    ims = [Image.new("RGB", size, _PALETTE_C27[i % len(_PALETTE_C27)])
+           for i in range(frames)]
+    import io as _io
+    buf = _io.BytesIO()
+    ims[0].save(buf, format="GIF", save_all=True, append_images=ims[1:],
+                duration=80, loop=0)
+    return buf.getvalue()
+
+
+class TestGifGridPromptC27(unittest.TestCase):
+    """C27：**GIF 网格版与静图版是两个 system prompt**（B-049）。
+
+    只说明"描述这张图片"时，模型会把网格当**一张拼图**逐格描述 —— 动作语义又丢了。
+    所以抽帧拼网格必须**成对**上线：网格 + "这是动图按顺序抽的连续帧"。
+    """
+
+    def _mk(self, post):
+        return VisionService("https://x/v1", "k", "m", http_post=post)
+
+    def _capture(self):
+        cap = []
+
+        async def post(url, payload):
+            cap.append(payload)
+            return {"choices": [{"message": {"content": '{"desc": "ok", "tags": ["猫"]}'}}]}
+        return cap, post
+
+    def test_prompts_are_distinct(self):
+        self.assertNotEqual(VISION_GIF_SYSTEM_PROMPT, VISION_SYSTEM_PROMPT)
+
+    def test_gif_prompt_says_frames_in_order(self):
+        """网格版必须点明"动图 / 按顺序抽的帧"，否则模型当拼图描述。"""
+        P = VISION_GIF_SYSTEM_PROMPT
+        for kw in ("动图", "顺序", "帧", "网格"):
+            self.assertIn(kw, P, f"GIF 网格提示词缺少 {kw!r}")
+        # 输出契约与静图版一致（S6：约定 JSON schema 是可用率的主导因素）
+        for kw in ('"desc"', '"tags"', "JSON"):
+            self.assertIn(kw, P)
+
+    def test_static_prompt_does_not_claim_to_be_a_grid(self):
+        self.assertNotIn("网格", VISION_SYSTEM_PROMPT)
+        self.assertNotIn("连续帧", VISION_SYSTEM_PROMPT)
+
+    @_requires_pil
+    def test_animated_gif_uses_grid_prompt_and_jpeg_payload(self):
+        import io as _io
+        cap, post = self._capture()
+        gif = _anim_gif(6, (400, 300))
+
+        async def go():
+            v = self._mk(post)
+            d = {}
+            out = await v.describe_bytes(gif, diag=d)
+            return v, d, out
+
+        v, diag, out = asyncio.run(go())
+        self.assertEqual(out, "ok")
+        self.assertEqual(cap[0]["messages"][0]["content"], VISION_GIF_SYSTEM_PROMPT)
+        url = cap[0]["messages"][1]["content"][1]["image_url"]["url"]
+        self.assertTrue(url.startswith("data:image/jpeg;base64,"), url[:32])
+        # 载荷确实是一张 960×640 的网格（不是原 GIF、也不是首帧）
+        self.assertNotEqual(base64.b64decode(url.split(",", 1)[1]), gif)
+        from PIL import Image
+        with Image.open(_io.BytesIO(base64.b64decode(url.split(",", 1)[1]))) as im:
+            self.assertEqual(im.size, (960, 640))
+        self.assertEqual(diag.get("prompt"), "gif_grid")
+        self.assertEqual(diag.get("mime"), "image/jpeg")
+        self.assertEqual(diag["grid"]["frames"], 6)
+        self.assertEqual(v.stats["gif_grid"], 1)
+        self.assertEqual(v.stats["gif_grid_fail"], 0)
+
+    @_requires_pil
+    def test_short_gif_uses_prompt_with_its_own_frame_count(self):
+        """2 帧的 GIF → 提示词说"共 2 帧"（不是写死的 6）—— 12% 的真实贴纸是这种。"""
+        cap, post = self._capture()
+
+        async def go():
+            v = self._mk(post)
+            d = {}
+            out = await v.describe_bytes(_anim_gif(2, (400, 300)), diag=d)
+            return out, d
+
+        out, diag = asyncio.run(go())
+        self.assertEqual(out, "ok")
+        sys_prompt = cap[0]["messages"][0]["content"]
+        self.assertIn("共 2 帧", sys_prompt)
+        self.assertNotEqual(sys_prompt, VISION_GIF_SYSTEM_PROMPT)
+        self.assertEqual(diag["grid"]["rows"], 1)
+
+    def test_static_image_uses_static_prompt(self):
+        cap, post = self._capture()
+
+        async def go():
+            v = self._mk(post)
+            d = {}
+            out = await v.describe_bytes(PNG, diag=d)
+            return v, d, out
+
+        v, diag, out = asyncio.run(go())
+        self.assertEqual(out, "ok")
+        self.assertEqual(cap[0]["messages"][0]["content"], VISION_SYSTEM_PROMPT)
+        self.assertEqual(diag.get("prompt"), "static")
+        self.assertNotIn("grid", diag)
+        self.assertEqual(v.stats["gif_grid"], 0)
+
+    def test_grid_failure_uses_static_prompt_and_leaves_trace(self):
+        """拼网格失败 → 回退静图路径，但**必须留下原因**（diag + stats）。
+
+        假 GIF 魔数（解不开）走的就是这条路：既有的"回退原字节 + 按魔数标 mime"
+        行为不变，新增的是可观测性。
+        """
+        fake_gif = b"GIF89a" + b"\x00" * 40
+        cap, post = self._capture()
+
+        async def go():
+            v = self._mk(post)
+            d = {}
+            out = await v.describe_bytes(fake_gif, diag=d)
+            return v, d, out
+
+        v, diag, out = asyncio.run(go())
+        self.assertEqual(out, "ok")
+        self.assertEqual(cap[0]["messages"][0]["content"], VISION_SYSTEM_PROMPT)
+        self.assertTrue(diag.get("gif_grid_fail"), "降级原因必须进 diag")
+        self.assertEqual(diag.get("prompt"), "static")
+        self.assertEqual(v.stats["gif_grid_fail"], 1)
+        self.assertEqual(v.stats["gif_grid"], 0)
+
+    @_requires_pil
+    def test_prep_runs_off_the_event_loop_thread(self):
+        """抽帧拼网格实测最坏 587ms（真实贴纸库 n=181）→ 必须在线程里跑。
+
+        同步调会把整个 bot 的消息处理按住几百毫秒 —— 旧路径最多 75ms，
+        这是 C27 带进来的新成本，所以要有这条钉子。
+        """
+        import threading
+        from services import vision as V
+
+        seen = []
+        orig = V.prepare_bytes_for_vision
+
+        def spy(data, **kw):
+            seen.append(threading.current_thread().name)
+            return orig(data, **kw)
+
+        cap, post = self._capture()
+        main_name = threading.current_thread().name
+        V.prepare_bytes_for_vision = spy
+        try:
+            async def go():
+                v = self._mk(post)
+                await v.describe_bytes(_anim_gif(6, (400, 300)))
+
+            asyncio.run(go())
+        finally:
+            V.prepare_bytes_for_vision = orig
+        self.assertTrue(seen, "预处理没被调用？")
+        self.assertNotEqual(seen[0], main_name,
+                            "抽帧跑在主线程上 → 事件循环被阻塞")
+
+    @_requires_pil
+    def test_cache_key_is_original_bytes_and_prep_runs_after_lookup(self):
+        """契约：缓存键 = **原始字节** sha256；抽帧拼网格发生在查缓存**之后**。"""
+        import tempfile
+        from services import vision as V
+
+        cap, post = self._capture()
+        gif = _anim_gif(6, (400, 300))
+        calls = []
+        orig = V.prepare_bytes_for_vision
+
+        def spy(data, **kw):
+            calls.append(len(data))
+            return orig(data, **kw)
+
+        V.prepare_bytes_for_vision = spy
+        try:
+            async def go():
+                with tempfile.TemporaryDirectory() as tmp:
+                    p = os.path.join(tmp, "image_desc_cache.json")
+                    v1 = VisionService("https://x/v1", "k", "m", http_post=post,
+                                       persist_path=p)
+                    d1 = await v1.describe_bytes(gif)
+                    v1.flush()
+                    first_prep_calls = list(calls)
+                    calls.clear()
+                    v2 = VisionService("https://x/v1", "k", "m", http_post=post,
+                                       persist_path=p)
+                    diag = {}
+                    d2 = await v2.describe_bytes(gif, diag=diag)
+                    return d1, d2, first_prep_calls, list(calls), diag, len(cap)
+
+            d1, d2, first, second, diag, n_calls = asyncio.run(go())
+        finally:
+            V.prepare_bytes_for_vision = orig
+
+        self.assertEqual(d1, "ok")
+        self.assertEqual(d2, "ok")
+        self.assertEqual(len(first), 1, "首次必须预处理一次")
+        self.assertEqual(first[0], len(gif), "预处理拿到的是**原始**字节")
+        self.assertEqual(second, [], "命中持久缓存后不得再预处理")
+        self.assertEqual(n_calls, 1, "第二次不得再调模型")
+        self.assertEqual(diag.get("cache"), "persist")
+        self.assertEqual(diag.get("hash"), hashlib.sha256(gif).hexdigest()[:16])
+        self.assertEqual(diag.get("bytes"), len(gif))
+
+
 class TestVisionPersistLRU(unittest.TestCase):
     """A7\u2462 \u6301\u4e45\u54c8\u5e0c\u7f13\u5b58\uff1a\u8de8\u5b9e\u4f8b\u590d\u7528 / LRU \u6dd8\u6c70 / flush / snapshot \u89c2\u6d4b\u3002"""
 
@@ -356,6 +582,9 @@ class TestVisionPersistLRU(unittest.TestCase):
                 self.assertEqual(snap["persist_size"], 1)
                 self.assertEqual(snap["persist_max"], 10)
                 self.assertEqual(snap["persist_evicted"], 0)
+                # C27：拼网格计数必须有出口（"只写不读的仪表盘 = 没有仪表盘"）
+                self.assertEqual(snap["gif_grid"], 0)
+                self.assertEqual(snap["gif_grid_fail"], 0)
 
         asyncio.run(go())
 

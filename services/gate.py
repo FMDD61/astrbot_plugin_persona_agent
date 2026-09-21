@@ -58,44 +58,48 @@ GATE_SYSTEM_PROMPT = (
 )
 
 
-# S4：共享上下文模式下的**判定指令**（拼在末尾那条 user 消息里）。
+# GATE PHI（C22/C23，2026-09-21）：**只承担"这一轮该表态了"与输出格式**。
 #
-# ⚠️ 这里的"判断维度约束"不是可选项 —— 2026-09-13 实测抓到 Gate **自行引入
-# 未声明的拒答维度**：它把「你怎么知道我昨晚只靠郊狼的环就把自己电🐍了」
-# 判为「内容涉性暗示，不宜回应」。该结论本身无害（那条确实没 @ 机器人），
-# 但同类判断作用于**该回的消息**时会变成静默误杀 —— 而这是本轮唯一
-# "会悄悄降低回复质量"的路径。故在此显式收紧：只判两件事，不得引入内容审查。
-GATE_JUDGE_INSTRUCTION = (
-    "请只判断两件事，**不要引入任何其他维度**：\n"
-    "A) 机器人**现在接这句话合不合适**（值不值得接）；\n"
-    "B) 当前对话**是否正在发生真实冲突**。\n"
-    "\n"
-    "关于 A（值不值得接）：\n"
-    "- 看：是否在向机器人提问/点名/寻求回应；话题是否新鲜、有可接的空间；\n"
-    "  是否有情绪需求（求安慰/分享欲）；对照历史里我自己的发言，这个风格接得上吗。\n"
-    "- **克制优先**：拿不准就选不回。\n"
-    "\n"
-    "关于 B（是否冲突）：冲突 = 真实的恶意对抗（人身攻击、辱骂、威胁、群体对立、\n"
-    "阴阳怪气持续升级、公开挂人）。\n"
-    "**不算冲突**：玩笑互怼/嘴炮约战（双方在乐、无真实恶意）、观点争论、技术辩论、\n"
-    "吐槽抱怨（哪怕语气冲）、单方面情绪发泄但不指向具体人。\n"
-    "判据是**有没有真实的恶意与伤害意图**，不看语气强不强、用词糙不糙。\n"
-    "冲突时 reply 强制 false（避免煽风点火）。拿不准时按冲突处理，但玩笑互怼要判非冲突。\n"
-    "\n"
-    "⚠️ **不评判话题本身的内容与尺度**：群友聊什么、用词荤素、玩什么梗，都不是\n"
-    "「该不该接」的理由。判断依据只有上面 A/B 两条 —— 由人格设定决定这个「人」\n"
-    "会接什么话，不由你做内容审查。\n"
-    "\n"
+# 依据 `docs/specs/gate_prompt_draft_v1.md` §B/§C 与 `prompt_v2_gate.md` §1：
+#   · 全部**判据**都在冻结头部（§1+§2+§4+决策段）里 —— 身份是成员丁本人，
+#     不再有"参与度与安全分析师"这种超脱身份；
+#   · PHI 里**不给时间与心情**（用户定：那只会影响回复率，对判断没帮助）；
+#   · 输出格式改两问分开：`want`（有没有话想说）/ `blocked`（能不能回）。
+#
+# ⚠️ 旧版这里是 600 字的"判断维度约束"，起因是 2026-09-13 实测抓到 Gate
+# **自行引入未声明的拒答维度**（把一句话判为"涉性暗示不宜回应"）。
+# 新设计用**身份 + 决策段**从根上解决：判据全部前置在头部，PHI 不再复述。
+#: 输出格式（案 2，用户 2026-09-19 定）—— 两问拆开**可分别统计**：
+#: 「想说但被拦」与「压根不想说」是决定"禁令是否拦过头"的唯一依据。
+#: `blocked` 的合法取值（其余一律按「被挡」处理并留痕）
+BLOCKED_VALUES = ("conflict", "topic", "pda")
+
+GATE_OUTPUT_SPEC = (
     "只输出一个 JSON 对象，不要输出其他内容：\n"
-    '{"reply": true或false, "conflict": true或false, "reason": "一句话理由（不超过20字）"}'
+    '{"want": true 或 false, "blocked": false 或 "conflict"/"topic"/"pda", '
+    '"reason": "一句话理由（不超过20字）"}'
+)
+
+#: GATE PHI（每轮追加在候选之前）—— 只有「这一轮该表态了」与输出格式。
+#: 判据全部在冻结头部（§1+§2+§4+决策段），这里**不复述**。
+GATE_PHI = (
+    "轮到我表态了。看看上面这条，我有没有话想说，以及有没有什么挡着我。\n"
+    + GATE_OUTPUT_SPEC
 )
 
 
 @dataclass
 class GateDecision:
-    reply: bool            # True=放行 RP 生成；False=静默
+    reply: bool            # True=放行 RP 生成；False=静默（= want 且未被挡）
     reason: str            # 理由（LLM 给的，或 fallback 说明）
     conflict: bool = False # A7④ 安全阀：True=正在冲突，强制不发言（勿煽风点火）
+    # ---- C23（2026-09-21）：输出改两问分开，可分别统计 ----
+    #: 「我有没有话想说」
+    want: bool = False
+    #: 「能不能回」被挡的原因：False=没被挡；否则 conflict/topic/pda
+    #: ⚠️ **字符串是 truthy** —— 判空必须写 `blocked is not False`；
+    #: 写成 `if blocked:` 会把「没被挡」与「被 topic 挡」搞反。
+    blocked: object = False
     fallback: bool = False  # True=本次是降级结果（超时/解析失败等）
     cached: bool = False    # True=命中同群节流窗口缓存
     ts: float = 0.0
@@ -104,6 +108,10 @@ class GateDecision:
         return {
             "reply": self.reply,
             "conflict": self.conflict,
+            # C23：两问分开记录 —— 「想说但被拦」与「压根不想说」必须能分别统计，
+            # 否则没法判断禁令是不是拦过头了（本项目纪律：可统计才可归因）。
+            "want": self.want,
+            "blocked": self.blocked,
             "reason": self.reason,
             "fallback": self.fallback,
             "cached": self.cached,
@@ -200,15 +208,20 @@ class GateService:
         rag_hits: Optional[list[dict]] = None,
         is_at: bool = False,
     ) -> list[dict]:
-        """共享上下文模式：前缀原样 + 末尾一条判定指令（S4）。
+        """组装 Gate 的请求（C22，2026-09-21 重新定义）。
 
-        前缀 = RP 的 `_assemble_base()` 输出（**不加工、不改写**）——
-        逐字节相同才能让网关前缀缓存被两次调用复用。
+        ⚠️ **这里不再是 RP 的上下文**：`prompt_v2_gate.md` §2 明确
+        「不追求跨调用共享缓存」—— Gate 的头部从 §1 之后就要插自己的决策段，
+        与 RP **从第一个字节起就分叉**，共享前缀无从谈起。
+        调用方（pipeline.gate_context）按设计给的是：
 
-        末尾那条 user 消息承担三件事：
-          1. 给出本轮候选（说话人 + 本条消息）
-          2. @ 提示（@ 了通常应回，但冲突除外）
-          3. **判定维度的显式约束**（见 GATE_JUDGE_INSTRUCTION）
+            [system] Gate 冻结头部（§1+§2+§4+决策段）
+            [system] 群友识别（关系图谱冻结块）
+            [user]   全天群聊消息（与 RP 同一份 session）
+
+        本方法只负责**尾部**：PHI（输出格式）＋**被打标的那一条**。
+        `【现在要回应的】` 这一行的措辞必须与 RP 的 PHI **一致** ——
+        Gate 与 RP 看到的是同一条（D39：同一视野），只是各自拿它做不同的事。
         """
         # 🔴 S10（2026-09-14 用户观察）：判定指令**放到最前面**，成为缓存前缀的一部分。
         #
@@ -230,9 +243,11 @@ class GateService:
         # 修法：仍独立成一条 system 消息（内容恒定 → 与 S4 一样能进缓存前缀），
         # 但**紧贴候选消息之前**，让"你现在的任务是判断"这件事在位置上成立。
         tail: list[str] = []
-        tail.append(f"【现在要判断的这一条】{current_speaker}：{current_text}")
+        # C22/D43：与 RP 的 PHI 同形 —— `【现在要回应的】别名：正文（@ 了你）`。
+        _line = f"{current_speaker}：{current_text}"
         if is_at:
-            tail.append("（本条 @ 了机器人：通常应当回复；但若正发生冲突，reply 必须为 false）")
+            _line += "（@ 了你）"
+        tail.append(f"【现在要回应的】{_line}")
         if rag_hits:
             hits = []
             for h in rag_hits[: self._max_rag_hits]:
@@ -246,18 +261,41 @@ class GateService:
         # 结构：共享前缀 → [system: 判定指令] → [user: 本轮候选]
         # 判定指令**恒定**，所以它自己那一段仍可被网关前缀缓存复用；
         # 而它紧贴候选，"裁判"角色在位置上成立。
-        msgs.append({"role": "system", "content": GATE_JUDGE_INSTRUCTION})
+        msgs.append({"role": "system", "content": GATE_PHI})
         msgs.append({"role": "user", "content": "\n\n".join(tail)})
         return msgs
 
     # ---- parsing ----
 
     @staticmethod
-    def _parse(text: str) -> Optional[GateDecision]:
-        """Strict JSON parse -> GateDecision; None on any malformation.
+    def _truthy(raw) -> Optional[bool]:
+        """布尔字段的宽容解析：true/false、"true"/"false"、1/0；其余 None。"""
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, int) and raw in (0, 1):
+            return bool(raw)
+        if isinstance(raw, str):
+            low = raw.strip().lower()
+            if low in ("true", "1", "yes"):
+                return True
+            if low in ("false", "0", "no", ""):
+                return False
+        return None
 
-        Accepts {reply, conflict?, reason}; conflict 缺省 false（向后兼容旧格式）。
-        安全规则：conflict=true 时 reply 强制 false（冲突中绝不发言）。
+    @staticmethod
+    def _parse(text: str) -> Optional[GateDecision]:
+        """解析 Gate 输出 → GateDecision；任何畸形都返回 None（调用方转 fallback）。
+
+        **C23（2026-09-21）新格式**：`{want, blocked, reason}`
+          · `want`    = 有没有话想说（必填）；
+          · `blocked` = 能不能回被挡的原因：false / conflict / topic / pda；
+          · `reply = want 且 blocked 为 false`（派生，供既有 7 处消费者继续用）。
+
+        **旧格式 `{reply, conflict}` 仍接受**：冻结头部装配失败时会退回旧裁判 system，
+        那时模型可能按老格式回 —— 兼容映射为 want=reply / blocked=conflict。
+
+        🔴 **失效方向必须安全**（独立核验点名过）：`blocked` 是未知字符串时**按被挡处理**
+        （fail closed，宁可不说），并原样记进 decision 供统计；解析不出来才走 fallback。
         """
         try:
             obj = json.loads(text)
@@ -265,41 +303,51 @@ class GateService:
             return None
         if not isinstance(obj, dict):
             return None
-        reply_raw = obj.get("reply")
-        if reply_raw is None:
-            return None
-        reply = bool(reply_raw) if isinstance(reply_raw, bool) else None
-        if reply is None:
-            # tolerate "true"/"false" strings / 0/1
-            if isinstance(reply_raw, str):
-                low = reply_raw.strip().lower()
-                reply = True if low == "true" else (False if low == "false" else None)
-            elif isinstance(reply_raw, int) and reply_raw in (0, 1):
-                reply = bool(reply_raw)
-            if reply is None:
+
+        blocked: object = False
+        want_raw = obj.get("want")
+        if want_raw is not None:
+            # ---- 新格式 ----
+            want = GateService._truthy(want_raw)
+            if want is None:
                 return None
-        # conflict 解析（缺省 false；容错同 reply）
-        conflict = False
-        conflict_raw = obj.get("conflict")
-        if conflict_raw is not None:
-            if isinstance(conflict_raw, bool):
-                conflict = conflict_raw
-            elif isinstance(conflict_raw, str):
-                low = conflict_raw.strip().lower()
-                if low in ("true", "1"):
-                    conflict = True
-                elif low in ("false", "0"):
-                    conflict = False
-            elif isinstance(conflict_raw, int) and conflict_raw in (0, 1):
-                conflict = bool(conflict_raw)
-        # 安全规则：冲突中强制不发言
-        if conflict:
-            reply = False
+            raw_blocked = obj.get("blocked", False)
+            if isinstance(raw_blocked, bool):
+                # true = 被挡但没说原因 → 仍然按被挡处理（fail closed）+ 留痕
+                blocked = "unspecified" if raw_blocked else False
+            elif raw_blocked is None or raw_blocked == 0:
+                blocked = False
+            elif isinstance(raw_blocked, str):
+                low = raw_blocked.strip().lower()
+                if low in ("false", "", "0", "no", "none", "null"):
+                    blocked = False
+                elif low in BLOCKED_VALUES:
+                    blocked = low
+                else:
+                    # 未知取值：**按被挡处理**（宁可不说）+ 原样留痕
+                    blocked = f"unknown:{low[:16]}"
+            else:
+                blocked = f"unknown:{type(raw_blocked).__name__}"
+        else:
+            # ---- 旧格式（回退路径）----
+            reply_raw = obj.get("reply")
+            if reply_raw is None:
+                return None
+            want = GateService._truthy(reply_raw)
+            if want is None:
+                return None
+            conflict = GateService._truthy(obj.get("conflict")) or False
+            blocked = "conflict" if conflict else False
+
+        denied = blocked is not False          # ⚠️ 字符串是 truthy，必须显式比
+        reply = bool(want) and not denied
         reason = str(obj.get("reason", "") or "").strip()
         return GateDecision(
             reply=reply,
-            conflict=conflict,
-            reason=reason or ("接" if reply else "不接"),
+            conflict=(blocked == "conflict"),
+            want=bool(want),
+            blocked=blocked,
+            reason=reason or ("接" if reply else ("被挡" if denied else "不接")),
             ts=time.time(),
         )
 

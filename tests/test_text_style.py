@@ -51,8 +51,20 @@ class TestPostprocess(unittest.TestCase):
         out = postprocess(text)
         self.assertLessEqual(out.count("口癖己"), 2)
 
-    def test_emoji_stripped(self):
-        self.assertNotIn("🤤", postprocess("好饿🤤🤤🤤"))
+    def test_emoji_and_at_survive_postprocess_c15(self):
+        """🔴 C15 / B-048（2026-09-21）：postprocess **不再**删 emoji 与 @。
+
+        这两步原先是 S0 的预防性收口，代价是提示词 §7【句末的表情】与
+        §6「@ 他一句」两处教学**自上线起不可能生效**（实测 bot 输出 465 条：
+        含 emoji 0 / 含 @ 0；风格源 2337 条：emoji 112 / @ 50）。
+        用户 2026-09-21：「emoji 和 @ 都打开，我们留给 RP 更大的发挥空间」。
+        """
+        self.assertIn("🤤", postprocess("好饿🤤🤤🤤"))
+        self.assertIn("@成员乙", postprocess("@成员乙 肘，咱俩骗钱去"))
+        # 但「防泄漏」那几项必须照旧剥掉（标记泄漏到群里就是乱码）
+        self.assertNotIn("[r]", postprocess("[r] 对呀"))
+        self.assertNotIn("[emote:", postprocess("好耶 [emote:开心比耶]"))
+        self.assertNotIn("[poke:", postprocess("戳 [poke:成员乙]"))
 
     def test_length_and_lines_capped(self):
         out = postprocess("，" * 300 + "。" * 300)

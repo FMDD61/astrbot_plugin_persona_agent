@@ -10,6 +10,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import threading
 import time
 from typing import Awaitable, Callable, Optional
@@ -40,6 +41,27 @@ def face_name(fid: int) -> str:
         return f"表情#{fid}"
 
 
+# 图像预处理（降采样 / 动图抽帧拼网格）抽到中性模块，与离线入库工具共用。
+# 见 services/image_prep.py 的 docstring：实测不降采样会让同一张图的
+# prompt_tokens 完全相同、而时延从 4.0s 涨到 29.6s（最坏 127.5s）。
+# ⚠️ 必须在**定义提示词常量之前**导入：GIF 网格版提示词要拼进网格几何（列×行/帧数）。
+from .image_prep import (
+    DESC_MAX_EDGE,
+    GIF_GRID_COLS,
+    GIF_GRID_FRAMES,
+    GIF_GRID_ROWS,
+    mime_of as _mime_of,
+    prepare_bytes_for_vision,
+    sniff_mime,
+)
+
+# 降级可见：`image_prep` 是纯模块（无状态），拼网格失败只能靠 `meta` 带回来；
+# 但"拼网格失败、描述仍成功"这条路 **diag 只有在全部图片失败时才会被打进日志**
+# （main.py `_augment_with_vision`），所以这里必须自己落一行 warning ——
+# 否则降级会静默滑过去（B-049 的教训：动作语义丢了却毫无痕迹）。
+logger = logging.getLogger("persona_vision")
+
+
 # 🔴 S6（2026-09-14，956 次实测标定）：**约定固定返回格式是唯一主导因素**。
 #
 # 失败机理（191/191 无例外）：content 为空的响应 `finish_reason` **全是 `length`**，
@@ -62,6 +84,48 @@ VISION_SYSTEM_PROMPT = (
     '- "tags"：2-4 个中文字符串，每个 2-6 字，是可用于检索的情绪/动作关键词（如「无语」「抱头」「流泪」）。\n'
     "不要猜测人物身份、不要脑补图中没有的内容；看不清就在 desc 里写「画面模糊，看不清」。"
 )
+
+# C27（2026-09-21）：**动图走"抽帧拼网格"，提示词必须跟着换**。
+#
+# 网格图对模型是"一张拼图" —— 不说清它是**同一段动画的不同时刻**，模型会把每格
+# 当成独立画面逐格描述，动作语义**又丢了**（等于白拼）。所以网格版必须点明：
+# 「这是一段动图按播放顺序抽出的连续帧，从左到右、从上到下就是时间先后」。
+#
+# ⚠️ 与静图版**成对上线**：只有拼网格没有换提示词 = 没修 B-049。
+def gif_grid_system_prompt(frames: int, cols: int = GIF_GRID_COLS,
+                           rows: int = GIF_GRID_ROWS) -> str:
+    """GIF 网格版 system prompt（**按这次实际的帧数与几何生成**）。
+
+    为什么不是写死的常量：抽帧数 = ``min(GIF_GRID_FRAMES, 总帧数)``，而真实贴纸里
+    帧数 <6 的并不罕见 —— 实测 181 张真实 GIF 中 22 张（**12%**）：
+    2 帧 7 张 / 3 帧 3 张 / 4 帧 8 张 / 5 帧 4 张。提示词里写死"共 6 帧"而图上只有
+    4 格有画面，模型会去解释那两格空白（"后面两格是空白/加载失败"），白送噪声。
+    """
+    n = max(1, int(frames or 1))
+    layout = f"{int(cols)} 列 × {int(rows)} 行"
+    blanks = ("；**不足的格子是空白**，表示这段动图没有更多帧了，不要去解释空白格"
+              if n < int(cols) * int(rows) else "")
+    return (
+        "你是图片标注器。看图片，只输出**一个 JSON 对象**，不要任何解释、不要 markdown 代码块。"
+        '格式固定为：{"desc": "图片描述", "tags": ["关键词1", "关键词2"]}\n'
+        f"**这是一段动图（GIF）按播放顺序抽出的连续帧**：共 {n} 帧，"
+        f"拼成{layout}的网格图，**从左到右、从上到下就是时间先后**{blanks}。"
+        "它不是一张拼图，而是同一段动画的不同时刻（等间隔抽样，相邻格子之间可能跳过"
+        "中间帧，所以只看动作的整体走向）。\n"
+        "看图时**对比各格之间的差异**，判断这段动画在动什么（动作过程、循环方式、幅度），"
+        "在 desc 里说明动作，**不要逐格罗列每格画面**。\n"
+        "字段约束：\n"
+        '- "desc"：中文字符串，只描述图中**确定可见**的内容，长度 8-80 字，一句话写完，不加换行；'
+        "说清「谁/什么在做什么动作」；若是表情包，在句中点明情绪（如委屈/无语/嘲讽）与可能的梗；"
+        "不确定的不要写。\n"
+        '- "tags"：2-4 个中文字符串，每个 2-6 字，是可用于检索的情绪/动作关键词（如「无语」「抱头」「流泪」）。\n'
+        "不要猜测人物身份、不要脑补图中没有的内容；看不清就在 desc 里写「画面模糊，看不清」。"
+    )
+
+
+#: 默认（6 帧 / 3 列 × 2 行）那一版。离线工具（tools/build_sticker_index.py）与
+#: 定长几何的调用方可以直接用它；线上走 ``gif_grid_system_prompt(prep["gif_grid"])``。
+VISION_GIF_SYSTEM_PROMPT = gif_grid_system_prompt(GIF_GRID_FRAMES)
 
 # 提示词复述/自我规训特征（模型把 system 要求或思考过程写进"答案"）
 _LEAK_MARKERS = (
@@ -120,18 +184,6 @@ def parse_vision_json(resp: dict) -> tuple[str, list[str]]:
         tags = [str(t).strip() for t in (o.get("tags") or []) if str(t).strip()][:4]
         return desc, tags
     return "", []
-
-
-# 图像预处理（降采样/动图）抽到中性模块，与离线入库工具共用。
-# 见 services/image_prep.py 的 docstring：实测不降采样会让同一张图的
-# prompt_tokens 完全相同、而时延从 4.0s 涨到 29.6s（最坏 127.5s）。
-from .image_prep import (
-    DESC_MAX_EDGE,
-    GIF_INLINE_MAX_BYTES,
-    mime_of as _mime_of,
-    prepare_bytes_for_vision,
-    sniff_mime,
-)
 
 
 async def resolve_image_bytes(img, diag: Optional[dict] = None) -> Optional[bytes]:
@@ -302,7 +354,10 @@ class VisionService:
         # 「无法识别」在调用方看来是单一结果，但底层至少有 4 种成因
         # （取不到图 / 模型空返回 / 异常 / 超时）—— 不分开就只能猜。
         self.last_error: Optional[str] = None
-        self.stats = {"ok": 0, "cache_hit": 0, "empty": 0, "timeout": 0, "error": 0}
+        # C27 观测：gif_grid = 成功拼网格（走 GIF 网格版提示词）；
+        # gif_grid_fail = 该拼却拼不出来（回退首帧 —— **降级，必须看得见**）。
+        self.stats = {"ok": 0, "cache_hit": 0, "empty": 0, "timeout": 0, "error": 0,
+                      "gif_grid": 0, "gif_grid_fail": 0}
         if self._persist_path:
             self._load_persist()
 
@@ -414,6 +469,9 @@ class VisionService:
                     (v.get("hits", 0) for v in self._persist.values()),
                     reverse=True,
                 )[:10],
+                # C27：抽帧拼网格的两条计数（成功 / 降级）—— 有出口才叫仪表盘
+                "gif_grid": self.stats.get("gif_grid", 0),
+                "gif_grid_fail": self.stats.get("gif_grid_fail", 0),
             }
 
     async def _post(self, payload: dict) -> dict:
@@ -430,6 +488,20 @@ class VisionService:
             return r.json()
 
     async def describe_bytes(self, data: bytes, diag: Optional[dict] = None) -> Optional[str]:
+        """描述一张图。顺序（**契约，别调换**）：
+
+        1. 空数据 → 失败留痕返回 None；
+        2. ``hash = sha256(原始字节)`` → 查内存 TTL 缓存 → 查持久 LRU 缓存
+           （**缓存键永远是原始字节**：降采样/抽帧在查缓存**之后**，命中即免 CPU）；
+        3. 预处理（`prepare_bytes_for_vision`，**在线程里跑**：抽帧是 CPU 活，
+           实测最坏 587ms，不能按住事件循环）：多帧 GIF → **抽帧拼网格**，
+           其余 → 长边 768 降采样转 JPEG；
+        4. 按预处理结果选 system prompt（**GIF 网格版 / 静图版**，C27）；
+        5. 调模型 → 解析 JSON → 截图长 → 写回两级缓存。
+
+        降级可见：拼网格失败时 ``diag["gif_grid_fail"]`` + ``stats["gif_grid_fail"]`` + 一行
+        warning 都会记下原因（回退首帧 = 动作语义会丢，绝不能静默）。
+        """
         # S0 观测：与 emotion/gate 同一套 —— 内部失败必须可分辨。
         # 此前 4 条静默 return None（空数据/空描述/异常/超时）在调用方看来
         # 都是"无法识别"，2026-09-13 实测 5/14 次失败却查不出哪一层。
@@ -465,15 +537,52 @@ class VisionService:
             # prompt_tokens 完全相同（412 vs 412，网关侧图像 token 数固定），
             # 而时延从 4.0s 涨到 29.6s（最坏 127.5s），纯属白烧上传时间。
             # 且 >15s 的离群点**全部**是大 GIF，正是它们撞破了 15s 超时。
-            data, mime = prepare_bytes_for_vision(data)
+            #
+            # 🔴 C27（B-049）：**多帧 GIF 一律抽帧拼网格**（6 帧 / 320px / 3×2 / q82），
+            # 体积闸门已废。哈希与缓存查找在上面、用的是**原始字节** —— 这里才开始
+            # 花 CPU 抽帧（缓存命中时完全不抽），语义不变。
+            prep: dict = {}
+            orig_bytes = len(data)
+            # ⚠️ 抽帧拼网格是**真 CPU 活**：181 张真实贴纸 GIF 两轮实测
+            # p50 55~62ms / p90 231~257ms / max 587~680ms（旧路径首帧降采样 p50 0.3ms /
+            # max 75ms）。同步调用实测把事件循环**完全钉死**（0 个 5ms tick）。
+            # 这里是异步上下文，直接调会把**整个 bot 的消息处理**按住几百毫秒 ——
+            # 所以挪进线程（PIL 的 resize/编码会放 GIL，事件循环能继续跑）。
+            data, mime = await asyncio.to_thread(
+                prepare_bytes_for_vision, data, meta=prep)
+            is_grid = bool(prep.get("gif_grid"))
+            grid_fail = prep.get("gif_grid_fail")
+            if is_grid:
+                self.stats["gif_grid"] += 1
+            elif grid_fail:
+                # 降级可见：该拼网格却拼不出来 → 回退首帧/原图（动作语义会丢）。
+                # meta 里的原因同时进 diag 与日志，别让它静默滑过去。
+                self.stats["gif_grid_fail"] += 1
+                logger.warning(
+                    "[vision] gif grid failed → fallback to static payload: %s "
+                    "(raw=%dB → payload=%dB hash=%s)",
+                    grid_fail, orig_bytes, len(data), h[:16],
+                )
+            info = prep.get("gif_grid") or {}
+            system_prompt = (
+                # 帧数 <6 的 GIF（实测占 12%）会留白，提示词必须报**实际**帧数
+                gif_grid_system_prompt(info.get("frames", GIF_GRID_FRAMES),
+                                       info.get("cols", GIF_GRID_COLS),
+                                       info.get("rows", GIF_GRID_ROWS))
+                if is_grid else VISION_SYSTEM_PROMPT)
             if diag is not None:
                 diag["mime"] = mime
                 diag["prepared_bytes"] = len(data)
+                diag["prompt"] = "gif_grid" if is_grid else "static"
+                if is_grid:
+                    diag["grid"] = prep["gif_grid"]
+                if grid_fail:
+                    diag["gif_grid_fail"] = grid_fail
             b64 = base64.b64encode(data).decode()
             payload = {
                 "model": self._model,
                 "messages": [
-                    {"role": "system", "content": VISION_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": [
                         {"type": "text", "text": "描述这张图片。"},
                         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},

@@ -428,7 +428,6 @@ class ReplayRuntime:
         InterjectionManager = interjection_mod.InterjectionManager
         MemoryStore = memory_store.MemoryStore
         MultiSignalKGProvider = kg_provider.MultiSignalKGProvider
-        LLMEmotionProvider = emotion_mod.LLMEmotionProvider
         DefaultEmotionProvider = emotion_mod.DefaultEmotionProvider
         GateService = gate_mod.GateService
         PersonaPipeline = pipeline_mod.PersonaPipeline
@@ -497,12 +496,10 @@ class ReplayRuntime:
         )
         emotion_cfg = self._cfg("emotion") or {}
         if int(emotion_cfg.get("enabled", 1)) == 1:
-            self.emotion = LLMEmotionProvider(
-                self._llm_emotion,
-                timeout=float(emotion_cfg.get("timeout_sec", 3)),
-                cache_ttl=float(emotion_cfg.get("cache_ttl_sec", 30)),
-                now_utc_fn=self.clock,
-            )
+            # C24：与线上同源 —— 代码计算（不再有 LLM 调用），参数读同一份配置；
+            # 用虚拟时钟（self.clock），否则「每分钟恢复」会按真实时间算。
+            self.emotion = emotion_mod.ScoreEmotionProvider.from_config(
+                emotion_cfg, now_utc_fn=self.clock)
         else:
             self.emotion = DefaultEmotionProvider()
 
@@ -662,19 +659,6 @@ class ReplayRuntime:
                     raise RuntimeError(f"gateway call failed: {type(e).__name__}: {e}")
                 time.sleep(1.0)
         return ""
-
-    async def _llm_emotion(self, prompt: str) -> str:
-        emotion_mod = _import("emotion")
-        ecfg = self._cfg("emotion") or {}
-        return await asyncio.to_thread(
-            self._chat,
-            [{"role": "system", "content": emotion_mod.EMOTION_SYSTEM_PROMPT},
-             {"role": "user", "content": prompt}],
-            float(ecfg.get("temperature", 0.2)),
-            _import("llm_params").reasoning_value(ecfg.get("reasoning_effort", "off")),
-            120,
-            20.0,
-        )
 
     async def _llm_gate(self, prompt: str) -> str:
         gate_mod = _import("gate")

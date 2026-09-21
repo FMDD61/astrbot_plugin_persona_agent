@@ -66,6 +66,23 @@ _FILES = (
 
 CLOSENESS_LABEL = {"close": "熟人", "known": "认识", "new": "新人"}
 
+#: 时段词表（D13，5 档覆盖 24 小时）—— 人设里的作息规则用的就是这类词
+#: （「凌晨/夜深/清晨」），旧实现只给 `HH 时`，把映射工作推给了模型。
+DAY_SEGMENTS = ((0, 4, "凌晨"), (5, 10, "早上"), (11, 13, "中午"),
+                (14, 17, "下午"), (18, 23, "晚上"))
+
+
+def day_segment(local_hour: int) -> str:
+    """小时 → 时段词（D13）。表外的值回落空串（调用方自行降级）。"""
+    try:
+        h = int(local_hour)
+    except (TypeError, ValueError):
+        return ""
+    for lo, hi, word in DAY_SEGMENTS:
+        if lo <= h <= hi:
+            return word
+    return ""
+
 #: 物化到 <data_dir>/persona/ 的说明文件（**不是段文件**：加载器按段 id 精确取名，不会读它）
 _PERSONA_README = """# 人格段文件（C10）
 
@@ -656,17 +673,24 @@ class StyleProfile:
                 + "\n".join(line for _, line in lines))
 
     def volatile_line(self, local_hour: Optional[int] = None, mood: str = "") -> str:
-        """逐轮易变信息（时间 + 心情）—— 放在上下文**末尾**专用。
+        """逐轮易变信息（时段 + 心情）—— 放在上下文**末尾**专用。
 
         与固定 system prompt 分离的理由见 ``system_prompt()`` 的缓存说明：
         易变量若留在前缀里，每次变化都会让整段会话前缀 miss。
+
+        ⚠️ C3（2026-09-21，D13 + D41）改了两件事：
+          ① **时间改分时段**（`下午`，不再是 `16 时`）—— 人设里的作息规则用的
+             就是「凌晨/夜深/清晨」这类词，旧写法把映射工作推给了模型；
+          ② **压成一行、与心情用逗号相接**：`下午，心情轻快`
+             （`【当下】` 前缀由调用方加）。
+        **时间永远在**，心情为空时只省后半句（§13.5 注 2：两个来源不同，
+        整行省略会让模型不知道几点）。
         """
-        lines: list[str] = []
-        if local_hour is not None and 0 <= local_hour < 24:
-            lines.append(f"现在本地时间 {local_hour:02d} 时。")
+        seg = day_segment(local_hour) if local_hour is not None else ""
+        parts = [seg] if seg else []
         if mood:
-            lines.append(f"当前心情：{mood}")
-        return "\n".join(lines)
+            parts.append(f"心情{mood}")
+        return "，".join(parts)
 
     def _hourly_local(self) -> dict:
         """按**本地小时**索引的 hourly 分布（兼容历史 UTC 文件）。

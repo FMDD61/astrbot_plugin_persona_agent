@@ -55,8 +55,9 @@ DESC_JPEG_QUALITY = 82
 #   196帧/496KB → "来回推带轮小车…摆烂打工"（首帧偏静态细节）
 # ⚠️ 但整图很贵：1.9MB/109帧 实测 **52s 且空返回**；496KB 约 9s。
 # 所以设体积闸门，超限回退首帧（宁愿描述静态，也不要一条描述都没有）。
-GIF_INLINE_MAX_BYTES = 1_500_000
-GIF_INLINE_TIMEOUT = 180.0
+#: 单张图描述超时。原名 GIF_INLINE_TIMEOUT —— C27 后不再有 GIF 分流，
+#: 名字留着会误导（"GIF 专用超时"其实对静图一视同仁）。
+DESCRIBE_TIMEOUT_SEC = 180.0
 
 # 视觉描述提示词：与 services/vision.py 同源（表情包要说明情绪与梗）
 # 🔴 S6 标定（2026-09-14，956 次实测）：**约定固定返回格式是唯一主导因素**。
@@ -129,8 +130,6 @@ def is_animated(path: str) -> int:
 # 避免"离线一套、线上一套"漂移（实测不降采样会让同一张图的时延从 4.0s 涨到 29.6s）。
 from services.image_prep import (  # noqa: E402
     DESC_MAX_EDGE,
-    GIF_INLINE_MAX_BYTES,
-    frame_count,
     mime_of as _mime_of,
     prepare_for_vision,
 )
@@ -166,17 +165,34 @@ def _validate_base(api_base: str) -> str:
     return b
 
 
+def _vision_sys_for(meta: dict) -> str:
+    """GIF 网格 → 网格版提示词；静图 → 静图版（C27）。"""
+    gi = (meta or {}).get("gif_grid") or {}
+    if gi:
+        try:
+            from services.vision import gif_grid_system_prompt
+            return gif_grid_system_prompt(int(gi.get("frames") or 0),
+                                        int(gi.get("cols") or 3),
+                                        int(gi.get("rows") or 2))
+        except Exception:
+            pass
+    return VISION_SYS
+
+
 def _describe_one(path: str, api_base: str, api_key: str, model: str,
                   timeout: float) -> tuple[str, list[str]]:
     """调视觉模型描述一张图。返回 ``(desc, tags)``；失败返回 ``("", [])``。"""
     import httpx
 
-    data, mime = prepare_for_vision(path)
+    # C27：GIF 会被抽帧拼成网格图 —— 那时必须用**网格版提示词**，
+    # 否则模型会把 "一张拼图" 当静图描述（动作语义丢失 = B-049 换个马甲复发）。
+    meta: dict = {}
+    data, mime = prepare_for_vision(path, meta=meta)
     b64 = base64.b64encode(data).decode()
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": VISION_SYS},
+            {"role": "system", "content": _vision_sys_for(meta)},
             {"role": "user", "content": [
                 {"type": "text", "text": "描述这张图片。"},
                 {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
@@ -443,7 +459,7 @@ def retry_missing(items: list[dict], *, library_dir: Path, api_base: str, api_ke
         for i, it in enumerate(todo, 1):
             try:
                 d, t = _describe_one(str(library_dir / it["file"]),
-                                     api_base, api_key, model, GIF_INLINE_TIMEOUT)
+                                     api_base, api_key, model, DESCRIBE_TIMEOUT_SEC)
                 if d:
                     it["desc"] = d
                     if t:
