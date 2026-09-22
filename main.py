@@ -2358,15 +2358,24 @@ class PersonaAgent(Star):
             logger.warning(f"[persona_agent] 日记补写失败（{yday}）：{e}")
 
     def _has_diary_for(self, group_id: str, day: str) -> bool:
-        """盘上有没有这一天的日记（容忍坏行；异常按「没有」处理 → 会尝试补写）。"""
+        """盘上有没有这一天的日记（容忍坏行；异常按「没有」处理 → 会尝试补写）。
+
+        🔴 **P1（独立审查 2026-09-22）**：第一版读的是 `<data_dir>/daily_diary.jsonl`
+        —— 那是 **B-024 的旧路径**（内容停在 08-29），而日记自 `e566116` 起写在
+        `<data_dir>/logs/<gid>/daily_diary.jsonl`。判据因此对近期日期**恒为「缺失」** →
+        护栏结构性失效：每次启动都白烧一次**全量归档日**的日记 LLM 调用
+        （之后被文件级幂等拦掉：数据不脏，但钱白花、还留一条误导性 WARNING）。
+        现在改用 `summary.read_diaries`（**双路径 + 同日去重**，与读取侧同一口径）。
+        """
         try:
-            from .services.summary import list_diaries
+            from .services.summary import read_diaries
             d0 = datetime.date.fromisoformat(day)
-            recs = list_diaries(
-                Path(str(self.data_dir)) / "daily_diary.jsonl", group_id, d0, d0)
-            return bool(recs)
+            return bool(read_diaries(self.data_dir, group_id, d0, d0))
         except Exception as e:
-            logger.debug(f"[persona_agent] 日记存在性判定失败: {e}")
+            # 静默路径（审查 P2）：判据失败会退化成"重复生成一次"，必须看得见
+            logger.warning(
+                f"[persona_agent] ⚠️ 日记存在性判定失败（按缺失处理，可能重复生成一次）: {e}"
+            )
             return False
 
 
@@ -2738,6 +2747,10 @@ class PersonaAgent(Star):
         现在两条路走同一个协程。
         """
         if old_msgs and self._diary_enabled:
+            # 🔴 P2（独立审查 2026-09-22）：日记只在**这一刻**生成，错过就整天没有；
+            # 而这一刻最可能出问题（进程刚重启、provider 刚注册）。
+            # 所以没产出时要在**本进程内退避重试**，不能只指望"下次启动补写"（进程不重启就一直缺）。
+            _day = self.session_mgr.day_key(time.time() - 86400.0)
             try:
                 # 上界 5 分钟：日记 LLM 卡死时不能拖住组装（有内容就装配）
                 await asyncio.wait_for(
@@ -2746,7 +2759,40 @@ class PersonaAgent(Star):
                 logger.warning("[persona_agent] 日记生成超时 300s（跳过，继续组装）")
             except Exception as e:
                 logger.warning(f"[persona_agent] 日记生成失败（继续组装）：{e}")
+            if not self._has_diary_for(group_id, _day):
+                asyncio.create_task(
+                    self._retry_diary_later(group_id, old_msgs, _day))
         self._rebuild_memory_digest(group_id)
+
+    async def _retry_diary_later(self, group_id: str, old_msgs: list,
+                               day: str, *, delays=(120.0, 600.0)) -> None:
+        """轮转时日记没产出 → 退避重试（P2，独立审查 2026-09-22）。
+
+        为什么必须有：日记写侧只在轮转那一刻被调用，而那一刻 provider 可能刚重启还没注册完
+        （09-22 实测）。只靠「下次启动补写」不够 —— 进程不重启就一直缺。
+        两次退避（2 分钟 / 10 分钟）后仍失败 → WARNING 交人工；**不无限重试**。
+        """
+        for k, delay in enumerate(delays, 1):
+            await asyncio.sleep(delay)
+            if self._has_diary_for(group_id, day):
+                return                      # 已被别的路径补上（多实例）
+            try:
+                logger.warning(
+                    f"[persona_agent] 日记缺失（day={day}）→ 第 {k} 次退避重试"
+                )
+                await asyncio.wait_for(
+                    self._generate_diary(group_id, old_msgs), timeout=300)
+                if self._has_diary_for(group_id, day):
+                    self._rebuild_memory_digest(group_id)
+                    logger.info(f"[persona_agent] 日记重试成功（day={day}）")
+                    return
+            except Exception as e:
+                logger.warning(f"[persona_agent] 日记重试失败（第 {k} 次）: {e}")
+        logger.warning(
+            f"[persona_agent] ⚠️ {day} 的日记**始终没写成功** → 该日对周报/做梦不可见，"
+            f"§3 记忆段少一层（启动补写会在下次重启时再试）"
+        )
+
 
     def _digest_fresh_today(self, group_id: str) -> bool:
         """B-056：今天的 §3 是否已组装过（判据在 services.summary，可单测）。
@@ -2829,7 +2875,7 @@ class PersonaAgent(Star):
                 logger.warning(
                     "[persona_agent] ⚠️ 日记**未生成**（provider 未就绪）："
                     "cfg=%r known=%r → 该日日记缺失，§3 记忆段会因此为空；"
-                    "启动补写会在下次 provider 就绪时兜底",
+                    "轮转内退避重试 + 下次启动补写两道兜底",
                     bool((self.config.get("llm") or {}).get("provider_id")),
                     bool(self._last_provider_id),
                 )

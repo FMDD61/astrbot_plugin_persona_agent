@@ -448,3 +448,30 @@ class TestB055B056Wiring(unittest.TestCase):
         body = self.src[j:j + 2200]
         self.assertIn("wait_for", body, "补写必须有超时上界（否则挂住启动）")
         self.assertIn("_has_diary_for", body, "先查盘上有没有，避免重复生成")
+
+
+class TestDiaryPathIsCurrent(unittest.TestCase):
+    """🔴 P1（独立审查 2026-09-22）：`_has_diary_for` 必须走**现行路径**。
+
+    第一版读 `<data_dir>/daily_diary.jsonl`（B-024 旧路径，内容停在 08-29）→
+    判据对近期日期恒为「缺失」→ 每次启动白烧一次全量日记 LLM 调用。
+    变异实测：把路径改回旧写法，整套餐件**全绿**（= 没有牙）→ 这里补上。
+    """
+
+    def test_has_diary_for_uses_current_path(self):
+        src = (REPO / "main.py").read_text(encoding="utf-8")
+        i = src.index("def _has_diary_for")
+        j = src.index("async def _provider_exists", i)
+        body = src[i:j]
+        self.assertIn("read_diaries", body,
+                      "必须用 summary.read_diaries（双路径 + 同日去重），不要自己拼路径")
+        self.assertNotIn('"daily_diary.jsonl"', body, "不得再出现裸的旧路径文件名")
+
+    def test_rotate_retries_when_diary_missing(self):
+        """P2：轮转里没产出要**本进程内退避重试**，不能只靠重启补写。"""
+        src = (REPO / "main.py").read_text(encoding="utf-8")
+        i = src.index("async def _rotate_followup")
+        j = src.index("async def _retry_diary_later", i)
+        body = src[i:j]
+        self.assertIn("_has_diary_for", body)
+        self.assertIn("_retry_diary_later", body)

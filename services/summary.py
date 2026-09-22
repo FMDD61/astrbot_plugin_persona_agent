@@ -14,6 +14,7 @@ LLM 改写由 main 注入（本模块只做：窗口计算 / 数据收集 / prom
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +26,11 @@ from typing import Optional
 from .style_profile import MEMORY_DIGEST_FILE  # noqa: E402
 
 DIARY_FILE = "daily_diary.jsonl"
+
+#: 判据与轮转同口径（UTC+8）；不要依赖进程本地时区（见 digest_fresh_today 注释）
+_CST = timezone(timedelta(hours=8))
+logger = logging.getLogger(__name__)
+_FRESH_WARNED = False
 WEEKLY_FILE = "weekly_summary.jsonl"
 MONTHLY_FILE = "monthly_summary.jsonl"
 YEARLY_FILE = "yearly_summary.jsonl"
@@ -544,10 +550,21 @@ def digest_fresh_today(data_dir, *, now=None) -> bool:
         if len(ts) < 19:
             return False
         dt = datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
-        dt = dt.replace(tzinfo=timezone.utc).astimezone()   # UTC → 本地
-        ref = now or datetime.now()
+        # 🔴 P2（独立审查 2026-09-22）：**显式 +8**，不用进程本地时区。
+        # 生产 compose 有 TZ=Asia/Shanghai（当前成立），但探针实测 TZ=UTC 时
+        # 判据会 ~18h/天恒不新鲜 → 退化成"每条消息重读四层摘要"，而日志已降 DEBUG
+        # = **完全静默**（B-056 换马甲）。轮转口径也是 +8，两者必须一致。
+        dt = dt.replace(tzinfo=timezone.utc).astimezone(_CST)
+        ref = now or datetime.now(_CST)
         return dt.strftime("%Y-%m-%d") == ref.strftime("%Y-%m-%d")
-    except Exception:
+    except Exception as e:
+        # 静默路径（审查 P2）：失败会退化成"反复重建"，必须留痕（每进程一次）
+        global _FRESH_WARNED
+        if not _FRESH_WARNED:
+            _FRESH_WARNED = True
+            logger.warning(
+                f"[summary] ⚠️ digest 新鲜度判定失败（按陈旧处理→会反复重建）: {e}"
+            )
         return False
 
 

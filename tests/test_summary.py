@@ -9,8 +9,6 @@ from pathlib import Path
 
 import sys
 
-from services.style_profile import MEMORY_DIGEST_FILE  # noqa: E402
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -21,11 +19,15 @@ try:
         sample_days, build_prompt, append_summary, build_phi,
         split_digest_body, digest_fresh_today,
     )
+    from services.style_profile import MEMORY_DIGEST_FILE  # noqa: E402
 except ImportError:
     from astrbot_plugin_persona_agent.services.summary import (
         SummaryService, weekly_window, monthly_window, list_diaries,
         sample_days, build_prompt, append_summary, build_phi,
-        split_digest_body,
+        split_digest_body, digest_fresh_today,
+    )
+    from astrbot_plugin_persona_agent.services.style_profile import (
+        MEMORY_DIGEST_FILE,
     )
 
 
@@ -621,3 +623,27 @@ class TestDigestFreshTodayB056(unittest.TestCase):
         self.assertIn(S.MEMORY_DIGEST_FILE,
                       (Path(__file__).resolve().parents[1] / "services" / "style_profile.py")
                       .read_text(encoding="utf-8"))
+
+    def test_explicit_cst_not_process_local(self):
+        """🔴 P2（独立审查）：判据必须用**显式 +8**，不能跟进程本地时区走。
+
+        探针实测 TZ=UTC 时旧写法 ~18h/天恒不新鲜 → 退化成每条消息重读四层摘要，
+        而日志已降 DEBUG = 完全静默（B-056 换马甲）。这里用 now= 钉住这条。
+        """
+        cst = timezone(timedelta(hours=8))
+        with tempfile.TemporaryDirectory() as td:
+            local = datetime(2026, 9, 22, 1, 0, tzinfo=cst)      # CST 凌晨 1 点
+            self._write(td, local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+            self.assertTrue(digest_fresh_today(td, now=local), "同一 CST 日应算新鲜")
+            self.assertFalse(
+                digest_fresh_today(td, now=local + timedelta(days=1)), "次日应算陈旧")
+
+    def test_cross_midnight_boundary(self):
+        """跨日边界：CST 23:59 组装 → 次日 00:01 必须判陈旧（否则 §3 陈旧一整天）。"""
+        cst = timezone(timedelta(hours=8))
+        with tempfile.TemporaryDirectory() as td:
+            t1 = datetime(2026, 9, 22, 23, 59, tzinfo=cst)
+            self._write(td, t1.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+            self.assertTrue(digest_fresh_today(td, now=t1))
+            self.assertFalse(digest_fresh_today(
+                td, now=t1 + timedelta(minutes=2)), "过零点就该重建")
