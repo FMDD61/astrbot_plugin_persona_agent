@@ -66,7 +66,8 @@
   +3 例 AST 接线闸（rebuild 必须被 freshness 支配 / 跳过必须 WARNING+重试 / warmup 必须调补写），
   另加 P1/P2 的闸：日记路径必须用 `read_diaries`（旧路径 → 判据恒缺失）、
   TZ 显式 +8（删掉转换 → 用例红）、轮转内退避重试。**全部变异自证有牙**。
-  计数以实际运行为准：系统 python3 在 891~895 tests 之间（**20+ skip，随环境浮动**，无 Pillow 时多）；
+  计数以实际运行为准：**本轮 895**（上一提交 891 —— 差值是新增用例，不是环境浮动）；
+  `.venv` 稳定 2 skip，系统 python3 **20+ skip**（随 Pillow 有无浮动）；
   `.venv/bin/python` 会真跑 GIF 用例（仍有 2 条环境相关 skip）—— 不写「0 skip」这种会被打脸的话。
 
 

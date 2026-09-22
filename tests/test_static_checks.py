@@ -503,8 +503,13 @@ class TestDiaryDayIsPassedIn(unittest.TestCase):
         real = [c for c in calls if ":" not in c and "msgs" in c]   # 定义行有类型注解，排除
         self.assertGreaterEqual(len(real), 3, "应有 轮转/重试/补写 三处调用")
         for c in real:
-            self.assertEqual(len([x for x in c.split(",") if x.strip()]), 3,
-                             "每个调用点都要显式传日：" + c)
+            args = [x.strip() for x in c.split(",") if x.strip()]
+            self.assertEqual(len(args), 3, "每个调用点都要显式传日：" + c)
+            # 🔴 G2d（审查第 3 轮）：只数个数钉不住"日从哪来" —— 把重试处换成
+            # `self.session_mgr.day_key(time.time() - 86400.0)` 仍是 3 个参数，
+            # 而那正是第 2 轮 bug 的复活形态。必须断言第三参**不是现算的**。
+            self.assertNotIn("day_key(", args[2],
+                             "第三个实参必须是调用方算好的日，不能在本处现算：" + c)
 
     def test_retry_prechecks_and_rebuilds(self):
         """M13/M16：重试里必须先查盘（多实例）并**在成功后重算 §3**。"""
