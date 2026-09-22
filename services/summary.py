@@ -15,9 +15,14 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+# 🔴 B-056 修复时的真实教训：这个常量住在 style_profile，
+# 我在本模块直接用了名字 → NameError 被 except 吞成「永远不新鲜」，
+# 表现为「每条消息都重建」（正是要修的那个 bug 换了个马甲）。**必须有测试钉住。**
+from .style_profile import MEMORY_DIGEST_FILE  # noqa: E402
 
 DIARY_FILE = "daily_diary.jsonl"
 WEEKLY_FILE = "weekly_summary.jsonl"
@@ -519,6 +524,31 @@ def _parse_day(day: str) -> Optional[date]:
         return date.fromisoformat((day or "").strip())
     except ValueError:
         return None
+
+
+def digest_fresh_today(data_dir, *, now=None) -> bool:
+    """`memory_digest.json` 是否**今天**（本地日期）组装过（B-056 的判据）。
+
+    为什么要读盘而不是只信内存：进程可能刚重启，而盘上的摘要是昨天 02:05 写的；
+    反之若只看内存，重启后会误判"今天已组装"而让 §3 陈旧一整天。
+
+    任何异常（文件缺失 / 坏 JSON / 时间戳畸形）一律返回 False：
+    **宁可多做一次组装，也不让 §3 陈旧**。
+    """
+    try:
+        path = Path(data_dir) / MEMORY_DIGEST_FILE
+        if not path.exists():
+            return False
+        data = json.loads(path.read_text("utf-8"))
+        ts = str((data or {}).get("generated_at") or "")
+        if len(ts) < 19:
+            return False
+        dt = datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
+        dt = dt.replace(tzinfo=timezone.utc).astimezone()   # UTC → 本地
+        ref = now or datetime.now()
+        return dt.strftime("%Y-%m-%d") == ref.strftime("%Y-%m-%d")
+    except Exception:
+        return False
 
 
 def write_memory_digest(data_dir: "str | Path", group_id: str) -> dict:

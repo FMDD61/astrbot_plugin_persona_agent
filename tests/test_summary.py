@@ -4,10 +4,12 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import sys
+
+from services.style_profile import MEMORY_DIGEST_FILE  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -17,7 +19,7 @@ try:
     from services.summary import (
         SummaryService, weekly_window, monthly_window, list_diaries,
         sample_days, build_prompt, append_summary, build_phi,
-        split_digest_body,
+        split_digest_body, digest_fresh_today,
     )
 except ImportError:
     from astrbot_plugin_persona_agent.services.summary import (
@@ -568,3 +570,54 @@ class TestCrossYear(unittest.TestCase):
         # （周一起于 2025-12-29）→ 标签是 2026-W01，不是 2025-W52。
         # 人读 §3 会觉得别扭，但这是 ISO 标准，且与 `_week_end("2026-W01")=2026-01-04` 自洽。
         self.assertEqual(label, "2026-W01")
+
+
+class TestDigestFreshTodayB056(unittest.TestCase):
+    """🔴 B-056（2026-09-22 线上）：每条消息都重读摘要并刷日志（当天 7269 条）。
+
+    修法 = 按 `generated_at` 的**本地日期**判「今天是否已组装」；异常一律按陈旧处理。
+    这条判据必须可单测（不能只活在 main.py 里 —— 测试从不导入它）。
+    """
+
+    def _write(self, td: str, iso: str) -> None:
+        (Path(td) / MEMORY_DIGEST_FILE).write_text(
+            json.dumps({"generated_at": iso, "layers": {}}), encoding="utf-8")
+
+    def test_fresh_when_generated_now(self):
+        with tempfile.TemporaryDirectory() as td:
+            now = datetime.now(timezone.utc)
+            self._write(td, now.strftime("%Y-%m-%dT%H:%M:%SZ"))
+            self.assertTrue(digest_fresh_today(td))
+
+    def test_stale_when_generated_yesterday(self):
+        with tempfile.TemporaryDirectory() as td:
+            # 用「本地昨天」构造，避免 UTC 与本地跨日造成假阴性
+            y = datetime.now().astimezone() - timedelta(days=1)
+            self._write(td, y.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+            self.assertFalse(digest_fresh_today(td))
+
+    def test_missing_file_is_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertFalse(digest_fresh_today(td))
+
+    def test_corrupt_or_shapeless_is_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / MEMORY_DIGEST_FILE).write_text("{坏 JSON", encoding="utf-8")
+            self.assertFalse(digest_fresh_today(td))
+            (Path(td) / MEMORY_DIGEST_FILE).write_text("{}", encoding="utf-8")
+            self.assertFalse(digest_fresh_today(td))
+            (Path(td) / MEMORY_DIGEST_FILE).write_text(
+                json.dumps({"generated_at": "不是时间"}), encoding="utf-8")
+            self.assertFalse(digest_fresh_today(td))
+
+    def test_constant_is_imported_not_shadowed(self):
+        """回归钉：常量住在 style_profile —— 本模块少一个 import 就会 NameError，
+        而它会被 `except` 吞成「永远不新鲜」= **每条消息都重建**（正是 B-056 本身）。
+        """
+        from services import summary as S
+        self.assertTrue(hasattr(S, "MEMORY_DIGEST_FILE"), "必须在本模块可见")
+        self.assertEqual(S.MEMORY_DIGEST_FILE, "memory_digest.json")
+        # 反向自证：把常量改名 → 函数必须**仍然基于同一份文件名**（防两处漂移）
+        self.assertIn(S.MEMORY_DIGEST_FILE,
+                      (Path(__file__).resolve().parents[1] / "services" / "style_profile.py")
+                      .read_text(encoding="utf-8"))

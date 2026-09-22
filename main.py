@@ -944,7 +944,11 @@ class PersonaAgent(Star):
         else:
             # 即使这次没换日（cron 已经换过），也确保 §3 是当天的：
             # 进程可能在 02:05 不在运行（重启/部署/崩溃）→ 全靠这条兜底。
-            self._rebuild_memory_digest(group_id)
+            # 🔴 B-056（2026-09-22 线上观察）：**这里原先无条件重建** →
+            # 每条消息都重读全部摘要文件并刷一行日志（实测当天 7269 条）。
+            # 兜底的真实语义是「**今天的** §3 还没组装过」，不是「每条消息都组装」。
+            if not self._digest_fresh_today(group_id):
+                self._rebuild_memory_digest(group_id)
 
         alias = self.style.preferred_alias(sender_uin) or f"群友{sender_uin}"
         if alias.startswith("群友") and sender_uin and sender_uin != self.bot_qq:
@@ -2310,9 +2314,61 @@ class PersonaAgent(Star):
                     f"[persona_agent] provider resolved at startup: {pid} "
                     f"(exists={ok}; attempts={attempt + 1})"
                 )
+                # B-055：provider 确认可用 → 顺手补写昨天可能缺失的日记
+                if self._diary_enabled:
+                    await self._backfill_missing_diary(self._active_group_id())
                 return
             last = "unresolved"
         logger.warning(f"[persona_agent] provider warmup gave up ({last}); will resolve lazily")
+
+    async def _backfill_missing_diary(self, group_id: str) -> None:
+        """补写「昨天」缺失的日记（B-055 的第二道防线，2026-09-22）。
+
+        为什么需要它：日记只在**轮转那一刻**生成，而那一刻 provider 可能还没注册完
+        （实测 09-22 02:05 两条轮转路径都 `no provider id known yet`）→
+        当天的日记与 §3 记忆段一起消失，且**当天不会再有第二次机会**。
+        这里在 provider 确认可用的启动时机补一次，把「错过就永久缺」变成「可自愈」。
+
+        只补**昨天**一天（不追溯更早）：范围可控，且归档会话文件就在盘上。
+        """
+        if not self._diary_enabled or self.session_mgr is None:
+            return
+        try:
+            yday = self.session_mgr.day_key(time.time() - 86400)
+            if self._has_diary_for(group_id, yday):
+                return
+            path = Path(str(self.data_dir)) / (
+                f"session_{group_id}_{yday}.json")
+            if not path.exists():
+                logger.info(f"[persona_agent] 无 {yday} 的归档会话 → 无需补写日记")
+                return
+            with path.open("r", encoding="utf-8") as f:
+                msgs = (json.load(f) or {}).get("messages") or []
+            if not msgs:
+                return
+            logger.warning(
+                f"[persona_agent] ⚠️ 发现 {yday} 的日记缺失（轮转时 provider 未就绪？）"
+                f"→ 用归档会话补写（{len(msgs)} 条）"
+            )
+            await asyncio.wait_for(self._generate_diary(group_id, msgs), timeout=300)
+            self._rebuild_memory_digest(group_id)
+        except asyncio.TimeoutError:
+            logger.warning(f"[persona_agent] 日记补写超时（{yday}）")
+        except Exception as e:
+            logger.warning(f"[persona_agent] 日记补写失败（{yday}）：{e}")
+
+    def _has_diary_for(self, group_id: str, day: str) -> bool:
+        """盘上有没有这一天的日记（容忍坏行；异常按「没有」处理 → 会尝试补写）。"""
+        try:
+            from .services.summary import list_diaries
+            d0 = datetime.date.fromisoformat(day)
+            recs = list_diaries(
+                Path(str(self.data_dir)) / "daily_diary.jsonl", group_id, d0, d0)
+            return bool(recs)
+        except Exception as e:
+            logger.debug(f"[persona_agent] 日记存在性判定失败: {e}")
+            return False
+
 
     async def _provider_exists(self, provider_id: str) -> Optional[bool]:
         """校验 provider_id 在 AstrBot 里真实存在。
@@ -2692,6 +2748,20 @@ class PersonaAgent(Star):
                 logger.warning(f"[persona_agent] 日记生成失败（继续组装）：{e}")
         self._rebuild_memory_digest(group_id)
 
+    def _digest_fresh_today(self, group_id: str) -> bool:
+        """B-056：今天的 §3 是否已组装过（判据在 services.summary，可单测）。
+
+        `group_id` 目前不参与判据 —— 摘要文件是**全局一份**（四层共用），
+        保留形参是为了以后按群拆分时不改调用点。
+        """
+        try:
+            from .services.summary import digest_fresh_today
+            return bool(digest_fresh_today(self.data_dir))
+        except Exception as e:
+            logger.debug(f"[persona_agent] digest 新鲜度判定失败（按陈旧处理）: {e}")
+            return False
+
+
     def _rebuild_memory_digest(self, group_id: str) -> None:
         """组装并落盘 `<data_dir>/memory_digest.json`（C4 的"组装"那一步）。
 
@@ -2703,7 +2773,9 @@ class PersonaAgent(Star):
             from .services.summary import write_memory_digest
             res = write_memory_digest(str(self.data_dir), group_id)
             _st = res.get("stats") or {}
-            logger.info(
+            # B-056：内容没变就降级到 DEBUG（否则每次调用刷一行；实测 7269 条）
+            _lv = logger.debug if res.get("unchanged") else logger.info
+            _lv(
                 f"[persona_agent] memory digest 已组装："
                 f"{_st.get('counts') or '（无内容）'} "
                 f"共 {_st.get('total_lines', 0)} 行"
@@ -2746,7 +2818,21 @@ class PersonaAgent(Star):
         try:
             provider = await self._resolve_provider_id()
             if not provider:
-                logger.info("[persona_agent] diary skipped: no provider id known yet")
+                # 🔴 B-055（2026-09-22 线上）：这里原先只记一行 INFO 就 return ——
+                # 后果是**当天的日记与 §3 记忆段一起静默消失**（实测 09-22 全天 §3 为空），
+                # 而留痕只有一行容易被淹没的 INFO。
+                # ① 先给一次重试：轮转发生在 02:00–02:05，provider 可能刚重启还没注册完；
+                await asyncio.sleep(15)
+                provider = await self._resolve_provider_id()
+            if not provider:
+                # ② 仍然没有 → **WARNING + 把三级回退链的状态打出来**（下次一眼可诊）
+                logger.warning(
+                    "[persona_agent] ⚠️ 日记**未生成**（provider 未就绪）："
+                    "cfg=%r known=%r → 该日日记缺失，§3 记忆段会因此为空；"
+                    "启动补写会在下次 provider 就绪时兜底",
+                    bool((self.config.get("llm") or {}).get("provider_id")),
+                    bool(self._last_provider_id),
+                )
                 return
             # C32（summary_v2 §4）：总结类调用的 system 收窄成 §1+§2 ——
             # ① §6/§7/§8 是「怎么说话」，与「记什么」无关；

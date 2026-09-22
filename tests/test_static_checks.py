@@ -376,3 +376,75 @@ class TestRotationOrderC4(unittest.TestCase):
         names = [name for _ln, name in self._calls(self._fn("_period_summary"))]
         self.assertIn("_rebuild_memory_digest", names,
                       "周/月/年记写完也要重算 §3（它会改变分层边界）")
+
+
+class TestB055B056Wiring(unittest.TestCase):
+    """🔴 B-055 / B-056（2026-09-22 线上观察）的接线判据。
+
+    两个缺陷都只在 main.py 里，而**测试从不导入 main.py**（见本文件开头的事故说明）
+    → 用 AST 钉住「必须存在的形状」，让变异测试打得到。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = (REPO / "main.py").read_text(encoding="utf-8")
+        cls.tree = ast.parse(cls.src)
+
+    def _calls(self, name: str) -> list[ast.Call]:
+        out = []
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Call):
+                f = node.func
+                if isinstance(f, ast.Attribute) and f.attr == name:
+                    out.append(node)
+        return out
+
+    def test_rebuild_digest_is_guarded_by_freshness(self):
+        """B-056：消息路径里的兜底重建必须**先问「今天组装过没有」**。
+
+        没有这道闸 → 每条消息都重读摘要 + 刷日志（实测当天 7269 条）。
+        """
+        def calls_in(node, name):
+            out = []
+            for x in ast.walk(node):
+                if isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) \
+                        and x.func.attr == name:
+                    out.append(x)
+            return out
+
+        guarded = 0
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.If):
+                continue
+            test_calls = calls_in(node.test, "_digest_fresh_today")
+            if not test_calls:
+                continue
+            for stmt in node.body:
+                guarded += len(calls_in(stmt, "_rebuild_memory_digest"))
+        self.assertGreaterEqual(
+            guarded, 1,
+            "兜底的 _rebuild_memory_digest 必须被 `if not self._digest_fresh_today(...)` 支配"
+        )
+
+
+    def test_diary_skip_is_warning_with_retry(self):
+        """B-055：provider 未就绪时不能再只记 INFO 就走 —— 要重试 + WARNING 落到日志。"""
+        i = self.src.index("日记**未生成**")
+        seg = self.src[max(0, i - 700):i + 400]
+        self.assertIn("logger.warning", seg, "跳过必须是 WARNING（INFO 会被淹没）")
+        self.assertIn("asyncio.sleep", seg, "给一次重试窗口")
+        self.assertIn("_last_provider_id", seg, "诊断要打出三级回退链的状态")
+
+    def test_startup_backfills_missing_diary(self):
+        """B-055：provider 就绪后要补写昨天缺失的日记（把「错过就永久缺」变成可自愈）。"""
+        # ⚠️ 只取**函数体内**那一段：方法定义本身就在附近，用 "x in 后续 700 字"
+        # 会被定义命中 → 闸无牙（第一版就是这么写的，变异实测 GREEN）。
+        i = self.src.index("provider resolved at startup")
+        j = self.src.index("async def _provider_exists", i)
+        seg = self.src[i:j]
+        self.assertIn("await self._backfill_missing_diary(", seg,
+                      "warmup 成功后必须**调用**补写（只有定义不算）")
+        j = self.src.index("async def _backfill_missing_diary")
+        body = self.src[j:j + 2200]
+        self.assertIn("wait_for", body, "补写必须有超时上界（否则挂住启动）")
+        self.assertIn("_has_diary_for", body, "先查盘上有没有，避免重复生成")

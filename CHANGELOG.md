@@ -11,6 +11,27 @@
 
 ## [Unreleased]
 
+### Fixed (2026-09-22 · 线上观察抓到的两条 —— B-055 / B-056)
+- **B-056 每条消息重建一次记忆摘要**：兜底分支（cron 已换日 / 进程重启时保证 §3 当天新鲜）
+  原先**无条件**调 `_rebuild_memory_digest()` → 当天刷出 **7269 条**日志并反复重读全部摘要文件。
+  改为按 `memory_digest.json` 的 `generated_at` 判「今天是否已组装」（本地日期），
+  判据下沉到 `services.summary.digest_fresh_today()`（可单测），main 只做薄包装；
+  内容未变时日志降级到 DEBUG（`write_memory_digest` 的 `unchanged` 键）。
+  修这条时自己踩了一次同形坑：`MEMORY_DIGEST_FILE` 住在 `style_profile`，
+  本模块少一个 import → NameError 被 except 吞成「永远不新鲜」= **每条消息都重建**（正是要修的 bug 换马甲）。
+  已加回归钉（常量可见性 + 值一致）。
+- **B-055 每日日记静默跳过 → §3 记忆段一整天为空**：09-22 02:05 两条轮转路径都记
+  `diary skipped: no provider id known yet`（而 01:51:44 启动日志明写 provider 已解析）→
+  `daily_diary.jsonl` 最新仍是 09-20，`memory_digest.json` 全天 `layers={}`。三处加固：
+  ① 跳过前先**重试一次**（+15s：轮转发生在 02:00-02:05，provider 可能刚重启没注册完）；
+  ② 仍失败时落 **WARNING 并打出三级回退链状态**（`cfg=... known=...`），不再是一行容易被淹没的 INFO；
+  ③ **启动补写**：provider warmup 成功后检查「昨天」日记是否缺失，缺且归档会话在 → 用归档补写并重算 §3
+  （把「错过就永久缺」变成可自愈；只补昨天一天，范围可控）。
+- 测试：`tests/test_summary.py` +5 例（新鲜度四态 + 常量回归钉）；`tests/test_static_checks.py`
+  +3 例 AST 接线闸（rebuild 必须被 freshness 支配 / 跳过必须 WARNING+重试 / warmup 必须调补写），
+  三条闸均**变异自证有牙**（拆掉任一 → 用例红）。全套 887 OK（venv 0 skip）。
+
+
 ### Fixed (2026-09-21 · 批次三 上线前 · 独立审查两轮的收尾)
 - **C22 的 system 位**（审查第 1 轮阻塞 1）：Gate 的冻结头部此前只进 `messages[0]`，
   而 system 位上仍是旧「参与度与安全分析师」提示词 → 一次请求两套身份 + 两套输出格式，
