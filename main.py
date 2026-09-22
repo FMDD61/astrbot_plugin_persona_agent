@@ -2350,7 +2350,8 @@ class PersonaAgent(Star):
                 f"[persona_agent] ⚠️ 发现 {yday} 的日记缺失（轮转时 provider 未就绪？）"
                 f"→ 用归档会话补写（{len(msgs)} 条）"
             )
-            await asyncio.wait_for(self._generate_diary(group_id, msgs), timeout=300)
+            await asyncio.wait_for(
+                self._generate_diary(group_id, msgs, yday), timeout=300)
             self._rebuild_memory_digest(group_id)
         except asyncio.TimeoutError:
             logger.warning(f"[persona_agent] 日记补写超时（{yday}）")
@@ -2754,7 +2755,7 @@ class PersonaAgent(Star):
             try:
                 # 上界 5 分钟：日记 LLM 卡死时不能拖住组装（有内容就装配）
                 await asyncio.wait_for(
-                    self._generate_diary(group_id, old_msgs), timeout=300)
+                    self._generate_diary(group_id, old_msgs, _day), timeout=300)
             except asyncio.TimeoutError:
                 logger.warning("[persona_agent] 日记生成超时 300s（跳过，继续组装）")
             except Exception as e:
@@ -2781,7 +2782,7 @@ class PersonaAgent(Star):
                     f"[persona_agent] 日记缺失（day={day}）→ 第 {k} 次退避重试"
                 )
                 await asyncio.wait_for(
-                    self._generate_diary(group_id, old_msgs), timeout=300)
+                    self._generate_diary(group_id, old_msgs, day), timeout=300)
                 if self._has_diary_for(group_id, day):
                     self._rebuild_memory_digest(group_id)
                     logger.info(f"[persona_agent] 日记重试成功（day={day}）")
@@ -2852,7 +2853,8 @@ class PersonaAgent(Star):
         except Exception as e:
             logger.warning(f"[persona_agent] cache_stats 聚合失败（不影响运行）: {e}")
 
-    async def _generate_diary(self, group_id: str, msgs: list[dict]) -> None:
+    async def _generate_diary(self, group_id: str, msgs: list[dict],
+                            day: str = "") -> None:
         """Daily diary summary reusing the archived day session as context.
 
         Cache-friendly by design (v3 decision): the request prefix
@@ -2911,7 +2913,11 @@ class PersonaAgent(Star):
             # C31：切开 digest / body 两字段（代码在 --- 围栏处切，下游不解析 frontmatter）
             digest, body = split_digest_body(summary)
             record = {
-                "day": self.session_mgr.day_key(time.time() - 86400.0),
+                # 🔴 P2（独立审查第 2 轮）：**日必须由调用方传入**，不许在这里现算。
+                # 现算的日 = day_key(now-86400)，而重试/补写可能跨过 02:00 边界 →
+                # 会把「09-20 的归档」写成 day=09-21 的记录：目标日永久缺失，
+                # 还会顶掉 02:05 真正的 09-21 日记（只留一条误导性的"幂等拦截"）。
+                "day": day or self.session_mgr.day_key(time.time() - 86400.0),
                 "group_id": group_id,
                 "digest": digest,
                 "body": body,

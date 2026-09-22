@@ -475,3 +475,52 @@ class TestDiaryPathIsCurrent(unittest.TestCase):
         body = src[i:j]
         self.assertIn("_has_diary_for", body)
         self.assertIn("_retry_diary_later", body)
+
+
+class TestDiaryDayIsPassedIn(unittest.TestCase):
+    """🔴 P2（独立审查第 2 轮）：**日必须由调用方传入**。
+
+    `_generate_diary` 原先自己现算 `day_key(now-86400)`，而重试/补写可能跨过 02:00 边界 →
+    把「09-20 的归档」写成 day=09-21 的记录：目标日永久缺失，还会顶掉 02:05 真正的日记。
+    触发窄（会话陈旧 + 01:58–02:00 触发轮转 + 首发失败）但后果是**记忆内容错误**。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = (REPO / "main.py").read_text(encoding="utf-8")
+
+    def test_record_day_comes_from_parameter(self):
+        i = self.src.index("async def _generate_diary")
+        j = self.src.index("def ", self.src.index("record = {", i))
+        body = self.src[i:i + 6000]
+        self.assertIn('"day": day or self.session_mgr.day_key(', body,
+                      "不许在写侧现算日；必须 `day or …` 兜底")
+
+    def test_all_callers_pass_day(self):
+        import re as _re
+        calls = _re.findall(r"_generate_diary\(([^)]*)\)", self.src)
+        self.assertGreaterEqual(len(calls), 3, "三处调用：轮转 / 重试 / 补写")
+        real = [c for c in calls if ":" not in c and "msgs" in c]   # 定义行有类型注解，排除
+        self.assertGreaterEqual(len(real), 3, "应有 轮转/重试/补写 三处调用")
+        for c in real:
+            self.assertEqual(len([x for x in c.split(",") if x.strip()]), 3,
+                             "每个调用点都要显式传日：" + c)
+
+    def test_retry_prechecks_and_rebuilds(self):
+        """M13/M16：重试里必须先查盘（多实例）并**在成功后重算 §3**。"""
+        i = self.src.index("async def _retry_diary_later")
+        j = self.src.index("def _digest_fresh_today", i)
+        body = self.src[i:j]
+        # ⚠️ 只断言那行 `if` 没牙：函数里还有第二处同名检查（生成后复查）→ 变异实测 GREEN。
+        # 这里连"前置检查的语义标记"一起钉住，拆掉整块才会红。
+        self.assertIn("已被别的路径补上", body, "M13：多实例前置检查（领先于首次生成）")
+        self.assertLess(body.index("已被别的路径补上"), body.index("self._generate_diary"),
+                        "前置检查必须在**第一次生成之前")
+        self.assertIn("_rebuild_memory_digest", body, "M16：成功后重算 §3")
+
+    def test_freshness_default_uses_cst(self):
+        """M15：默认 `now` 必须走显式 +8（否则测试都传 now= 就钉不住）。"""
+        src = (REPO / "services" / "summary.py").read_text(encoding="utf-8")
+        i = src.index("def digest_fresh_today")
+        body = src[i:i + 2000]
+        self.assertIn("datetime.now(_CST)", body, "默认参考时刻必须是 CST")
