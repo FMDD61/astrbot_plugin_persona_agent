@@ -36,8 +36,8 @@ class TestPostprocess(unittest.TestCase):
             postprocess("呜哇小明你这个人！\n角色快来管管她呀"),
             "呜哇小明你这个人！角色快来管管她呀")
         self.assertEqual(
-            postprocess("嗯…眼熟\n\n口癖己，报个名吧？"),
-            "嗯…眼熟，口癖己，报个名吧？")
+            postprocess("嗯…眼熟\n\n你好，报个名吧？"),
+            "嗯…眼熟，你好，报个名吧？")
 
     def test_reply_marker_stripped(self):
         self.assertEqual(postprocess("[r:-1] 你好"), "你好")
@@ -47,9 +47,11 @@ class TestPostprocess(unittest.TestCase):
         self.assertNotIn("AI", postprocess("作为一个AI，我可以帮你"))
 
     def test_koupi_capped_at_2(self):
-        text = "口癖己口癖己口癖己，口癖丁口癖丁口癖丁，口癖庚"
-        out = postprocess(text)
-        self.assertLessEqual(out.count("口癖己"), 2)
+        """口癖封顶走**外部名单**（真实名单在仓库外 data_out/koupi.json）。"""
+        from services import text_style
+        text = "测试口癖A测试口癖A测试口癖A，测试口癖B测试口癖B"
+        out = text_style.cap_koupi(text, phrases=("测试口癖A", "测试口癖B"))
+        self.assertLessEqual(out.count("测试口癖A") + out.count("测试口癖B"), 2)
 
     def test_emoji_and_at_survive_postprocess_c15(self):
         """🔴 C15 / B-048（2026-09-21）：postprocess **不再**删 emoji 与 @。
@@ -85,10 +87,11 @@ class TestCollapseNewlines(unittest.TestCase):
 
 class TestCapKoupi(unittest.TestCase):
     def test_cap(self):
-        out = cap_koupi("口癖己a口癖己b口癖己c")
-        self.assertEqual(out.count("口癖己"), 2)
-        self.assertIn("a", out)
-        self.assertIn("c", out)
+        # 用**假口癖**验证机制（真实名单在仓库外，代码/夹具里不留真实口癖）
+        out = cap_koupi("测试口癖A1测试口癖A2测试口癖A3", phrases=("测试口癖A",))
+        self.assertEqual(out.count("测试口癖A"), 2)
+        self.assertIn("1", out)
+        self.assertIn("3", out)
 
 
 class TestStripStepsRemovedC15(unittest.TestCase):

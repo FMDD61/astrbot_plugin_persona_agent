@@ -11,6 +11,47 @@
 
 ## [Unreleased]
 
+### Security / Privacy (2026-09-23 · 脱敏第二轮：号码补洗 + 口癖解耦 + 示例换代)
+
+用户口径（逐字）：
+> 「口癖常量解耦，将具体口癖外挂到 data_out/ 下，加载时插件从外部引入数据。
+>  若外部无文件，降级到无口癖功能。」
+> 「线上生效的文件直接轮转时更新，仅保留新 examples.json，旧文件进行清理。」
+
+- **🔴 号码补洗（第一轮的漏网）**：第一轮的敏感串表是从成员**别名**里抽的，
+  **漏了号码本身** —— 一个真实 QQ 号残留在 `tests/test_cache_stats.py`（被当成
+  "假时间戳"，所以上一轮判定为噪声）。现在改占位 `100000004`，并另建一张
+  **全仓 8–10 位数字表**（工作树 + 全历史）：逐个判定"占位/日期/时间戳"还是
+  "真实号码"，真实的并入替换表。判据与结论见 `scratch/SCRUB_round2_report.md`。
+- **口癖常量解耦**（`services/text_style.py`）：删掉硬编码的 `KOUPI_LIST` ——
+  那几个词源自**风格源真实的语言习惯**，属数据。真实名单移到仓库外
+  `data_out/koupi.json`；插件运行时从 **`<data_dir>/koupi.json`** 加载
+  （**不硬编码 `data_out/`**），带缓存 + **mtime 热重载**（指纹 = `mtime_ns` + `size`，
+  加 size 是 N-1 粗时钟教训的补救）。`KOUPI_MAX_TOTAL = 2` 仍是**框架常量**。
+  **代码 / 注释 / 测试夹具里不再有任何一个真实口癖字面量**（单测一律用假口癖
+  `测试口癖A/B/C` 验证机制）；`tests/test_koupi.py` 钉住四条契约：
+  文件在→按外部名单裁剪、缺失→直通+留痕、mtime 变→热重载、坏 JSON→直通+留痕且**不抛**。
+- **无口癖数据 = 可见降级**（本项目第一病根）：`koupi_state()` 区分
+  `file` / `missing`（没有外部文件）/ `broken`（文件在但用不了）；降级时 `cap_koupi()`
+  **原样直通**（不改一个字符、不抛异常），且三处留痕：启动时 `[koupi] ⚠️ … koupi_source=missing`
+  一行 WARNING、`text_style.koupi_manifest()` 写进启动日志、每轮 trace 写 `koupi_degraded`。
+  文件消失时**立刻降级**（不保留内存里的旧名单 —— 陈旧比空更糟）；正常态不写 trace（不恒亮）。
+- **示例文件换代接进轮转**：`services/examples.cleanup_legacy_file()` 是幂等判定
+  （`absent` / `no_replacement` / `removed` / `failed`），由 `main._rotate_followup`
+  （cron 与消息兜底**两条轮转路径共用**）调用：旧名 `example_dialogs.json` 在**且**
+  新名 `examples.json` 在 → 备份到 `<data_dir>/data_out/legacy/` 后删除并留一行 INFO；
+  **新文件不在时绝不删旧文件**（否则示例块凭空消失）。示例块**每轮现读**，
+  删除后无需重启即生效。
+- **文档同步**：`docs/services.md`（loader 候选序 + 口癖外置）、`docs/params.md`
+  （口癖统计口径的前提）、`_conf_schema.json`（`examples.max_entries` 的 hint）、
+  仓库外 `data_out/README.md` 与 `ops/desktop/README.md` / `DESKTOP_STATE.md` 的
+  scp 清单（加 `koupi.json`）与退役说明。
+- **git 历史第二轮清洗**：`--replace-text` / `--replace-message`（号码 + 口癖字面量）→
+  `reflog expire` + `gc --prune=now --aggressive` → `git push --force --mirror`；
+  **完整 clone（非浅克隆）后逐串三查（工作树 / `git log --all -S` / 提交信息）全零**。
+- 测试：**952 OK**（系统 python 21 skip / `.venv` 0 skip）—— 比上一轮 920 多 32 条，
+  全是本轮新增的不变量（`tests/test_koupi.py` 24 条 + 示例换代 8 条）。
+
 ### Security / Privacy (2026-09-23 · 仓库脱敏：框架化 + 历史清洗)
 
 用户口径：「代码侧与提示词侧全面清理任何个人信息和群数据，所有涉及具体信息的部分

@@ -45,6 +45,9 @@ class TestCompact(unittest.TestCase):
         self.assertEqual(r["cold"], 1)
 
     def test_day_is_utc(self):
+        # ⚠️ 这里的 ts 是**占位值**（2026-09-23 脱敏）：原值是一个**真实 QQ 号**
+        # （被误当成"假时间戳"写进了用例）。本用例只要求 day 由 ts 现算，
+        # 取什么值都等价 —— 但真实号码不许留在 public 仓库里。
         ts = 100000004.0
         r = C.compact(probe_row(ts, 100, 10))
         self.assertEqual(r["day"], time.strftime("%Y-%m-%d", time.gmtime(ts)))

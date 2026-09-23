@@ -13,7 +13,8 @@ import json, os, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from services import examples_default
 from services.examples import (
-    EXAMPLES_FILES, ExamplesState, MAX_ENTRIES, candidate_paths, load_examples_block,
+    CURRENT_EXAMPLES_FILE, EXAMPLES_FILES, LEGACY_EXAMPLES_FILE, ExamplesState,
+    MAX_ENTRIES, candidate_paths, cleanup_legacy_file, load_examples_block,
     parse_payload,
 )
 
@@ -155,7 +156,9 @@ class TestBundledIsEmptyByDesign(unittest.TestCase):
         # 旧句现在连"数据"都不在：ENTRIES 恒空、HEADER 是纯框架文本。
         # （源码注释里会出现"旧句叫什么名字"的说明 —— 那是文档，不是语料。）
         blob = json.dumps(examples_default.ENTRIES, ensure_ascii=False) + examples_default.HEADER
-        for old in ("规则A", "规则B", "口癖丙"):
+        # ⚠️ 2026-09-23 口癖解耦：旧句里那个**口癖词**已不在代码/夹具里（真实口癖
+        # 属数据，移到仓库外 data_out/koupi.json）；这里只剩示例句名可查。
+        for old in ("规则A", "规则B"):
             self.assertNotIn(old, blob, f"旧示例残留：{old}")
 
     def test_max_entries_default_is_20(self):
@@ -167,6 +170,92 @@ class TestBundledIsEmptyByDesign(unittest.TestCase):
     def test_state_defaults_are_none(self):
         st = ExamplesState()
         self.assertEqual((st.source, st.entries, st.path, st.error), ("none", 0, "", ""))
+
+
+class TestLegacyExamplesCleanup(unittest.TestCase):
+    """轮转时的示例文件换代（用户 2026-09-23：「仅保留新 examples.json，旧文件进行清理」）。
+
+    判定在 `services.examples.cleanup_legacy_file`（主链路 main._rotate_followup 调它），
+    这里钉住**删不删**这条规则本身。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _put(self, name, entries):
+        p = os.path.join(self.dir, name)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False)
+        return p
+
+    def test_candidate_order_is_legacy_first(self):
+        """旧名**优先** —— 这正是必须清理它的原因。"""
+        self.assertEqual(EXAMPLES_FILES, (LEGACY_EXAMPLES_FILE, CURRENT_EXAMPLES_FILE))
+
+    def test_absent_when_no_legacy_file(self):
+        self.assertEqual(cleanup_legacy_file(self.dir), ("absent", ""))
+
+    def test_no_replacement_keeps_legacy(self):
+        """只有旧文件时**绝不删** —— 删了示例块会凭空消失。"""
+        self._put(LEGACY_EXAMPLES_FILE, EX)
+        action, detail = cleanup_legacy_file(self.dir)
+        self.assertEqual(action, "no_replacement")
+        self.assertTrue(detail.endswith(CURRENT_EXAMPLES_FILE))
+        self.assertTrue(os.path.exists(os.path.join(self.dir, LEGACY_EXAMPLES_FILE)))
+        # 传**主路径 = 旧名**（main._examples_block 就是这么传的）→ 候选序里旧名在前
+        _block, st = load_examples_block(os.path.join(self.dir, LEGACY_EXAMPLES_FILE))
+        self.assertEqual(st.entries, len(EX), "旧语料必须照旧生效（降级不是消失）")
+
+    def test_removed_with_byte_identical_backup(self):
+        legacy = self._put(LEGACY_EXAMPLES_FILE, EX)
+        self._put(CURRENT_EXAMPLES_FILE, EX + EX)
+        with open(legacy, "rb") as f:
+            before = f.read()
+        action, dest = cleanup_legacy_file(self.dir, stamp="TESTSTAMP")
+        self.assertEqual(action, "removed")
+        self.assertFalse(os.path.exists(legacy))
+        self.assertTrue(dest.endswith(os.path.join("data_out", "legacy",
+                                                   LEGACY_EXAMPLES_FILE + ".TESTSTAMP")))
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), before, "备份必须逐字节相同")
+
+    def test_new_file_takes_effect_after_cleanup(self):
+        """验收口径：清理前读旧文件、清理后读新文件（**不需要重启**）。"""
+        self._put(LEGACY_EXAMPLES_FILE, EX)                 # 2 条
+        self._put(CURRENT_EXAMPLES_FILE, EX + EX)           # 4 条
+        path = os.path.join(self.dir, LEGACY_EXAMPLES_FILE)   # main 传入的主路径
+        _b, st = load_examples_block(path)
+        self.assertEqual(st.entries, 2, "旧文件优先：清理前读到的是旧的")
+        cleanup_legacy_file(self.dir, stamp="T")
+        _b, st = load_examples_block(path)                  # 现读，无需重启
+        self.assertEqual(st.entries, 4, "清理后必须立刻读到新文件")
+
+    def test_idempotent(self):
+        self._put(LEGACY_EXAMPLES_FILE, EX)
+        self._put(CURRENT_EXAMPLES_FILE, EX)
+        self.assertEqual(cleanup_legacy_file(self.dir, stamp="T1")[0], "removed")
+        self.assertEqual(cleanup_legacy_file(self.dir, stamp="T2")[0], "absent")
+
+    def test_failure_is_reported_not_raised(self):
+        """备份目录建不出来 → 报 failed 且**保持不动**（绝不半途而废只删不备份）。"""
+        self._put(LEGACY_EXAMPLES_FILE, EX)
+        self._put(CURRENT_EXAMPLES_FILE, EX)
+        with open(os.path.join(self.dir, "data_out"), "w") as f:
+            f.write("占位：让 backup_dir.mkdir 失败")
+        action, detail = cleanup_legacy_file(self.dir, stamp="T")
+        self.assertEqual(action, "failed")
+        self.assertTrue(detail)
+        self.assertTrue(os.path.exists(os.path.join(self.dir, LEGACY_EXAMPLES_FILE)),
+                        "出错时旧文件必须原样留着")
+
+    def test_no_backup_dir_written_when_absent(self):
+        self._put(CURRENT_EXAMPLES_FILE, EX)
+        self.assertEqual(cleanup_legacy_file(self.dir, stamp="T")[0], "absent")
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "data_out", "legacy")))
 
 
 if __name__ == "__main__":

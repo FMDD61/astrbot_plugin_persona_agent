@@ -70,7 +70,7 @@ class CollectTests(unittest.TestCase):
         payload = {"version": 2, "group_id": gid, "day": "2026-08-20",
                    "messages": [
                        {"role": "user", "name": "小明", "content": "今天好累哦"},
-                       {"role": "assistant", "content": "口癖庚"},
+                       {"role": "assistant", "content": "好的呀"},
                        {"role": "user", "name": "群友A", "content": "吃点好的"},
                        {"role": "user", "name": "", "content": "   "},
                    ]}
@@ -91,7 +91,7 @@ class CollectTests(unittest.TestCase):
                               date(2026, 8, 17), date(2026, 8, 23), max_per_day=6)
         self.assertEqual(len(samples), 2)
         self.assertIn("今天好累哦", samples[0])
-        self.assertNotIn("口癖庚", "".join(samples))
+        self.assertNotIn("好的呀", "".join(samples))
 
     def test_sample_cap_per_day(self) -> None:
         samples = sample_days(str(self.dir), "123456789",

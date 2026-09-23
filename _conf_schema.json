@@ -290,7 +290,7 @@
         "type": "int",
         "description": "最多注入示例条数",
         "default": 20,
-        "hint": "C1：不锁死在 12（用户：「13 条不一定够，甚至可能会增加」）。🔴 示例语料源自真实群聊语句，**不在仓库里**：真身在仓库外 data_out/examples.json（部署时 scp 到 <data_dir>/example_dialogs.json，examples.json 亦可）。代码里 examples_default.ENTRIES 恒空 —— 数据目录没有可用文件时是**空示例块**（启动日志 WARNING + trace examples_degraded），任何情况下都不会回退到旧示例句。"
+        "hint": "C1：不锁死在 12（用户：「13 条不一定够，甚至可能会增加」）。🔴 示例语料源自真实群聊语句，**不在仓库里**：真身在仓库外 data_out/examples.json（部署时 scp 到 <data_dir>/examples.json）。代码里 examples_default.ENTRIES 恒空 —— 数据目录没有可用文件时是**空示例块**（启动日志 WARNING + trace examples_degraded），任何情况下都不会回退到旧示例句。⚠️ 旧文件名 example_dialogs.json 优先级更高、已退役：插件在**日轮转**时自动备份到 data_out/legacy/ 后删除（拿不到新文件时不删），日志留痕。"
       }
     }
   },

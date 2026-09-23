@@ -356,12 +356,12 @@ class TestMemberNoteRendering(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             sp = self._sp(td, [{
                 "uin": "1", "alias": "甲", "closeness": "close",
-                "notes": "喜欢用「口癖乙」\n最近在备考",
+                "notes": "喜欢用「测试口头禅」\n最近在备考",
             }])
             lines = sp.relations_lines()
             self.assertEqual(len(lines), 1)
             line = lines[0][1]
-            self.assertIn("喜欢用「口癖乙」", line)
+            self.assertIn("喜欢用「测试口头禅」", line)
             self.assertIn("最近在备考", line)
             self.assertNotIn("\n", line, "必须压成一行（增量按整行比对）")
             self.assertIn("—", line)

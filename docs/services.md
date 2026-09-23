@@ -13,9 +13,9 @@
 | ConflictDetector | services/conflict_detector.py | 3-stage conflict (keyword+burst+LLM verify)——**仅 gate.enabled=0 时兜底**（A7④）；gate.enabled=1 时 conflict 由 GateLLM 承担 |
 | StyleProfile | services/style_profile.py | 8 style files hot-reload；add_new_member 原子追加（G9）；WHO/HOW separated system_prompt, 6-segment time |
 | RagService | services/rag_service.py | ChromaDB vector retrieval（warmup 预热；查询走 asyncio.to_thread） |
-| ExamplesLoader | services/examples.py | G14 静态示例注入：mtime_ns 热重载，**块位于 session 之前**（S2 修正：排在增长段之后 = 永远落在缓存失效区），头部含规则A/B 约束 |
+| ExamplesLoader | services/examples.py | G14 静态示例注入：**每轮现读、不做 mtime 缓存**（N-1：粗时钟下同刻度改写会静默返回旧块），**块位于 session 之前**（S2 修正：排在增长段之后 = 永远落在缓存失效区），头部含规则A/B 约束。候选序 `example_dialogs.json`（**旧名，已退役**）→ `examples.json`；`cleanup_legacy_file()` 在日轮转时备份后清掉旧名（幂等，缺新文件则不删） |
 | VisionService | services/vision.py | G15 识图：**模型名必须带网关命名空间前缀**（默认 `deepseek/deepseek-v4.1-flash`；无前缀一律 HTTP 400，曾被静默吞成「无法识别」），reasoning=low + max_tokens **2048**（S6 标定），三源字节解析，30s 内存 TTL + **持久 LRU 哈希缓存**（image_desc_cache.json 跨重启复用；键 = `VISION_PREP_VERSION` + 原始字节 sha256）；**C27：多帧 GIF 一律抽帧拼 6 帧网格（3 列×2 行 / 每帧长边 320px / q82）+ 网格专用提示词**，拼不出来回退首帧并把原因落 diag/stats/warning |
-| text_style | services/text_style.py | 纯文本工具：clean_message_text / extract_quote（`[r]` 打标制 + 旧 `[r:-N]` 编号制）/ postprocess（AI 味 / 元信息括号 / 标记剥离 / 口癖封顶 / 换行 / 长度；**C15 起不再删 emoji 与 @** —— 那两个函数已删） |
+| text_style | services/text_style.py | 纯文本工具：clean_message_text / extract_quote（`[r]` 打标制 + 旧 `[r:-N]` 编号制）/ postprocess（AI 味 / 元信息括号 / 标记剥离 / 口癖封顶 / 换行 / 长度；**C15 起不再删 emoji 与 @** —— 那两个函数已删）。🔴 **口癖名单是数据不是框架**（2026-09-23 解耦）：运行时从 `<data_dir>/koupi.json` 加载，缓存 + mtime 热重载；外部无文件 → `cap_koupi()` **直通**（不裁剪），留痕 `koupi_source=missing`（启动 WARNING + trace `koupi_degraded`） |
 | ContextBuffer | services/context_buffer.py | 滑动窗口（仅 interjection 决策；LLM 上下文来自 session）+ **`QuoteIndex` 不可变引用快照**（B-001：编号基在生成前冻结） |
 | PokeService | services/poke.py | G11 戳一戳：300s 同人冷却/小时配额 4/未知成员不回戳/conflict_keywords 抑制/poke_log.jsonl；enabled=0 全静默 |
 | TopicBank | services/topic_bank.py | G12 冷场话题：§10 评分（0.45 silence+0.25 priority+0.20 hints+0.10 freshness）、topic_bank.json mtime_ns 热加载、发送后归档 topic_sent.json |

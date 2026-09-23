@@ -44,7 +44,22 @@ PROBES = [
 ]
 EGGCORN = re.compile(r"早上好|中午好|下午好|晚上好")
 MARKER = re.compile(r"\[图片|\[ComponentType")
-KOUPIS = ("口癖甲", "口癖庚", "口癖己", "口癖丁", "口癖丙", "口癖乙", "口癖戊")
+
+def load_koupis(data_dir):
+    """口癖名单在**仓库外**（`<data_dir>/koupi.json`，与插件同一份文件）。
+
+    本工具不内置任何真实口癖字面量（仓库是 public）。文件缺失 / 读不出来 →
+    返回空表并**打一行说明**（统计口径变化必须看得见，不许静默当 0 处理）。
+    """
+    path = os.path.join(data_dir, "koupi.json")
+    try:
+        with io.open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"[koupi] ⚠️ 名单读不出来（{path}）：{type(e).__name__}: {e} → 口癖统计为空")
+        return ()
+    raw = data.get("phrases") if isinstance(data, dict) else data
+    return tuple(p.strip() for p in (raw or []) if isinstance(p, str) and p.strip())
 
 
 def load_module(name, path):
@@ -109,7 +124,8 @@ def main() -> int:
 
     sp = sp_mod.StyleProfile(args.data_dir)
     sys_prompt = sp.system_prompt(local_hour=args.hour)
-    ex_path = os.path.join(args.data_dir, "example_dialogs.json")
+    ex_path = os.path.join(args.data_dir, ex_mod.CURRENT_EXAMPLES_FILE)
+    koupis = load_koupis(args.data_dir)
     api_base, key = get_creds()
 
     results = []
@@ -158,10 +174,9 @@ def main() -> int:
     for r in results:
         r["eggcorn"] = bool(EGGCORN.search(r["reply"]))
         r["marker_leak"] = bool(MARKER.search(r["reply"]))
-        r["tungsten"] = r["reply"].count("口癖甲")
-        r["cuocuo"] = r["reply"].count("口癖庚")
     for r in results:
-        r["koupi"] = {k: r["reply"].count(k) for k in KOUPIS}
+        r["koupi"] = {k: r["reply"].count(k) for k in koupis}
+        r["koupi_total"] = sum(r["koupi"].values())
 
     with io.open(args.out, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
@@ -175,10 +190,10 @@ def main() -> int:
     for phase in ("OFF", "ON"):
         rs = [r for r in results if r["phase"] == phase]
         judge = [r.get("judge", 0) for r in rs if r.get("judge")]
-        tungsten = sum(r["tungsten"] for r in rs)
+        koupi_total = sum(r["koupi_total"] for r in rs)
         egg_hits = sum(1 for r in rs if r["eggcorn"])
         lines.append(f"## {phase}  (n={len(rs)} 平均judge={sum(judge)/len(judge) if judge else '-'} "
-                     f"钨钼总量={tungsten} 谐音出现={egg_hits})")
+                     f"口癖总量={koupi_total} 谐音出现={egg_hits})")
         for r in rs:
             lines.append(f"- [{r['probe']}/{r['topic']}#{r['rep']}] {r['reply']}  "
                          f"(judge={r.get('judge','-')})")

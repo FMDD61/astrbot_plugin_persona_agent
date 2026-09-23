@@ -724,6 +724,12 @@ class PersonaPipeline:
                 "entries": getattr(_exs, "entries", 0),
                 "error": getattr(_exs, "error", ""),
             }
+        # C8（2026-09-23 解耦）：口癖名单外部化 —— 没有 <data_dir>/koupi.json 时
+        # cap_koupi() **直通**（不裁剪）。这是降级，必须与"正常"可区分 → 每轮留痕。
+        # （正常态不写这条，避免 trace 恒亮 —— 与 persona_placeholder 同族纪律。）
+        _km = text_style.koupi_manifest()
+        if _km.get("koupi_source") != "file":
+            trace["koupi_degraded"] = _km
 
         # ---- S2 输入打包重划：把「该回哪句」显式标注出来 ----
         # 实测依据：决策窗口（96 条/1h）的文本有 **59% 已在 session 里**，

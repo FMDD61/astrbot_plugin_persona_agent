@@ -4,7 +4,11 @@ No astrbot imports: safe to import in tests and offline tools.
 """
 from __future__ import annotations
 
+import json
 import re
+import threading
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 RE_QUOTE_BLOCK = re.compile(r"\[引用消息\(.+?\)\]", re.DOTALL)
@@ -87,12 +91,168 @@ def split_media_annotations(text: str) -> tuple[str, list[str], list[str]]:
     return body, imgs, faces
 
 
-# ⚠️ `口癖丙` 属于**待清理项**：D21 已定它在提示词侧删除（实测风格源 0 次使用），
-# 草案 §7 与示例块里都已没有它 —— **提示词侧是干净的**。这里留着只是因为它进了
-# `cap_koupi()` 的封顶名单（永不匹配、无害）。归 **C8（口癖/点名率的硬控制）** 一起处理，
-# 免得被误当成 C1/C2 的残留。
-KOUPI_LIST = ("口癖己", "口癖庚", "口癖丁", "口癖丙", "口癖甲", "口癖戊", "口癖乙")
+# ---------------------------------------------------------------------------
+# 口癖封顶（C8）—— **名单是数据，不是框架**（2026-09-23 解耦）
+#
+# 原先这里是**一行硬编码**的名单常量。那几个词源自**风格源真实的语言习惯**，
+# 属真实数据特征 —— 仓库是 public，不能留（用户 2026-09-23 口径：「口癖常量解耦，
+# 将具体口癖外挂到 data_out/ 下，加载时插件从外部引入数据。若外部无文件，
+# 降级到无口癖功能」）。现在整批移到仓库外 `data_out/koupi.json`（规范副本），
+# 插件运行时从 `<data_dir>/koupi.json` 加载 —— **代码里一个真实口癖字面量都不留**
+# （含注释与测试夹具；单测用假口癖验证机制）。
+#
+# 🔴 **降级必须可见**（本项目第一病根）：外部没有文件 → 口癖功能降级为
+# 「不裁剪」（`cap_koupi()` 直通）。这条降级路径有三个留痕点，**绝不静默**：
+#   * `main.initialize()` 打一行 WARNING（启动一次）；
+#   * `koupi_manifest()` 把 `koupi_source` 记进启动日志；
+#   * `pipeline` 每轮把 `koupi_degraded` 写进 trace。
+# ---------------------------------------------------------------------------
+
+#: 口癖名单文件名（`<data_dir>/koupi.json`）。插件**只认 `<data_dir>`** ——
+#: 不硬编码 `data_out/`（那是仓库外的迁移/备份规范位置，见 workspace AGENTS.md）。
+KOUPI_FILE = "koupi.json"
+
+#: 单条回复里保留的口癖条数上限（**框架常量**：与"用哪些词"无关，不进数据文件）
 KOUPI_MAX_TOTAL = 2
+
+
+@dataclass
+class KoupiState:
+    """口癖名单的加载结果 + 留痕（降级必须可见）。"""
+
+    #: 当前生效的口癖（外部文件里的原样顺序）
+    phrases: tuple = ()
+    #: "file"（数据目录文件可用）/ "missing"（**没有外部文件** → 降级不裁剪）
+    #: / "broken"（文件在但用不了：坏 JSON / 结构不对 / 空名单 → 同样降级）
+    source: str = "missing"
+    #: 实际生效的文件（降级时为空串）—— 日志里点名用
+    path: str = ""
+    #: 文件指纹（`st_mtime_ns` + `st_size`）：热重载判定用
+    mtime_ns: int = 0
+    size: int = 0
+    #: "文件在但用不了"的原因（与"压根没文件"可区分，N6 同族纪律）
+    error: str = ""
+
+    @property
+    def degraded(self) -> bool:
+        """是否处于降级态（口癖功能不可用 → `cap_koupi` 直通）。"""
+        return self.source != "file"
+
+    def manifest(self) -> dict:
+        """留痕用的扁平字典（启动日志与 pipeline trace **共用同一份口径**）。"""
+        return {
+            "koupi_source": self.source,
+            "koupi_phrases": len(self.phrases),
+            "koupi_path": self.path,
+            "koupi_error": self.error,
+        }
+
+
+def parse_koupi_payload(data) -> tuple[list[str], str]:
+    """解析 koupi.json，返回 ``(phrases, error)``。接受两种形态：
+
+    * ``{"phrases": [...]}`` —— `data_out/koupi.json` 的交付形态（自带说明字段）；
+    * 裸数组 —— 只想要一份名单时的最简写法。
+
+    非法条目（非字符串 / 空串）**跳过并记账**：一个坏条目不该让整份名单失效
+    —— 那会把"少一个词"放大成"没有口癖"（降级面被无谓放大）。
+    """
+    raw = data.get("phrases") if isinstance(data, dict) else data
+    if not isinstance(raw, list):
+        return [], '结构不对：期望 {"phrases": [...]} 或裸数组'
+    out: list[str] = []
+    bad = 0
+    for item in raw:
+        text = item.strip() if isinstance(item, str) else ""
+        if text:
+            out.append(text)
+        else:
+            bad += 1
+    return out, (f"{bad} 个条目非法（已跳过）" if bad else "")
+
+
+_koupi_lock = threading.Lock()
+_koupi_path: Optional[Path] = None
+_koupi_state = KoupiState()
+
+
+def configure_koupi(data_dir) -> KoupiState:
+    """绑定 `<data_dir>/koupi.json` 并**立即加载一次**（插件启动时调用）。
+
+    宿主必须显式调用：路径只从 `<data_dir>` 来 —— 插件不得硬编码 `data_out/`。
+    返回加载结果，调用方据此打「降级必须可见」的那一行日志。
+    """
+    global _koupi_path
+    _koupi_path = Path(data_dir) / KOUPI_FILE
+    return koupi_state(force=True)
+
+
+def reset_koupi() -> None:
+    """回到「未配置」态（单测 / 离线工具用；避免全局状态跨用例泄漏）。"""
+    global _koupi_path, _koupi_state
+    with _koupi_lock:
+        _koupi_path = None
+        _koupi_state = KoupiState()
+
+
+def koupi_state(force: bool = False) -> KoupiState:
+    """当前生效的口癖名单 + 留痕（**mtime 热重载**，与项目人工 JSON 约定一致）。
+
+    * 指纹 = ``(st_mtime_ns, st_size)``。加 size 是 N-1 那条教训的补救：文件 mtime
+      走内核**粗时钟**，同一刻度内的改写 `st_mtime_ns` 完全相同 → 只看 mtime 会返回
+      **旧名单**（改了不生效，且不报错）。size 能抓住"同一刻度内长度变了"这一大类；
+      长度也没变的同刻度改写仍看不见，故**不宣称完备**（要绝对新鲜就改完 `touch` 一下）。
+    * 文件消失 → **立刻降级为 missing，不保留内存里的旧名单**：「数据没了」必须当场
+      可见，而不是继续拿旧名单装作一切正常（陈旧比空更糟）。
+    """
+    global _koupi_state
+    with _koupi_lock:
+        path = _koupi_path
+        if path is None:
+            # 宿主没配置数据目录（离线工具 / 单测）—— 与"文件不存在"同一种形态：
+            # 没有外部数据 → 口癖功能不可用，且这个事实写在 state 里（不静默）。
+            _koupi_state = KoupiState(
+                source="missing", error="未配置数据目录（configure_koupi 未调用）")
+            return _koupi_state
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            _koupi_state = KoupiState(source="missing")
+            return _koupi_state
+        except OSError as e:                      # 权限 / 目录等真错误：也说清楚
+            _koupi_state = KoupiState(
+                source="missing", error=f"{type(e).__name__}: {e}")
+            return _koupi_state
+        fingerprint = (st.st_mtime_ns, st.st_size)
+        if not force and _koupi_state.source == "file"                 and (_koupi_state.mtime_ns, _koupi_state.size) == fingerprint:
+            return _koupi_state
+        try:
+            data = json.loads(path.read_text("utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as e:
+            _koupi_state = KoupiState(
+                source="broken", path=str(path), mtime_ns=st.st_mtime_ns,
+                size=st.st_size, error=f"{type(e).__name__}: {e}")
+            return _koupi_state
+        phrases, perr = parse_koupi_payload(data)
+        if not phrases:
+            _koupi_state = KoupiState(
+                source="broken", path=str(path), mtime_ns=st.st_mtime_ns,
+                size=st.st_size, error=perr or "名单为空（没有可用条目）")
+            return _koupi_state
+        _koupi_state = KoupiState(
+            phrases=tuple(phrases), source="file", path=str(path),
+            mtime_ns=st.st_mtime_ns, size=st.st_size, error=perr)
+        return _koupi_state
+
+
+def koupi_phrases() -> tuple:
+    """当前生效的口癖名单（热重载；**降级时为空元组**）。"""
+    return koupi_state().phrases
+
+
+def koupi_manifest() -> dict:
+    """口癖加载留痕（启动日志 / pipeline trace 共用口径）。"""
+    return koupi_state().manifest()
 
 _AI_PHRASES = (
     "作为一个AI", "作为AI", "作为一名AI", "作为人工智能", "我是AI", "我是一个AI",
@@ -182,9 +342,24 @@ def extract_quote(text: str, meta: Optional[dict] = None) -> tuple[str, Optional
     return rest, n
 
 
-def cap_koupi(text: str) -> str:
+def cap_koupi(text: str, phrases: Optional[tuple] = None) -> str:
+    """把口癖总量封顶到 ``KOUPI_MAX_TOTAL``（超出的**删掉**，保留靠前的）。
+
+    🔴 **外部无名单 → 直通**：``phrases`` 为空即**原样返回**，不抛异常、不改一个字符
+    —— 口癖功能整体降级为「不裁剪」。降级本身**不在这里报**（这里每轮都跑，报了就是
+    刷屏）：留痕在 ``koupi_state()`` / ``koupi_manifest()`` —— 宿主启动打 WARNING，
+    pipeline 每轮把 ``koupi_source`` 写进 trace。**可见，但不恒亮**。
+
+    ``phrases`` 显式传入 = 用给定名单（单测 / 离线工具），不走全局加载器。
+    """
+    if not text:
+        return text
+    if phrases is None:
+        phrases = koupi_phrases()
+    if not phrases:
+        return text
     occurrences: list[tuple[int, int]] = []
-    for phrase in KOUPI_LIST:
+    for phrase in phrases:
         idx = 0
         while True:
             pos = text.find(phrase, idx)

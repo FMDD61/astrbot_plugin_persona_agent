@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -34,9 +35,15 @@ MAX_ENTRIES = 20
 #: 头部（兼容旧引用；真身在 examples_default，是**框架文本**）
 HEADER = examples_default.HEADER
 
+#: 旧示例文件名（历史交付名，9-10 月那一版用过）。
+#: ⚠️ 它**排在候选序最前**，两个文件同时在时旧名优先 —— 新的 20 条因此永远不生效。
+LEGACY_EXAMPLES_FILE = "example_dialogs.json"
+
+#: 新示例文件名（`data_out/` 的交付名）。**今后只认这一个。**
+CURRENT_EXAMPLES_FILE = "examples.json"
+
 #: 数据目录里示例语料的**可接受文件名**（按优先序）。
-#: `example_dialogs.json` = 线上历史名；`examples.json` = `data_out/` 的交付名。
-EXAMPLES_FILES: tuple[str, ...] = ("example_dialogs.json", "examples.json")
+EXAMPLES_FILES: tuple[str, ...] = (LEGACY_EXAMPLES_FILE, CURRENT_EXAMPLES_FILE)
 
 
 @dataclass
@@ -151,3 +158,39 @@ def load_examples_block(
     block = (header + "\n" + "\n".join(lines)) if lines else ""
     return block, ExamplesState(
         mtime=mt, block=block, source=source, entries=len(lines), path=used, error=err)
+
+
+def cleanup_legacy_file(data_dir, *, stamp: Optional[str] = None) -> tuple:
+    """轮转时的示例文件换代（**幂等**；用户 2026-09-23 口径：
+    「线上生效的文件直接轮转时更新，仅保留新 examples.json，旧文件进行清理。」）。
+
+    返回 ``(action, detail)``，调用方据此**留痕**（判定在这里、日志在 main ——
+    这样"删不删"这条规则可以脱离 AstrBot 单测）：
+
+    * ``("absent", "")``            旧文件不在 → 什么都不做（绝大多数轮转走这条）；
+    * ``("no_replacement", 新路径)`` 旧文件在但**新文件不在** → **不删旧的**：
+      删了示例块会凭空消失（提示词少一整块是静默失效），比留着旧语料糟得多；
+    * ``("removed", 备份路径)``     备份到 ``<data_dir>/data_out/legacy/`` 后删除；
+    * ``("failed", 原因)``          出错 → **保持不动**（绝不半途而废只删不备份）。
+
+    删除**不需要重启即生效**：示例块每轮由 ``load_examples_block`` **现读**文件
+    （本模块明确不做 mtime 缓存），下一次装配读到的就是新文件。
+    """
+    data_dir = Path(data_dir)
+    legacy = data_dir / LEGACY_EXAMPLES_FILE
+    current = data_dir / CURRENT_EXAMPLES_FILE
+    try:
+        if not legacy.exists():
+            return ("absent", "")
+        if not current.exists():
+            return ("no_replacement", str(current))
+        backup_dir = data_dir / "data_out" / "legacy"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        if not stamp:
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        dest = backup_dir / f"{LEGACY_EXAMPLES_FILE}.{stamp}"
+        dest.write_bytes(legacy.read_bytes())
+        legacy.unlink()
+        return ("removed", str(dest))
+    except OSError as e:
+        return ("failed", f"{type(e).__name__}: {e}")

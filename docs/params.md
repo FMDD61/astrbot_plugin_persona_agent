@@ -51,4 +51,7 @@
   只有拼网格失败（无 Pillow / 解码失败）才回退首帧，并落 warning + `stats.gif_grid_fail` + `diag`。
 - **出站文本 `postprocess`（C15）**：**不再删 emoji 与 @**（那两个函数已删）；仍剥 AI 味短语、
   元信息括号、`[r]`/`[emote:]`/`[poke:]` 标记，并做口癖封顶 / 换行折叠 / 400 字截断。
+  ⚠️ **口癖封顶的名单在仓库外**（2026-09-23 解耦）：`<data_dir>/koupi.json`；`KOUPI_MAX_TOTAL=2`
+  仍是代码里的框架常量。**没有这份文件 → 封顶整步直通**（不裁剪），留痕 `koupi_source=missing`。
+  要量"口癖被裁掉多少"，先确认 `koupi_source=file`，否则统计口径不同（等于没开这项后处理）。
   ⚠️ 统计 emoji·@ 出现率时注意末尾截断会把第 401 位之后的内容一起丢掉。

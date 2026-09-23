@@ -60,9 +60,12 @@ from .services.vision import VisionService, face_name
 from .services.poke import PokeService
 from .services import protocol_compat
 from .services.examples import (
+    CURRENT_EXAMPLES_FILE,
     EXAMPLES_FILES,
+    LEGACY_EXAMPLES_FILE,
     MAX_ENTRIES as EXAMPLES_MAX_ENTRIES,
     ExamplesState,
+    cleanup_legacy_file,
     load_examples_block,
 )
 from .services.memory_store import MemoryStore, MemoryEvent
@@ -182,6 +185,22 @@ class PersonaAgent(Star):
                 f"{len(_pm['superseded_keys'])} 个键（{_pm['superseded_chars']} 字符）"
                 f"已被八段文案取代、不再进提示词：{', '.join(_pm['superseded_keys'])}"
             )
+
+        # C8（2026-09-23 解耦）：口癖名单是**数据不是框架** —— 具体口癖源自风格源的
+        # 真实语言习惯，已移到仓库外 data_out/koupi.json。插件只认 <data_dir>/koupi.json；
+        # 外部没有文件 → cap_koupi() 降级为**直通**（不裁剪）。
+        # 🔴 降级必须可见：这里启动打一次 WARNING；pipeline 每轮把 koupi_source 写进 trace。
+        _ks = text_style.configure_koupi(self.data_dir)
+        if _ks.degraded:
+            _reason = _ks.error or ("数据目录没有 " + text_style.KOUPI_FILE)
+            logger.warning(
+                f"[koupi] ⚠️ 口癖名单不可用（koupi_source={_ks.source}）：{_reason}"
+                f" → cap_koupi() 降级为**直通**（回复整条照发，但口癖不再封顶）。"
+                f"规范副本在仓库外 data_out/{text_style.KOUPI_FILE}，"
+                f"部署时 scp 到 {self.data_dir}/"
+            )
+        else:
+            logger.info(f"[koupi] 名单 {len(_ks.phrases)} 条 source=file 文件={_ks.path}")
 
         rag_cfg = self.config.get("rag", {}) or {}
         self.rag = RagService(self.data_dir)
@@ -2754,6 +2773,35 @@ class PersonaAgent(Star):
         except Exception as e:
             logger.warning(f"[persona_agent] housekeeping failed: {e}")
 
+    def _cleanup_legacy_examples(self) -> None:
+        """轮转时的示例文件换代（**幂等**；用户 2026-09-23 口径）。
+
+        判定在 `services/examples.cleanup_legacy_file`（可脱离 AstrBot 单测），
+        这里只负责**留痕** —— 降级必须可见：没新文件时绝不删旧的，且要说出来。
+
+        ⚠️ loader 的候选序是 [旧名, 新名]，两个文件同时在时**旧名优先** →
+        "新的 20 条"永远不生效，旧名必须在轮转时清掉。
+
+        删除**不需要重启即刻生效**：示例块每轮由 `_examples_block()` **现读**文件
+        （`load_examples_block` 明确不做 mtime 缓存，见其 docstring），
+        下一次装配读到的就是新文件。
+        """
+        action, detail = cleanup_legacy_file(self.data_dir)
+        if action == "removed":
+            logger.info(
+                f"[examples] 旧示例文件已清理：{LEGACY_EXAMPLES_FILE}（备份到 {detail}）→ "
+                f"示例语料今后只认 {CURRENT_EXAMPLES_FILE}（每轮现读，无需重启即生效）"
+            )
+        elif action == "no_replacement":
+            logger.warning(
+                f"[examples] ⚠️ 旧示例文件 {LEGACY_EXAMPLES_FILE} 仍在（它**优先于** "
+                f"{CURRENT_EXAMPLES_FILE}，新语料因此不生效）但新文件不存在 → "
+                f"**不删旧文件**（删了示例块会凭空消失）；"
+                f"请先 scp data_out/{CURRENT_EXAMPLES_FILE} 到 {self.data_dir}/"
+            )
+        elif action == "failed":
+            logger.warning(f"[examples] ⚠️ 清理旧示例文件失败（保持不动）：{detail}")
+
     async def _daily_rotation_job(self) -> None:
         """Cron: rotate every group session that crossed the day boundary and
         generate the daily diary from the archived day."""
@@ -2790,6 +2838,9 @@ class PersonaAgent(Star):
         把组装整段跳过 → 新一天的 §3 停在**昨天**（陈旧比空更糟：空看得见）。
         现在两条路走同一个协程。
         """
+        # 2026-09-23：示例文件换代也挂在**轮转**上（两条轮转路径共用本协程）。
+        # 幂等：旧文件不在就什么都不做；没有新文件时绝不删旧的。
+        self._cleanup_legacy_examples()
         if old_msgs and self._diary_enabled:
             # 🔴 P2（独立审查 2026-09-22）：日记只在**这一刻**生成，错过就整天没有；
             # 而这一刻最可能出问题（进程刚重启、provider 刚注册）。
