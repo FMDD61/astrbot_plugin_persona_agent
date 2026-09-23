@@ -163,7 +163,8 @@ EXTRA_ENV=(FETCH_SOURCES="$BAD1 $WORK/remote.git" FETCH_ATTEMPTS=1)
 run 'multisource-fallback' 0
 check '降级后已重启' "$(restarted)" yes
 check '降级后 HEAD 前进到 v7' "$(grep -c 'v7' "$WORK/plugin/version.txt")" 1
-check '降级：源 1 失败留痕' "$(grep -c '✘ 源 1/2' "$WORK/out.txt")" 1
+check '降级：源 1 失败留痕（尝试行）' "$(grep -c '✘ 源 1/2 第 1/1 次失败' "$WORK/out.txt")" 1
+check '降级：源 1 失败留痕（小结行）' "$(grep -c '✘ 源 1/2 .*失败 ×1' "$WORK/out.txt")" 1
 check '降级：源 2 成功留痕' "$(grep -c '✔ 源 2/2 成功' "$WORK/out.txt")" 1
 check '降级：打印了 ↳ 换源' "$(grep -c '↳ 降级：换下一个源' "$WORK/out.txt")" 1
 check '降级：有醒目告警' "$(grep -c '本次是\*\*降级\*\*拉取' "$WORK/out.txt")" 1
@@ -199,7 +200,7 @@ EXTRA_ENV=(FETCH_SOURCES="$BAD1 $WORK/remote.git" FETCH_ATTEMPTS=1)
 run 'checkonly-multisource' 0 --check-only
 check 'check-only 未重启' "$(restarted)" no
 check 'check-only HEAD 未动' "$(head_of)" "$HEAD_BEFORE_CHECK"
-check 'check-only 列出源 1 失败' "$(grep -c '✘ 源 1/2' "$WORK/out.txt")" 1
+check 'check-only 列出源 1 失败' "$(grep -c '✘ 源 1/2 第 1/1 次失败' "$WORK/out.txt")" 1
 check 'check-only 列出源 2 成功' "$(grep -c '✔ 源 2/2 成功' "$WORK/out.txt")" 1
 check 'check-only 列出了新提交 v8' "$(grep -c 'v8' "$WORK/out.txt")" 1
 
