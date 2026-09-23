@@ -11,6 +11,48 @@
 
 ## [Unreleased]
 
+### Security / Privacy (2026-09-23 · 仓库脱敏：框架化 + 历史清洗)
+
+用户口径：「代码侧与提示词侧全面清理任何个人信息和群数据，所有涉及具体信息的部分
+必须存入仓库外范围，插件只保留框架作用」。**真实数据在仓库外（`data_out/`），
+部署走 `scp`；仓库里只剩框架。**
+
+- **🔴 仓库是 public**（2026-09-23 实测 `api.github.com` → `"private": false`）→
+  真实群号 / 群名 / 成员昵称 / QQ 号 / 真实群聊语句**一律不得进 git**（含历史）。
+- **提示词侧外置**：`services/persona_sections.py` 从"生成物（含真实文案）"改成
+  **框架**（段结构 + 段首标题 + 中性占位 `【框架占位】`）。真实七段文案与 GATE 决策段
+  移到仓库外 `data_out/persona/*.md`，部署时 scp 到 `<plugin_data>/persona/`。
+  GATE 决策段与 `sched` 同族 —— **内容可外置**（`persona/gate_decision.md`），
+  缺文件用占位，**绝不返回空串**（S13：空 system 会让 Gate 失去裁判身份）。
+  `s8_rules` 例外：`[r]` 是**框架协议**（由 `text_style` 解析），不含具体信息，留在代码里。
+- **示例语料外置**：`services/examples_default.py` 只留 `HEADER` + 加载契约，
+  `ENTRIES` **恒空**；真实 20 条在仓库外 `data_out/examples.json`（**自带 HEADER**）。
+  loader 兼容裸数组（历史 `example_dialogs.json`）与 `{header, entries}` 两种形态，
+  并新增 `examples.json` 别名；文件坏掉时 `ExamplesState.error` 留下原因（与"没文件"可区分）。
+- **降级必须可见**（本项目第一病根）：没有外部数据时**不是静默空转** ——
+  `persona_manifest()["placeholder"]` 列出仍在用占位的段，启动日志 `[persona] ⚠️ …`
+  与 `[selfcheck] ⚠️ …`、示例块 `[examples] ⚠️ … source=none`（**WARNING 不是 INFO**）、
+  每轮 trace 的 `persona_placeholder` / `examples_degraded` 都会点名。
+  ⚠️ **占位不算 `missing`**：段没丢，是"文案不该由代码提供" —— 两类降级分开报（B1 的教训）。
+- **生成器改向**：`tools/gen_persona_sections.py` / `tools/gen_examples_default.py`
+  默认写仓库外 `data_out/`，并加**硬闸**：`--out` 落在插件仓库内 → 报错退出
+  （防止有人把真实文案写回 public 仓库）；`--check` 改为校验
+  「仓库外数据 == docs/specs 草案」，数据或草案缺任一 → 报告后放行。
+- **夹具与文档脱敏**：`tests/*` 的真 QQ 号 / 昵称 / 群名 → 中性占位
+  （`成员甲`… / `100000001`…）。⚠️ **占位必须 ≥2 字符** —— 单字会被
+  `kg_stopwords.is_stopword` 的 "len < 2 即停用词" 规则吃掉，把「群内真实梗保留」
+  那批用例打红（第一版占位踩过）。`docs/{services,params,merge-gotchas}.md` 与本文件
+  改写成框架口径：**保留技术结论，去掉身份信息**。
+- **内容指纹改钉仓库外数据**：`tests/examples_frozen.json` 移出仓库
+  （→ `data_out/examples_frozen.json`），新增 `data_out/persona_frozen.json`；
+  单测对**仓库外数据**生效，缺数据时 **skip**（台式机 `git pull` 后不会因此变红）。
+- **git 历史清洗**：`git filter-repo --replace-text`（**不用**已弃用的 `filter-branch`）
+  把敏感串在**全历史**替换为占位，commit message 一并清洗；随后
+  `reflog expire --expire=now --all` + `gc --prune=now` + 强制推送。
+  **协作者与台式机必须重新 clone**（不能 merge）。验收：每个敏感串在工作树、全 ref、
+  `git log -S` 上均零命中（见 `scratch/SCRUB_report.md`）。
+- 测试：920 OK（系统 python 21 skip / `.venv` 0 额外 skip）。
+
 ### Removed / Docs (2026-09-23 · 代码侧收尾清理)
 - **删死代码**（都先 grep 全仓确认零引用）：`image_prep.GIF_INLINE_MAX_BYTES`（C27 后的墓碑）、
   `image_prep.frame_count()`、`vision.VISION_GIF_SYSTEM_PROMPT`、`text_style.strip_emoji()` /
@@ -197,7 +239,7 @@
 - 上线版本 `3994c73`；真机自测台 **41 断言 / 0 失败**；13:02:11 停 → 13:02:12 起新进程。
 - 启动日志实测：人格 **1469 字符**、段 7/8（§3 按设计省略）、段文件物化 9 个、
   旧 19 键（5426 字符）被**点名**取代、`memory digest 已组装：共 0 行，跳过无 digest 的 3 条`。
-- **首次回复** 13:05:56（`at`）：`中午好～成员丙`；`kg_display=False` / `kg_tail=（已禁用：D42 …）` / 无降级标记。
+- **首次回复** 13:05:56（`at`）：`中午好～<别名>`；`kg_display=False` / `kg_tail=（已禁用：D42 …）` / 无降级标记。
 - 会话副作用（如预告）：首条 system 仍是 910 字旧人格，新版以 `［设定更新］…以此为准`（1495 字）追加尾部，02:05 轮转后干净。
 - 09-22 02:05 起 §3 自然补齐；**周层要等 09-28**（09-21 02:10 的周记由旧代码写成、无 digest）。
 
@@ -456,7 +498,7 @@
     （规则B 已证伪；规则A 是错误示例 —— 它教的那条本身就是反面教材）；
   - **`[emote:]` 教学去掉劝退措辞**（「选不中就不发」「没有合适的表情时不要硬写」）——
     选图是 RAG 命中已向量化的表情包描述，属**机制行为**，不由模型把关（C2/D20）；
-  - **任何情况下不回退旧示例句**：旧句（`成员甲`/`成员甲`/规则A/规则B/`口癖丙`）在这份代码里
+  - **任何情况下不回退旧示例句**：旧句（几个旧示例句名 + 规则A/规则B/`口癖丙`）在这份代码里
     **一个字都不存在**；数据目录文件缺失/损坏/无可用条目 → 回落的就是新 20 条。
     新增 `ExamplesState.source`（file / bundled）并在**来源变化时打一行日志** ——
     部署时忘了替换文件，那是唯一能看见的地方；
@@ -771,7 +813,7 @@
   `[110..184]` 全部 `auto_added` 新成员）→ **新块以旧块为前缀**（已验证）。
   取舍：不再有分段标题，但每行的 `[熟人]/[认识]/[新人]` 标签保留，亲疏信息不丢。
 - **澄清一处认知**：`system_prompt_fragments.json` **本就有 `relations` 字段**
-  （手写的关系风格，如 `成员甲: "略带调侃的贴贴，会用'成员甲的小名'等别称打趣对方"`）
+  （手写的关系风格，如 `某成员: "略带调侃的贴贴，会用别称打趣对方"`）
   —— 真正的关系知识在那里且基本不变；`alias_block` 是平铺的名字→QQ 映射。
 - **顺带修正一处我自己的错误陈述**：此前说"Gate 收到的 messages 就是 RP 前缀本身"
   是**错的**。准确说法：Gate 与 RP **共享同一段前缀**，但**尾巴不同** ——
@@ -800,7 +842,7 @@
   报出各臂差异、变多个时 warning；凭据/模型跟随 cmd_config 不硬编码。
 - **实测效果（D3 立即可见）**：Gate 解析失败率 **27~31% → 0%**（S14/S15 修复后），
   Gate 通过率 24.2% → 36.6%。
-- **实测发现（D2 首次实跑）**：去掉**示例块**后输出里出现了 `成员戊` ——
+- **实测发现（D2 首次实跑）**：去掉**示例块**后输出里出现了**场景中不存在的名字** ——
   而该名字**不在场景里**，却是人格提示词中固定被点名的名字（5 个字段）。
   → 示例块可能在**压制提示词里的"名字引力"**（n=1，待确认）。归档于
   `docs/specs/measurements.md §2d`。
@@ -870,11 +912,11 @@
 
 - **接口设计的关键取捨**：`[poke:QQ号]` 要求模型从 185 人名单背出号码 ——
   比"叫出昵称"难得多，而**戳错人是对外可见的社交事故**。实测模型能准确叫出
-  `成员乙`/`成员丙`，故改为 `[poke:名字]`，服务端解析。
+  两个成员的昵称，故改为 `[poke:名字]`，服务端解析。
 - **`StyleProfile.resolve_member_name()` —— 严格优先于宽松**：
   精确匹配 `alias` → 精确匹配 `other_names` → 否则返回 None（**不猜**）。
   🔴 修掉一个既有的静默错配：`resolve_uin_from_name()` 是**首个匹配即返回**，
-  实测真实数据里 `成员壬` 同时属于 `成员壬` 与 `成员癸` → 旧函数会静默选第一个，
+  实测真实数据里**同一个昵称同时属于两个成员** → 旧函数会静默选第一个，
   而这正是"戳错人"的成因。新函数遇到歧义**拒绝**。
 - **`PokeService.decide_proactive()` 硬闸**（任一不过 → 静默跳过戳、正文照发）：
   `proactive_disabled` / `no_target` / `self_poke` / `not_in_pool` / `conflict` /
@@ -1129,7 +1171,7 @@
 - 测试 257 → **287 全绿**（新增 `test_memory_quality.py` 23 例）
 
 ### Fixed (2026-09-13, R2 重构 S1：B-001 引用错位 + B-002 空条目静默)
-- **🔴 B-001 `[r:-N]` 引用目标错位（线上事故 11:45，群 100000001）**：LLM 按**它当时看到的上下文**编号，旧实现 `ContextBuffer.quote_target()` 却在生成结束后对**实时** buffer 求值 —— 生成窗口（5–8s）内每进 1 条消息编号整体偏移 1 位（该群 100–400 条/时 → 错位概率约 1/3–1/2）。修复：新增 `QuoteIndex`（**不可变引用快照**）+ `SessionManager.quote_snapshot()`，在**建上下文之后、发起生成之前**冻结编号基，生成结束后对它求值；`message_id`/`sender_uin` 随条目入 session（内部键 `_mid`/`_uin`，所有对外出口剥离，**绝不进 LLM 请求**）。附带消除次要错位：编号基与 `get_contexts()` **同源同过滤**（旧实现 session 含 assistant 条目而 buffer 不含，且 buffer 含被媒体过滤掉的纯图消息）。新增审计字段 `trace.quote_n/quote_id/quote_resolved/quote_basis/quote_target_alias/quote_target_uin/quote_target_missing` —— 此前 trace **没有** quote 字段，11:45 那次只能靠人工比对 SnowLuma 日志
+- **🔴 B-001 `[r:-N]` 引用目标错位（线上事故 11:45，生产群）**：LLM 按**它当时看到的上下文**编号，旧实现 `ContextBuffer.quote_target()` 却在生成结束后对**实时** buffer 求值 —— 生成窗口（5–8s）内每进 1 条消息编号整体偏移 1 位（该群 100–400 条/时 → 错位概率约 1/3–1/2）。修复：新增 `QuoteIndex`（**不可变引用快照**）+ `SessionManager.quote_snapshot()`，在**建上下文之后、发起生成之前**冻结编号基，生成结束后对它求值；`message_id`/`sender_uin` 随条目入 session（内部键 `_mid`/`_uin`，所有对外出口剥离，**绝不进 LLM 请求**）。附带消除次要错位：编号基与 `get_contexts()` **同源同过滤**（旧实现 session 含 assistant 条目而 buffer 不含，且 buffer 含被媒体过滤掉的纯图消息）。新增审计字段 `trace.quote_n/quote_id/quote_resolved/quote_basis/quote_target_alias/quote_target_uin/quote_target_missing` —— 此前 trace **没有** quote 字段，11:45 那次只能靠人工比对 SnowLuma 日志
 - **⚠️ 顺带修掉一个标记泄漏**：旧代码只在 `quote_id` 非空时剥离 `[r:-N]`，解析失败时会把标记**原样发进群**（线上实际发生过）。现在无论是否解析出目标都剥离
 - **🔴 B-002 空 `content` → LLM 永久 400 → 静默不回复**：唯一收口点 `SessionManager` 过滤空白 content（`get_messages`/`recent`/`quote_entries` 同过滤），正常会话零行为变化；恢复期丢弃计数入 `empty_dropped_on_load()`，运行期 `trace.session_empty_dropped`
 
@@ -1276,7 +1318,7 @@
 - **当前说话人动态行（命名识别修复）**: `_generate_reply` 在 KG 前注入 `【当前说话人】QQ xxx，群内别名「yyy」…` 提示（每说话人恒定、不污染前缀缓存），并要求不臆造他人别名；根治 2026-08-23 实测「叫不上名字/误称成员戌成员戊」类缺口
 - **member_relations 风格源标注**: 小明条目增加 `is_style_source: true`（不影响别名块渲染，系统提示词哈希实测不变，缓存不失效）
 - **换行折叠（postprocess 强制执行 prompt 禁令）**: 回复中的多段换行按标点感知合并为单行（`x\n\ny` → `x，y`），修复 2026-08-23 实测 6/6 回复带换行的系统性违规
-- **member_relations.json 补风格源条目**: `234567 → 小明/小明玛奇朵`（人工格式追加，携 `.bak.20260822` 备份；修正此前机器人臆造他人别名「成员戌/成员戊」称呼的根因）
+- **member_relations.json 补风格源条目**: `<风格源 uin> → <别名>/<别名二>`（人工格式追加，携 `.bak.20260822` 备份；修正此前机器人臆造他人别名「成员戌/成员戊」称呼的根因）
 - **LLM 缓存观测探针 (2026-08 评测用)**: `_generate_reply` 每次生成追加一行 `llm_cache_probe.jsonl`（session 长度 / sys prompt sha256 前缀 / usage 缓存命中 / raw usage），仅观测用途，失败仅 warning 不影响回复
 - **DreamJob (Phase 3)**: 周 cron 记忆巩固与风格漂移报告
   - `_build_member_stats`: 从 MemoryStore 边计算活跃天数/日均互动/连续天数
@@ -1318,8 +1360,8 @@
 ### Changed
 - `system_prompt_fragments.json`: vocabulary 重写 (口癖与术语分离), 新增 group_context / personality
 - `style_profile.py`: `system_prompt()` 增加 group_context / personality key; `_build_alias_block()` 跳过 bot
-- `member_relations.json`: 成员子 / 成员丑 标记为 bot
-- `main.py` `_KOUPI_LIST`: 移除 `成员A`(人名), 新增 `口癖乙`
+- `member_relations.json`: 两个 bot 账号标记为 bot
+- `main.py` `_KOUPI_LIST`: 移除一个人名口癖, 新增 `口癖乙`
 - `DEPLOYMENT_GUIDE.md`: §8 重写为 git pull 工作流 + DreamJob cron + style 文件同步
 - PostgreSQL 图表替代 pure ChromaDB 的存储方案规划
 

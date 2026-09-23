@@ -9,7 +9,7 @@
 - **Square-bracket prefixes `[...]`** mark resource placeholders, not replies. Filter by `messageType`.
 - **Do not trust `chatInfo.type`** — it is `"private"` in this export. Filter on `receiver.type=="group"` + uid.
 - Root JSON: `{ metadata, chatInfo, statistics, senders[], messages[] }`. Use `ijson` path `messages.item`. Never `json.load` whole file.
-- Sender identity: `sender.uin` is a numeric string (e.g. `"100000002"`). Comparing to int silently fails.
-- `senders[]` contains bookkeeping entries (e.g. `uid:"100000001"` is NOT a real user). Don't iterate `senders[]` to find people.
+- Sender identity: `sender.uin` is a numeric string (e.g. `"123456789"`). Comparing to int silently fails.
+- `senders[]` contains bookkeeping entries (e.g. `uid:"<group_id>"` is NOT a real user). Don't iterate `senders[]` to find people.
 - Text in `content.text`; canonical element is `rawMessage.elements[*].textElement.content`. `messageType==2` is plain text.
 - Empty/truncated `content.text` occurs. Treat as skippable.

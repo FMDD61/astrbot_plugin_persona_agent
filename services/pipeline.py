@@ -94,6 +94,7 @@ class PersonaPipeline:
         buffer: Optional[ContextBuffer] = None,
         generate: Optional[GenerateFn] = None,
         examples_block: Optional[Callable[[], str]] = None,
+        examples_state: Optional[Callable[[], object]] = None,
         # S3: 工具语法块（恒定；库空/未教学时为空串 → 不进上下文）
         tool_syntax_block: Optional[Callable[[], str]] = None,
         # S9: 关系图谱块（独立于人格 —— 它增长、人格不增长）
@@ -140,6 +141,9 @@ class PersonaPipeline:
         self.buffer = buffer
         self._generate = generate
         self._examples_block = examples_block
+        #: 示例块状态取值器（main 的 `_examples_state`）——用于 trace 里的
+        #: `examples_degraded`（降级必须可见）。None = 调用方不提供，trace 不写。
+        self._examples_state = examples_state
         self._tool_syntax_block = tool_syntax_block
         self._relations_block = relations_block
         self._system_prompt = system_prompt
@@ -704,6 +708,21 @@ class PersonaPipeline:
                 "mode": _prep.get("mode"),
                 "missing": _prep.get("missing"),
                 "fallback": _prep.get("fallback"),
+            }
+        if isinstance(_prep, dict) and _prep.get("placeholder"):
+            # 2026-09-23 脱敏：仓库只带中性占位，"没 scp 真实文案"是**独立的**降级形态
+            # （不是 missing：段没丢，是文案不该由代码提供）。两者分开报。
+            trace["persona_placeholder"] = {
+                "sections": _prep.get("placeholder"),
+                "chars": _prep.get("placeholder_chars"),
+            }
+        _exs = self._examples_state() if self._examples_state is not None else None
+        if _exs is not None and getattr(_exs, "source", "") != "file":
+            # 示例块为空 / 语料不在数据目录 → 提示词少一整块，必须进 trace
+            trace["examples_degraded"] = {
+                "source": getattr(_exs, "source", ""),
+                "entries": getattr(_exs, "entries", 0),
+                "error": getattr(_exs, "error", ""),
             }
 
         # ---- S2 输入打包重划：把「该回哪句」显式标注出来 ----

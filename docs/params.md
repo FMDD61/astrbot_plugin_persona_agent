@@ -8,7 +8,7 @@
 
 | 键 | 值 |
 |---|---|
-| `test_mode` | 0（生产群 100000001）|
+| `test_mode` | 0（生产群；**群号见线上配置，不写进仓库**）|
 | `active_interjection` | 0（只 @ 才回，不主动插话）|
 | `rag.score_threshold` | **0.8（2026-09-22 用户按观察 0.55→0.7→0.8；0.8 ≈ 只回 @）**（可调，非"生产值"）** —— 用户 2026-09-21：
 「RAG 设定值从来没有固定的生产值……本项目几乎没有可定为长期不变的度量值，
@@ -30,7 +30,7 @@
 ⚠️ 阈值不再写死在代码里 —— `rag.score_threshold` 改了就注入 emotion 的"悬崖"换算。|
 | `*.reasoning_effort` | `low`（**off 会被网关拒**，见下）|
 | `llm.provider_id` | `commandcode/deepseek/deepseek-v4.1-flash` |
-| `privileged_qq` | 100000002 |
+| `privileged_qq` | 见线上配置（**不写进仓库**）|
 
 ## 参数语义（易踩）
 

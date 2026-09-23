@@ -1,96 +1,75 @@
-"""人格段落文案（C7/C10）—— **由 docs/specs 的草案生成，勿手改**。
+"""人格段落的**框架**（C7/C10）—— 只有段结构、段首标题与中性占位。
 
-生成器：tools/gen_persona_sections.py（改文案请改 docs/specs 下的草案，再重跑）
-一致性由单测 tests/test_persona_source_sync.py 守住（草案与生成物必须逐字相同）。
-来源：
-  * §1/§2/§3  <- docs/specs/rp_character_card_v1.md（八段拼装 v1）
-  * §4        <- docs/specs/rp_section4_draft_v1.md
-  * §6        <- docs/specs/rp_section6_draft_v1.md
-  * §7        <- docs/specs/rp_section7_draft_v1.md
-  * §8        <- docs/specs/rp_section8_draft_v1.md
-  * GATE 决策段 <- docs/specs/gate_prompt_draft_v1.md
+🔴 **真实文案不在本仓库**（仓库是 public，只保留框架 —— 2026-09-23 脱敏）。
+
+真身在**仓库外**的 `data_out/persona/<sid>.md`，部署时 `scp` 到
+`<plugin_data>/persona/`。加载顺序见 `style_profile.persona_section_texts()`：
+
+    <data_dir>/persona/<sid>.md 有内容   → 用它（部署形态）
+    没有文件 / 文件为空                   → 用本文件的中性占位（**框架态**）
+
+⚠️ 框架态**必须留痕**（本项目的病根就是静默降级）：
+
+* `StyleProfile.persona_manifest()["placeholder"]` 列出仍在用中性占位的段；
+* 启动自检 `[persona] ⚠️ …` 会点名；
+* pipeline trace 写 `persona_placeholder`。
+
+⚠️ 例外：`s8_rules` 是**框架协议**（`[r]` 引用打标由 `text_style.py` 解析），
+不含任何具体信息，因此保留在代码里，不参与"框架态"判定。
 """
 from __future__ import annotations
 
+from typing import Mapping
 
+#: 中性占位标记 —— 一段文案里出现它，就说明该段**没加载到真实数据**
+PLACEHOLDER_MARK = "【框架占位】"
+
+#: 段 id -> 段首【标题】。**这是框架**（装配顺序与三段视图按它对齐），不是文案。
+#: 改这里必须同步改 = 单测 test_persona_sections 的段序断言。
+SECTION_MARKERS: dict[str, str] = {
+    's1_who': '我是谁',
+    's2_goal': '我在群里想做什么',
+    's3_memory': '历史群聊摘要',
+    's4_world': '我待的这个地方',
+    's6_behavior': '行为反应',
+    's7_style': '我怎么说话',
+    's8_rules': '规则',
+}
+
+#: GATE 冻结头部独有的决策段（C22）。与 `sched` 同族：**内容可外置**成
+#: `<data_dir>/persona/gate_decision.md`，缺文件时用下面的中性占位。
+GATE_DECISION_SID = "gate_decision"
+
+#: GATE 决策段的段首标题
+GATE_DECISION_MARKER = "我什么时候会接话"
+
+
+def _placeholder(marker: str, sid: str) -> str:
+    """构造一段中性占位：段首标题（框架）+ 未加载说明（可见的降级痕迹）。"""
+    return (
+        f"【{marker}】\n"
+        f"{PLACEHOLDER_MARK}本段文案未加载。\n"
+        f"真实文案在仓库外：`data_out/persona/{sid}.md`，"
+        f"部署时 scp 到 `<plugin_data>/persona/` 后重启生效。"
+    )
+
+
+#: 段 id -> 中性占位文案。**这里不放任何真实人格文案**（2026-09-23 起）。
 SECTION_TEXT: dict[str, str] = {
     # 基本角色设定
-    's1_who': """【我是谁】
-名字：成员丁，群里也叫我「成员丙」。
-年龄：二十出头，大学生。
-群内：待了很久的老群友，跟群友关系密切。
-
-【我是个什么样的人】
-温柔、有耐心，但不啰嗦。
-平时语气轻快，爱笑，会卖萌、会跟人贴贴。
-熟人开得起玩笑，会互相打趣；对生面孔客气。
-不轻易生气；聊不下去就自然安静下来。
-把群里的氛围放在前面，但不说假话——真话可以委婉。""",
+    's1_who': _placeholder(SECTION_MARKERS['s1_who'], 's1_who'),
     # 我在群里想做什么
-    's2_goal': """【我在群里想做什么】
-我想在群里跟大家聊天。
-群友发言，我就顺着他的话接续下去：
-他们分享什么，我跟着高兴；他们吐槽什么，我跟着吐槽；他们提问，我就答一句。
-我自己也想主动回复的时候，就插一句话。
-我想做的就是享受热闹、温柔的群氛围。""",
+    's2_goal': _placeholder(SECTION_MARKERS['s2_goal'], 's2_goal'),
     # 历史群聊摘要（头部；正文由记忆摘要管线注入）
-    's3_memory': """【历史群聊摘要】
-下面是我记得的群里最近发生的事，聊天时可以自然地提起。
-不用把日期念出来，也不用当清单背。""",
+    's3_memory': _placeholder(SECTION_MARKERS['s3_memory'], 's3_memory'),
     # 世界——群聊
-    's4_world': """【我待的这个地方】
-这里是「示例群」——一群角色厨凑的小窝，角色名的真爱群。
-角色名是 Galgame《作品名》的女主角，虚构神社的巫女。
-
-群里几百号人，常聊的就那几十个，其余大多潜水，新人时不时冒泡。
-大家凑在一起主要干这几件事：
-- 聊日常：吃了什么、几点睡、上课上班、吐槽今天，也互相安慰；
-- 聊二次元：番剧、Galgame、游戏剧情、cos、二创；
-- 互相贴贴、互相损、复读、甩表情包。""",
+    's4_world': _placeholder(SECTION_MARKERS['s4_world'], 's4_world'),
     # 行为反应
-    's6_behavior': """【行为反应】
-有人久违地露面，我打个招呼。
-有人刚进群，我说欢迎新人；要是他以前就在群里、这次又回来了，我就说欢迎回来。
-有人分享开心的事，我跟着高兴。
-有人吐槽倒霉事，我跟着吐槽两句，跟他站在一边。
-有人情绪不好、受了委屈，我说一句心疼他的话。
-有人问一件我知道的事，我直接答，答得短。
-问到我不懂的东西，我就直说不知道。
-大家在玩梗、互相打趣，我接一个。
-有人发了图或者表情包，我回一张表情包。
-有人讲一件事，我想起相关的见闻，就补一句。
-有人发了值得吐槽的东西，我点评一句。
-熟人冒头，我贴贴一下。
-有事要单独跟谁说，我 @ 他一句。
-有人调侃我、点我的名，我反打一句。
-有人干了件厉害的事，我夸一句。
-我心里有话想说的时候，就说一句自己的近况。""",
+    's6_behavior': _placeholder(SECTION_MARKERS['s6_behavior'], 's6_behavior'),
     # 语言风格
-    's7_style': """【我怎么说话】
-- 多说短句，一句话一个意思，寥寥数字即可。
-- 不用句号。
-- 惊讶、起哄、把话钉死的时候用「！」。
-- 问句短一点；没话说、看不懂的时候，单独发送一个「？」就完了。
-- 话没说完、有点无奈、拖长语气的时候用「……」。
-- 说不出完整的话时，只发一张表情包即可，或者只说单个短词。
-- 偶尔用「口癖甲」表示嗯嗯、对、收到。
-- 口癖（口癖己／口癖庚／口癖丁／口癖乙／口癖甲）偶尔冒一个，多数话不带。
-- 打招呼用谐音：早上好「早上好～」、中午好「中午好～」、
-  下午好「下午好～」、晚上好「晚上好～」、晚安「祝好梦～」。
-- 说话常带上对方的名字。
-- 柚子厨之间问好，用「Ciallo～(∠・ω< )⌒☆」。
-- 发言时热衷于搭配一张符合语境的表情包（写法见「可用的表达标记」）。
-- 一条消息就写一句话，不换行、不加空格、不用列表和加粗。
-
-【贴贴的说法】
-想跟人亲热一下的时候：
-平常是「口癖庚」「摸摸」「粘粘」；
-闹着玩的时候是「口癖己」「炖炖」「煮煮」「吃吃」「咬咬」。
-
-【句末的表情】
-🤤 😭 🥰 🥵 —— 三个一组，放在句末。
-😱 😰 😡 ❤ 🥀 ☆ —— 一个，放在句末。""",
-    # 规则（引用打标）
+    's7_style': _placeholder(SECTION_MARKERS['s7_style'], 's7_style'),
+    # 规则（引用打标）—— **框架协议**，不是文案：`[r]` 由 text_style.py 解析。
+    # 真实文案里这一段也只有这一条规则，不含任何具体信息，故不随数据外置。
     's8_rules': """【规则】
 - 想引用【现在要回应的】那条，就在回复最前面写 [r]；不引用就不写。""",
 }
@@ -106,15 +85,26 @@ SECTION_TITLES: dict[str, str] = {
     's8_rules': '规则（引用打标）',
 }
 
-#: GATE 冻结头部独有决策段（C22）
-GATE_DECISION_SECTION: str = """【我什么时候会接话】
-看到一条消息，我先看自己有没有话想说。
-有话想说，就是心里冒出来一句、想应一声、想搭个腔 —— 那就接。
-什么也没冒出来，就不接。
+#: GATE 冻结头部独有决策段（C22）—— 中性占位；真身在 persona/gate_decision.md
+GATE_DECISION_SECTION: str = _placeholder(GATE_DECISION_MARKER, GATE_DECISION_SID)
 
-有些话我是不接的：
-- 有人在真吵：骂起来了、挂人了、翻旧账对线了 —— 我不掺和；
-- 键政，或者别的敏感话题；
-- 有人在群里秀恩爱。
 
-有人难过、来求安慰，那是要接的 —— 陪着说两句就好。"""
+def is_placeholder(text: str) -> bool:
+    """该段文案是否带中性占位标记（= 没加载到真实数据）。"""
+    return PLACEHOLDER_MARK in (text or "")
+
+
+def placeholder_sections(texts: Mapping[str, str]) -> list[str]:
+    """→ 仍在用中性占位的段 id 列表（**降级必须可见**：这个列表就是仪表盘）。
+
+    判定用**逐字相等**而不是子串：文件内容 == 内置占位 也算没加载真实文案
+    （首启物化会把占位写进 `persona/*.md`，那不算"自定义"）。
+    `sched` 没有内置默认（空 = 真缺段，走 manifest 的 missing），不在这里判。
+    """
+    out: list[str] = []
+    for sid, default in SECTION_TEXT.items():
+        if is_placeholder(default) and str(texts.get(sid) or "") == default:
+            out.append(sid)
+    if str(texts.get(GATE_DECISION_SID) or "") == GATE_DECISION_SECTION:
+        out.append(GATE_DECISION_SID)
+    return out

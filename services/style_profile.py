@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import NamedTuple, Optional
 
 from . import persona as persona_mod
-from .persona_sections import SECTION_TEXT
+from .persona_sections import GATE_DECISION_SECTION, GATE_DECISION_SID, SECTION_TEXT
 
 _FILES = (
     "my_style_profile.json",
@@ -99,11 +99,16 @@ _PERSONA_README = """# 人格段文件（C10）
 | `s6_behavior.md` | §6 行为反应 | ✅ | ❌ |
 | `s7_style.md`    | §7 语言风格 | ✅ | ❌ |
 | `s8_rules.md`    | §8 规则（引用打标）| ✅ | ❌ |
+| `gate_decision.md` | GATE 决策段（C22）| ❌ | ✅ |
 
-Gate 的冻结头部 = §1 + §2 + §4 ＋ 插件内置的 GATE 决策段（`services/persona_sections.py`）。
+Gate 的冻结头部 = §1 + §2 + §4 ＋ `gate_decision.md`（缺文件时用插件内置的中性占位）。
+
+🔴 **仓库里没有真实人格文案**（2026-09-23 脱敏）：插件只带**中性占位**。
+真实文案在仓库外的 `data_out/persona/`，部署时 scp 到本目录。
+没 scp 就只剩占位 —— 启动日志 `[persona] ⚠️ …` 与 `persona_manifest()["placeholder"]` 会点名。
 
 改完保存即生效（每次调用现读，无缓存）。启动日志里有装配清单（`[persona] …`），
-能看到哪些段来自文件、哪些来自默认。
+能看到哪些段来自文件、哪些仍是占位。
 """
 
 
@@ -171,7 +176,7 @@ class StyleProfile:
 
         ## 为什么单独收口（S12，2026-09-14）
 
-        成员表里有 **2 个 bot 账号混在真人中间**（成员子、成员丑），原先靠
+        成员表里混着 **bot 账号**（不是真人群友），原先靠
         `m.get("notes") == "bot"` 排除。但 `notes` 要**让给"群友描述"**
         （LLM 生成 + 人工可改），所以标记迁到 `kind`。
 
@@ -322,11 +327,16 @@ class StyleProfile:
             raw = self._read_section_file(sid)
             if not raw:
                 out[sid] = "missing"
-            elif sid == "sched":
+                continue
+            if sid == GATE_DECISION_SID:
+                default = GATE_DECISION_SECTION
+            else:
+                default = SECTION_TEXT.get(sid)
+            if default is None:
                 # sched 没有内置默认 → 有内容就是自定义
                 out[sid] = "custom"
             else:
-                out[sid] = "default" if raw == SECTION_TEXT[sid].strip() else "custom"
+                out[sid] = "default" if raw == default.strip() else "custom"
         return out
 
     # ⚠️ **这里刻意不做 mtime 缓存**（独立核验 N7 的教训）：
@@ -348,6 +358,11 @@ class StyleProfile:
             texts[sid] = self._read_section_file(sid) or default
         # sched：文件 > 旧人格文件的 schedule 键（> 无）
         texts["sched"] = self._read_section_file("sched") or self._legacy_schedule()
+        # GATE 决策段（C22）：与 sched 同族 —— 真实文案已外置到
+        # <data_dir>/persona/gate_decision.md（2026-09-23 脱敏），
+        # 缺文件时用内置中性占位（**绝不返回空串**，S13）。
+        texts[GATE_DECISION_SID] = (
+            self._read_section_file(GATE_DECISION_SID) or GATE_DECISION_SECTION)
         return texts
 
     def _read_section_file(self, sid: str) -> str:
@@ -380,7 +395,9 @@ class StyleProfile:
             # N11：全部失败也要留痕 —— 否则"物化没做成"与"无需物化"不可区分
             self.last_materialize_error = f"{type(e).__name__}: {e}"
             return created
-        for sid, default in SECTION_TEXT.items():
+        # 段文件 + GATE 决策段（两者都是"内容可外置"的段，同一套物化规则）
+        for sid, default in list(SECTION_TEXT.items()) + [
+                (GATE_DECISION_SID, GATE_DECISION_SECTION)]:
             path = self._persona_path(sid)
             if path.exists():
                 continue
@@ -541,6 +558,7 @@ class StyleProfile:
                          "chars": {}, "assembled_chars": len(self._legacy_system_prompt()),
                          "overridden": [], "files": {}, "memory_layers": {},
                          "memory_error": "", "materialize_error": "",
+                         "placeholder": [], "placeholder_chars": 0,
                          "note": "legacy 装配：只读旧键元组，persona/ 段文件不参与"})
             return base
         texts = self.persona_section_texts() if texts is None else texts
@@ -558,6 +576,12 @@ class StyleProfile:
         base["memory_layers"] = {k: len(v) for k, v in self.memory_layers().items() if v}
         base["memory_error"] = getattr(self, "last_memory_error", "")
         base["materialize_error"] = getattr(self, "last_materialize_error", "")
+        # 🔴 2026-09-23 脱敏：仓库不再带真实人格文案 → 「仍在用中性占位」是一种
+        # **独立的降级形态**（不是 missing：段没丢，是不该由代码提供的文案没数据）。
+        # 必须与 missing 分开报，否则两类失效混成一个信号（B1 的老教训）。
+        base["placeholder"] = persona_mod.placeholder_sections(texts)
+        base["placeholder_chars"] = sum(
+            len(str(texts.get(sid) or "")) for sid in base["placeholder"])
         return base
 
     def relations_lines(self) -> list[tuple[str, str]]:
@@ -756,12 +780,12 @@ class StyleProfile:
         ## 为什么需要（S7 拍一拍）
 
         `[poke:QQ号]` 要求模型从 185 人名单里背出正确号码 —— 比"叫出昵称"难得多，
-        而**戳错人是对外可见的社交事故**。实测模型能准确叫出 `成员乙`/`成员丙`/
-        `成员午`/`成员巳`，所以改成 `[poke:名字]`，由服务端解析。
+        而**戳错人是对外可见的社交事故**。实测模型能准确叫出**别名**
+        （群里互相称呼的那几个字），所以改成 `[poke:名字]`，由服务端解析。
 
         ## 严格优先于宽松（用户 2026-09-14 拍板）
 
-        池子里有大量互含简称（`成员甲`/`成员甲`、`成员乙`/`成员乙的小名`/`成员乙的昵称`）。
+        池子里有大量互含简称（`某某`/`某某某`、`阿甲`/`小甲`）。
         解析规则：**精确匹配** `alias` → 精确匹配 `other_names` → 都不唯一/都没有
         **即返回 None**。不猜、不做模糊匹配。代价是"模型用了未收录的昵称"时戳不出去，
         这个代价可接受；戳错人的代价不可接受。

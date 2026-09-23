@@ -19,6 +19,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from services import persona as P  # noqa: E402
+from services.persona_sections import PLACEHOLDER_MARK  # noqa: E402
 from services.style_profile import StyleProfile  # noqa: E402
 
 
@@ -86,9 +87,9 @@ class TestSectionOverrides(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             sp = _mk(td, sections={"s1_who": "【自定义】我是测试人格"})
             self.assertIn("我是测试人格", sp.system_prompt())
-            self.assertNotIn("成员丁", sp.system_prompt())
+            self.assertNotIn("persona/s1_who.md", sp.system_prompt())
             os.remove(os.path.join(td, "persona", "s1_who.md"))
-            self.assertIn("成员丁", sp.system_prompt(), "删文件应回到内置默认")
+            self.assertIn("persona/s1_who.md", sp.system_prompt(), "删文件应回到内置占位")
 
     def test_override_is_hot_reloaded(self):
         with tempfile.TemporaryDirectory() as td:
@@ -136,11 +137,11 @@ class TestMemorySection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             sp = _mk(td)
             with open(os.path.join(td, "memory_digest.json"), "w", encoding="utf-8") as f:
-                json.dump({"layers": {"recent_days": ["09-17 成员戊拔智齿"]}}, f,
+                json.dump({"layers": {"recent_days": ["09-17 某成员去拔智齿"]}}, f,
                           ensure_ascii=False)
             card = sp.system_prompt()
             self.assertIn("【历史群聊摘要】", card)
-            self.assertIn("- 09-17 成员戊拔智齿", card)
+            self.assertIn("- 09-17 某成员去拔智齿", card)
 
     def test_no_digest_means_section_absent(self):
         with tempfile.TemporaryDirectory() as td:
@@ -450,45 +451,116 @@ class TestReviewRound1Fixes(unittest.TestCase):
             self.assertEqual(sp.persona_manifest()["assembled_chars"], len(prompt))
 
 
-class TestGeneratedContentFrozen(unittest.TestCase):
-    """生成物的**内容指纹**（不依赖 docs/specs 的一致性闸）。
+class TestFrameworkIsPlaceholders(unittest.TestCase):
+    """🔴 2026-09-23 脱敏的**核心不变量**：代码里没有人格文案，只有中性占位。
 
-    为什么还要这一层：`test_persona_source_sync` 需要 `docs/specs/`，而**台式机上没有**
-    （设计文档在仓库外）→ 那个闸在生产机会 **skip**，「生成物 == 草案」就没有任何保障。
-    这里把各段内容的 sha256 前 12 位冻住：
-
-    * 有人手改 `services/persona_sections.py` → 立刻红；
-    * 草案改了、重跑生成器 → 这里也红 → **强制把改动显式更新进来**（改动可见，不静默）。
-
-    更新方式：跑 `python3 tools/gen_persona_sections.py`，再把本表按新哈希改掉。
+    真身在仓库外的 `data_out/persona/`（见 `TestExternalPersonaFrozen`）。
     """
 
-    #: 段 id -> sha256(utf-8)[:12]
-    FROZEN = {
-        "s1_who": "7a796a98f192",
-        "s2_goal": "277a8fc6c1cf",
-        "s3_memory": "921d9fe18659",
-        "s4_world": "6aced9766a27",
-        "s6_behavior": "1c347675e0a5",
-        "s7_style": "ad9a5b1bb9b0",
-        "s8_rules": "ecc9d2ffe30a",
-        "__gate__": "0b103a96273f",
-    }
+    def test_builtin_defaults_carry_placeholder_mark(self):
+        from services.persona_sections import (
+            GATE_DECISION_SECTION, SECTION_TEXT, is_placeholder)
+        for sid in ("s1_who", "s2_goal", "s3_memory", "s4_world",
+                    "s6_behavior", "s7_style"):
+            self.assertTrue(is_placeholder(SECTION_TEXT[sid]),
+                            f"{sid} 必须是中性占位（真实文案在仓库外）")
+        self.assertTrue(is_placeholder(GATE_DECISION_SECTION))
+        # s8 是**框架协议**（[r] 由 text_style 解析），不含具体信息，故意留在代码里
+        self.assertFalse(is_placeholder(SECTION_TEXT["s8_rules"]))
+
+    def test_placeholder_sections_is_the_dashboard(self):
+        """降级必须可见：`placeholder_sections()` 就是那块仪表盘。"""
+        from services.persona_sections import (
+            GATE_DECISION_SECTION, SECTION_TEXT, placeholder_sections)
+        texts = dict(SECTION_TEXT)
+        texts["gate_decision"] = GATE_DECISION_SECTION
+        got = placeholder_sections(texts)
+        self.assertIn("s1_who", got)
+        self.assertIn("gate_decision", got)
+        self.assertNotIn("s8_rules", got, "框架协议段不算占位")
+        # 换成真实文案后必须从名单里消失
+        texts["s1_who"] = "REAL_S1"
+        self.assertNotIn("s1_who", placeholder_sections(texts))
+
+    def test_manifest_reports_placeholder(self):
+        """启动自检/trace 读的就是 manifest 的 placeholder 字段。"""
+        with tempfile.TemporaryDirectory() as td:
+            sp = _mk(td)
+            m = sp.persona_manifest()
+            self.assertIn("placeholder", m)
+            self.assertIn("s1_who", m["placeholder"])
+            self.assertGreater(m["placeholder_chars"], 0)
+            self.assertEqual(m["missing"], ["sched"],
+                             "sched 无内置默认才算真缺段；占位段不是 missing")
+            # 给了段文件就不再是占位
+            sp2 = _mk(td, sections={"s1_who": "REAL_S1"})
+            self.assertNotIn("s1_who", sp2.persona_manifest()["placeholder"])
+
+    def test_gate_decision_comes_from_data_dir(self):
+        """GATE 决策段与 sched 同族：数据目录有文件就用文件。"""
+        with tempfile.TemporaryDirectory() as td:
+            sp = _mk(td, sections={"gate_decision": "【我什么时候会接话】\n只在想说话时接。"})
+            head = sp.gate_system_prompt()
+            self.assertIn("只在想说话时接", head)
+            self.assertNotIn("persona/gate_decision.md", head)
+            self.assertEqual(sp.gate_system_prompt(), head)
+
+    def test_legacy_view_reports_empty_placeholder(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = StyleProfile(td, sections_mode="legacy")
+            self.assertEqual(sp.persona_manifest()["placeholder"], [])
+
+
+#: 仓库外规范数据目录（开发机才有；台式机 `git pull` 后不存在 → skip）
+DATA_OUT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data_out"))
+
+
+@unittest.skipUnless(os.path.isdir(os.path.join(DATA_OUT, "persona")),
+                     "仓库外人格文案不存在（非开发机）")
+class TestExternalPersonaFrozen(unittest.TestCase):
+    """仓库外文案的**内容指纹**（不依赖 docs/specs 的一致性闸）。
+
+    为什么还要这一层：`test_persona_source_sync` 需要 `docs/specs/` 与 `data_out/`，
+    两者都不在台式机上 → 那个闸在生产机会 **skip**，「仓库外数据 == 草案」就没有任何保障。
+    这里把各段内容的 sha256 前 12 位冻在 `data_out/persona_frozen.json`：
+
+    * 有人手改 `data_out/persona/*.md` → 立刻红；
+    * 草案改了、重跑生成器 → 这里也红 → **强制把改动显式更新进来**（改动可见，不静默）。
+
+    更新方式：跑 `python3 tools/gen_persona_sections.py`（会一并刷新 `persona_frozen.json`）。
+    """
+
+    def _frozen(self) -> dict:
+        with open(os.path.join(DATA_OUT, "persona_frozen.json"), encoding="utf-8") as f:
+            return json.load(f)["sha256_12"]
+
+    def _texts(self) -> dict:
+        out = {}
+        for sid in ("s1_who", "s2_goal", "s3_memory", "s4_world",
+                    "s6_behavior", "s7_style", "s8_rules"):
+            path = os.path.join(DATA_OUT, "persona", f"{sid}.md")
+            self.assertTrue(os.path.isfile(path), f"仓库外缺段文件：{path}")
+            with open(path, encoding="utf-8") as f:
+                out[sid] = f.read().strip()
+        return out
 
     def test_section_texts_match_frozen_hashes(self):
         import hashlib
-        from services.persona_sections import GATE_DECISION_SECTION, SECTION_TEXT
         actual = {sid: hashlib.sha256(t.encode("utf-8")).hexdigest()[:12]
-                  for sid, t in SECTION_TEXT.items()}
-        actual["__gate__"] = hashlib.sha256(
-            GATE_DECISION_SECTION.encode("utf-8")).hexdigest()[:12]
-        self.assertEqual(actual, self.FROZEN,
-                         "人格文案变了：若是有意改的，重跑生成器并更新本表")
+                  for sid, t in self._texts().items()}
+        for sid, want in self._frozen().items():
+            if sid == "__gate__":
+                continue
+            self.assertEqual(actual[sid], want,
+                             f"{sid} 的仓库外文案变了：若是有意改的，重跑生成器并更新指纹")
 
     def test_every_section_is_non_empty_and_titled(self):
-        from services.persona_sections import GATE_DECISION_SECTION, SECTION_TEXT
-        self.assertEqual(len(SECTION_TEXT), 7)
-        for sid, text in SECTION_TEXT.items():
+        texts = self._texts()
+        self.assertEqual(len(texts), 7)
+        for sid, text in texts.items():
             self.assertTrue(text.strip(), f"{sid} 是空的")
             self.assertTrue(text.lstrip().startswith("【"), f"{sid} 缺少段标题")
-        self.assertTrue(GATE_DECISION_SECTION.lstrip().startswith("【"))
+
+
+if __name__ == "__main__":
+    unittest.main()

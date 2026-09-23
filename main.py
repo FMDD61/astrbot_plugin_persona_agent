@@ -60,6 +60,7 @@ from .services.vision import VisionService, face_name
 from .services.poke import PokeService
 from .services import protocol_compat
 from .services.examples import (
+    EXAMPLES_FILES,
     MAX_ENTRIES as EXAMPLES_MAX_ENTRIES,
     ExamplesState,
     load_examples_block,
@@ -160,6 +161,15 @@ class PersonaAgent(Star):
         )
         if _pm.get("materialize_error"):
             logger.warning(f"[persona] ⚠️ 段文件物化失败：{_pm['materialize_error']}")
+        if _pm.get("placeholder"):
+            # 🔴 2026-09-23 脱敏：仓库只带中性占位，真实人格文案在仓库外。
+            # 「没 scp 数据」= 人格提示词是一堆占位 —— 这是最贵的一种静默失效，必须点名。
+            logger.warning(
+                f"[persona] ⚠️ {len(_pm['placeholder'])} 个段仍是**框架占位**"
+                f"（{_pm['placeholder_chars']} 字符）: {', '.join(_pm['placeholder'])} "
+                f"→ 真实文案在仓库外 data_out/persona/，部署时 scp 到 "
+                f"{self.style.persona_dir()}/（段文件存在即覆盖）"
+            )
         if _pm.get("memory_error"):
             logger.warning(
                 f"[persona] ⚠️ memory_digest.json 读不出来：{_pm['memory_error']} "
@@ -472,6 +482,7 @@ class PersonaAgent(Star):
             buffer=self.buffer,
             generate=self._pipeline_generate,
             examples_block=self._examples_block,
+            examples_state=lambda: self._examples_state,
             tool_syntax_block=self._tool_syntax_block,
             relations_block=(self.style.relations_block if self.style is not None else None),
             system_prompt=(self.style.system_prompt if self.style is not None else None),
@@ -1561,8 +1572,16 @@ class PersonaAgent(Star):
                     pm = self.style.persona_manifest()
                     logger.info(
                         f"[persona] 段清单 used={pm['used']} missing={pm['missing']} "
-                        f"file_override={pm['overridden']}"
+                        f"file_override={pm['overridden']} 框架占位={pm['placeholder'] or '无'}"
                     )
+                    # 2026-09-23 脱敏：占位不是"段丢了"（missing），是"文案没 scp 过来"。
+                    # 两类分开报 —— 合成一个信号就答不出该去补什么。
+                    if pm["placeholder"]:
+                        logger.warning(
+                            f"[selfcheck] ⚠️ 人格段仍用框架占位：{pm['placeholder']} "
+                            f"→ scp data_out/persona/*.md 到 "
+                            f"{self.style.persona_dir()}/"
+                        )
                     # 只对**真丢失**告警。`omitted`（按设计省略，如 C4 落地前的
                     # §3）不算降级 —— 否则降级信号从部署当天起恒亮（独立核验 B1）。
                     if pm["missing"]:
@@ -1766,7 +1785,7 @@ class PersonaAgent(Star):
 
         拼成**一条** system 消息，让模型一眼看到「该回哪句、对谁、什么状态」：
 
-            【现在要回应的】成员丙：你好！（@ 了你）
+            【现在要回应的】甲：在吗（@ 了你）
             ［图片］一只橘猫趴在键盘上，表情嫌弃
             【当下】下午，心情轻快
 
@@ -2147,10 +2166,12 @@ class PersonaAgent(Star):
 
     @staticmethod
     def _group_id_from_umo(umo: Optional[str]) -> str:
-        """从 unified_msg_origin 里取群号：'aiocqhttp:GroupMessage:100000001'。
+        """从 unified_msg_origin 里取群号：'aiocqhttp:GroupMessage:<group_id>'。
 
-        PrivateMessage 形如 'aiocqhttp:FriendMessage:100000002' → 返回空字符串
+        PrivateMessage 形如 'aiocqhttp:FriendMessage:<uin>' → 返回空字符串
         （私聊不属目标群，不落探针）。
+
+        ⚠️ 这里**只写形态，不写真实群号**（仓库是 public，2026-09-23 脱敏）。
         """
         parts = str(umo or "").split(":")
         if len(parts) >= 3 and parts[1] == "GroupMessage":
@@ -2254,12 +2275,14 @@ class PersonaAgent(Star):
             self._vision_resolving = False
 
     def _examples_block(self) -> str:
-        """G14/C1: 示例块（热重载；数据目录文件优先，缺失回落**内置新 20 条**）。
+        """G14/C1: 示例块（热重载；**语料全部来自数据目录**）。
 
-        ⚠️ 用户 2026-09-20 定：**任何情况下都不回退到旧示例句** ——
-        旧句在代码里一个字都不存在，缺失时回落的就是新 20 条。
-        `source` 变了就打一行日志（用了文件还是内置、几条）——
-        部署时忘了替换文件，这里是唯一能看见的地方。
+        ⚠️ 2026-09-23 脱敏：示例语料源自真实群聊语句，已整批移出仓库
+        （仓库是 public）→ 代码里**没有内置语料**。忘了 scp 迁移，
+        后果是"没有示例块"，不是"回落到某个默认值"。
+        ``source="none"`` 就是这种形态，**必须打 WARNING**（不是 INFO）：
+        它是"提示词少了一整块、模型只能裸奔"的可观测点。
+        `source` 变了就打一行日志（用了哪个文件、几条）。
         """
         try:
             cfg = self.config.get("examples", {}) or {}
@@ -2274,13 +2297,22 @@ class PersonaAgent(Star):
             _prev = self._examples_state
             if getattr(_prev, "source", "") != state.source or \
                     getattr(_prev, "entries", 0) != state.entries:
-                logger.info(
-                    f"[examples] 示例块来源={state.source} 条数={state.entries} "
-                    f"（file=数据目录 example_dialogs.json；bundled=内置新 20 条）"
-                )
+                if state.source == "none":
+                    logger.warning(
+                        f"[examples] ⚠️ 示例块为空（source=none）：数据目录没有可用的 "
+                        f"{'/'.join(EXAMPLES_FILES)}（{state.error or '文件不存在'}）"
+                        f"→ 提示词里不会有示例块。真实语料在仓库外 data_out/examples.json，"
+                        f"部署时 scp 到 {self.data_dir}/"
+                    )
+                else:
+                    logger.info(
+                        f"[examples] 示例块来源={state.source} 条数={state.entries} "
+                        f"文件={state.path or '（内置）'}"
+                    )
             self._examples_state = state
             return block
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[examples] ⚠️ 示例块装配失败：{type(e).__name__}: {e}")
             return ""
 
     def _temperature_for(self, trigger: str) -> Optional[float]:

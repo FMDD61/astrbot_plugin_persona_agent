@@ -34,7 +34,20 @@ from __future__ import annotations
 
 from typing import Iterable, Mapping, Optional, Sequence
 
-from .persona_sections import GATE_DECISION_SECTION, SECTION_TEXT, SECTION_TITLES
+from .persona_sections import (
+    GATE_DECISION_SECTION,
+    GATE_DECISION_SID,
+    SECTION_TEXT,
+    SECTION_TITLES,
+    placeholder_sections,
+)
+
+__all__ = [
+    "ALL_SECTIONS", "GATE_DECISION_SECTION", "GATE_DECISION_SID", "GATE_ORDER",
+    "MEMORY_LAYERS", "OPTIONAL_WHEN_EMPTY", "RP_ORDER", "SUMMARY_ORDER",
+    "compose", "gate_head", "manifest", "placeholder_sections",
+    "render_memory_block", "section_title", "summary_head",
+]
 
 #: RP 角色卡段序（冻结头部）
 RP_ORDER: tuple[str, ...] = (
@@ -62,8 +75,9 @@ MEMORY_LAYERS: tuple[tuple[str, str], ...] = (
     ("older", "更早"),
 )
 
-#: 全部段 id（含无内置默认的 `sched`）
-ALL_SECTIONS: tuple[str, ...] = tuple(SECTION_TEXT.keys()) + ("sched",)
+#: 全部段 id（含两个**内容可外置**的段：无内置默认的 `sched`、
+#: 以及 GATE 决策段 `gate_decision` —— 两者都从 `<data_dir>/persona/<sid>.md` 现读）
+ALL_SECTIONS: tuple[str, ...] = tuple(SECTION_TEXT.keys()) + ("sched", GATE_DECISION_SID)
 
 #: **内容为空时按设计整段省略**的段（不算降级）。
 #: §4.4：没有内容的层整段不出现 —— 首月只有日层时不留空标题；全空时 §3 整段省略。
@@ -76,6 +90,8 @@ def section_title(sid: str) -> str:
     """段的中文标题（**只用于日志/自检，不进提示词** —— D26）。"""
     if sid == "sched":
         return "作息（沿用 system_prompt_fragments.json 的 schedule 键）"
+    if sid == GATE_DECISION_SID:
+        return "GATE 决策段（真身在 persona/gate_decision.md）"
     return SECTION_TITLES.get(sid, sid)
 
 
@@ -84,7 +100,7 @@ def render_memory_block(layers: Optional[Mapping[str, Iterable[str]]]) -> str:
 
     ```
     这几天：
-    - 09-17 成员戊拔智齿前紧张到肚子疼，大家轮流摸摸；成员乙饿得嗷嗷叫
+    - 09-17 （由记忆摘要管线生成的一句话）
     前几周：
     - 2026-W37 ……
     ```
@@ -136,6 +152,10 @@ def compose(
 def gate_head(texts: Mapping[str, str], meta: Optional[dict] = None) -> str:
     """Gate 冻结头部 = §1+§2+§4 ＋ GATE 独有决策段（C22）。
 
+    决策段优先取 `texts["gate_decision"]`（= `<data_dir>/persona/gate_decision.md`，
+    2026-09-23 起真实文案在仓库外），取不到才用内置中性占位 —— **绝不返回空串**
+    （空 system 会让模型失去裁判身份，S13）。
+
     ``meta``（可选，回传诊断信息）：``identity_empty`` = §1/§2/§4 一段都没装上；
     ``used_identity`` = 实际装上的身份段。调用方据此决定要不要退回裁判 system
     —— 只剩决策段时，Gate 就没有"我"了，而 C22 的前提正是这三段。
@@ -144,7 +164,10 @@ def gate_head(texts: Mapping[str, str], meta: Optional[dict] = None) -> str:
     if meta is not None:
         meta["identity_empty"] = not base.strip()
         meta["used_identity"] = list(used)
-    parts = [p for p in (base, GATE_DECISION_SECTION.strip()) if p]
+    decision = str(texts.get(GATE_DECISION_SID) or "").strip() or GATE_DECISION_SECTION.strip()
+    if meta is not None:
+        meta["decision_placeholder"] = not str(texts.get(GATE_DECISION_SID) or "").strip()
+    parts = [p for p in (base, decision) if p]
     return "\n\n".join(parts)
 
 

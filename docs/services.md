@@ -44,9 +44,9 @@
 - **Group isolation (A7)**: interjection 用量状态按群隔离 + `usages/<gid>.json` 持久化（原子写 + mtime 热重载）；topic_bank 已发归档按群隔离；日志按群分目录 `logs/<gid>/`；**poke 刻意跨群共享**（QQ 拍一拍按目标用户限，非按群）。
 - **trace (A7)**: 每次处理落全链路 trace_log（含 RAG 命中原文/决策链/生成文本）→ 评估 RAG/BGE 价值与污染的数据依据；`trace.enabled=1` 默认开；工具 `tools/trace_view.py` 渲染。
 - **Examples block (G14, S2 修正位置)**: 固定示例对话**插入 session 之前**（内容恒定 → 进入缓存稳定前缀）；原先在会话与 KG 之间，但 session 每轮变长 → 恒定内容落在失效区等于每轮白付。按文件 mtime_ns 热重载，A/B = 改名即切换。
-- **test_mode**: `_conf_schema.json` has `test_mode` (0/1) + `test_group_id`. `_is_target_group` switches accordingly. **2026-08-25 已切 0（生产 100000001 接管）**。
+- **test_mode**: `_conf_schema.json` has `test_mode` (0/1) + `test_group_id`. `_is_target_group` switches accordingly. **2026-08-25 已切 0（生产群接管；群号见线上配置，不写进仓库）**。
 - **G16 插话（2026-09-13 状态：已关）**: `active_interjection=0`（只 @ 才回，不主动插话）；`rag.score_threshold=0.60`（S2：实测非 @ RAG top1 p50=0.652 压在中位数上；**该值只是 Gate 调用量的音量阀，不做"该不该回"的判断**）；决策日志每个 entry 的 extra 落盘 `top_rag_score` + `emotion_multiplier`（调阈数据驱动）。
 - **G11 poke（2026-09-12 已开）**: `poke.enabled=1`，`cooldown_sec=300`；回戳走 `group_poke` **action 通道**（消息段通道在部分协议端会被静默丢弃，见 `services/protocol_compat.py`）；真机实测通过（`poke_log.jsonl`）。
 - **G12 topic_bank**: `topic_bank.enabled` 仍为 0；`topic_bank.json` 建议稿在 data_out/。
-- **G13/G17 已开**: `summary.{weekly_enabled,monthly_enabled}=1`（周一 02:10 / 月首 02:15 cron，产物 jsonl + 推 bind_dream 私聊）；`dream.enabled=1`（周一 03:00 cron）；`dream_binding.json` 预绑定 `aiocqhttp:FriendMessage:100000002`。
+- **G13/G17 已开**: `summary.{weekly_enabled,monthly_enabled}=1`（周一 02:10 / 月首 02:15 cron，产物 jsonl + 推 bind_dream 私聊）；`dream.enabled=1`（周一 03:00 cron）；`dream_binding.json` 预绑定 `aiocqhttp:FriendMessage:<uin>`（uin 见线上配置）。
 - **Memory layer (#2)**: 3-layer design (Hermes/Cognee/Dreaming inspired). 已落地：KGProvider (retrieval) → MemoryStore (SQLite ADD-only + FTS5 BM25) → `services/dream.py`（周 cron，**已与原 DreamJob 分离**：做梦不负责熟悉度汇报）。Postgres 图+pgvector 仍是远期规划，未实现。

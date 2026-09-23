@@ -12,7 +12,7 @@
       "sections_mode": {
         "type": "string",
         "description": "人格装配模式",
-        "hint": "v2（默认）=按 <data_dir>/persona/*.md 现场组装八段角色卡（缺文件用内置默认）；legacy=旧的 system_prompt_fragments.json 键元组装配。改回 legacy 可整体回退提示词 v2 的人格改写（B-037）。",
+        "hint": "v2（默认）=按 <data_dir>/persona/*.md 现场组装八段角色卡（缺文件用**中性占位** —— 真实文案在仓库外 data_out/persona/，部署时 scp 到本目录）；legacy=旧的 system_prompt_fragments.json 键元组装配。改回 legacy 可整体回退提示词 v2 的人格改写（B-037）。",
         "default": "v2"
       }
     }
@@ -290,7 +290,7 @@
         "type": "int",
         "description": "最多注入示例条数",
         "default": 20,
-        "hint": "C1：不锁死在 12（用户：「13 条不一定够，甚至可能会增加」）。示例文案真身在 docs/specs/rp_examples_draft_v1.md，生成物 services/examples_default.py；数据目录 example_dialogs.json 存在且可解析时优先用它，否则回落内置 20 条 —— 任何情况下都不会回退到旧示例句。"
+        "hint": "C1：不锁死在 12（用户：「13 条不一定够，甚至可能会增加」）。🔴 示例语料源自真实群聊语句，**不在仓库里**：真身在仓库外 data_out/examples.json（部署时 scp 到 <data_dir>/example_dialogs.json，examples.json 亦可）。代码里 examples_default.ENTRIES 恒空 —— 数据目录没有可用文件时是**空示例块**（启动日志 WARNING + trace examples_degraded），任何情况下都不会回退到旧示例句。"
       }
     }
   },
