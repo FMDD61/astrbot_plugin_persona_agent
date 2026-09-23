@@ -258,5 +258,51 @@ class TestLegacyExamplesCleanup(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.dir, "data_out", "legacy")))
 
 
+class TestRotationWiring(unittest.TestCase):
+    """把「轮转时清理旧示例文件」这一步钉在**轮转协程**上。
+
+    `main.py` 依赖 astrbot，测试环境导不进来 → 用 AST 看**调用图**：
+    `_rotate_followup`（cron 与消息兜底两条轮转路径共用的那个协程）必须调用
+    `_cleanup_legacy_examples`。这一步被删掉的话，"新 20 条"会永远不生效，
+    而且**不报错**（旧文件优先）—— 正是本项目反复栽的静默失效，必须钉住。
+    """
+
+    def _main_tree(self):
+        import ast
+        path = os.path.join(os.path.dirname(__file__), "..", "main.py")
+        with open(path, encoding="utf-8") as f:
+            return ast.parse(f.read())
+
+    def _called_names(self, tree, func_name):
+        """该函数体里被调用的名字（`f()` 与 `self.f()` 都算）。"""
+        import ast
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and node.name == func_name:
+                out = set()
+                for n in ast.walk(node):
+                    if not isinstance(n, ast.Call):
+                        continue
+                    if isinstance(n.func, ast.Attribute):
+                        out.add(n.func.attr)
+                    elif isinstance(n.func, ast.Name):
+                        out.add(n.func.id)
+                return out
+        return None
+
+    def test_rotate_followup_cleans_legacy_examples(self):
+        tree = self._main_tree()
+        called = self._called_names(tree, "_rotate_followup")
+        self.assertIsNotNone(called, "main._rotate_followup 不见了（轮转路径改了？）")
+        self.assertIn("_cleanup_legacy_examples", called,
+                      "轮转路径没有清理旧示例文件 → 新 20 条永不生效且不报错")
+
+    def test_cleanup_delegates_to_the_service_function(self):
+        """判定在 service（可单测），main 只负责留痕 —— 这条分工也要钉住。"""
+        tree = self._main_tree()
+        called = self._called_names(tree, "_cleanup_legacy_examples")
+        self.assertIn("cleanup_legacy_file", called)
+
+
 if __name__ == "__main__":
     unittest.main()
