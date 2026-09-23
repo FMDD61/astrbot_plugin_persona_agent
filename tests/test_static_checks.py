@@ -543,6 +543,10 @@ class TestSelfcheckStalenessUsesCST(unittest.TestCase):
         i = src.index("§3 是**旧的**")
         seg = src[max(0, i - 900):i + 200]
         self.assertIn("datetime.now(_cst)", seg, "必须显式 +8")
+        # ⚠️ 只钉"今天用 CST"不够 —— 第一版就是这么修的，左边仍拿 `_gen[:10]` 当日期 →
+        # 照旧误报（我同一处错了两次）。必须钉住**两边都换算**。
+        self.assertIn("astimezone(_cst)", seg, "生成时刻也必须换算到 CST 再比")
+        self.assertNotIn("_gen[:10] < _today_cst", seg, "不得再拿 UTC 裸串当日期")
         self.assertNotIn("time.gmtime()", seg, "不得再比 UTC 日期")
 
     def test_digest_fresh_accepts_session_day(self):

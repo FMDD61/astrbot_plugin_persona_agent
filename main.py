@@ -1586,14 +1586,25 @@ class PersonaAgent(Star):
                         f"[selfcheck] §3 历史群聊摘要：{_n} 行"
                         + (f"，组装于 {_gen}" if _gen else "（memory_digest.json 不存在）")
                     )
-                    # 🔴 2026-09-23 观察抓到误报：这里原先比的是 **UTC 日期**，而轮转在
-                    # 02:05 CST = **前一天的 18:05 UTC** → 每天 00:00-08:00 CST 之间都误报"§3 是旧的"。
-                    # 与 `digest_fresh_today` 同口径，一律 **显式 +8**。
+                    # 🔴 2026-09-23 观察抓到误报（**同一处错了两次**，记下来）：
+                    # `generated_at` 是 **UTC** ISO，轮转在 02:05 CST = 前一天 18:05 UTC。
+                    # 第一次我只把"今天"改成 CST，左边仍拿 `_gen[:10]` 当日期 → 照旧误报；
+                    # **必须把两边都换算到 CST 再比**（与 digest_fresh_today 同口径）。
                     _cst = datetime.timezone(datetime.timedelta(hours=8))
                     _today_cst = datetime.datetime.now(_cst).strftime("%Y-%m-%d")
-                    if _gen and _gen[:10] < _today_cst:
+                    _gen_cst = ""
+                    if _gen:
+                        try:
+                            _gen_cst = (
+                                datetime.datetime.strptime(_gen[:19], "%Y-%m-%dT%H:%M:%S")
+                                .replace(tzinfo=datetime.timezone.utc)
+                                .astimezone(_cst).strftime("%Y-%m-%d")
+                            )
+                        except Exception:
+                            _gen_cst = _gen[:10]        # 解析不了才退回裸串（保守）
+                    if _gen_cst and _gen_cst < _today_cst:
                         logger.warning(
-                            f"[selfcheck] ⚠️ §3 是**旧的**（组装于 {_gen} UTC < 今天 {_today_cst} CST）→ "
+                            f"[selfcheck] ⚠️ §3 是**旧的**（组装于 {_gen_cst}，今天 {_today_cst}，均 CST）→ "
                             f"检查 02:05 轮转的日记/组装那两步是否跑成"
                         )
                     if pm.get("memory_error"):
