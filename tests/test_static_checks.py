@@ -529,3 +529,26 @@ class TestDiaryDayIsPassedIn(unittest.TestCase):
         i = src.index("def digest_fresh_today")
         body = src[i:i + 2000]
         self.assertIn("datetime.now(_CST)", body, "默认参考时刻必须是 CST")
+
+
+class TestSelfcheckStalenessUsesCST(unittest.TestCase):
+    """🔴 2026-09-23 观察抓到误报：自检原先比 **UTC 日期**，而轮转在 02:05 CST
+    = 前一天的 18:05 UTC → 每天 00:00-08:00 CST 都误报「§3 是旧的」。
+
+    变异实测：改回 `time.gmtime()` 时整套餐件**全绿**（无闸）→ 这里补上。
+    """
+
+    def test_selfcheck_compares_in_cst(self):
+        src = (REPO / "main.py").read_text(encoding="utf-8")
+        i = src.index("§3 是**旧的**")
+        seg = src[max(0, i - 900):i + 200]
+        self.assertIn("datetime.now(_cst)", seg, "必须显式 +8")
+        self.assertNotIn("time.gmtime()", seg, "不得再比 UTC 日期")
+
+    def test_digest_fresh_accepts_session_day(self):
+        """P3：判据要能吃**会话日**（否则 00:00-02:05 每天两小时仍重建）。"""
+        src = (REPO / "services" / "summary.py").read_text(encoding="utf-8")
+        self.assertIn("day=None", src)
+        self.assertIn("str(day).strip() if day else", src)
+        m = (REPO / "main.py").read_text(encoding="utf-8")
+        self.assertIn("day=day or None", m, "调用点必须把会话日传下去")

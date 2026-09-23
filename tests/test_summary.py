@@ -647,3 +647,23 @@ class TestDigestFreshTodayB056(unittest.TestCase):
             self.assertTrue(digest_fresh_today(td, now=t1))
             self.assertFalse(digest_fresh_today(
                 td, now=t1 + timedelta(minutes=2)), "过零点就该重建")
+
+    def test_session_day_takes_precedence_over_calendar(self):
+        """P3（审查第 2 轮）：给了**会话日**就按会话日比，别用日历日。
+
+        轮转把 00:00–02:00 归前一天 → 两个口径不一致时每天 00:00–02:05 判据恒"不新鲜"，
+        又变成每条消息重建一次（只是日志已 DEBUG，更隐蔽）。
+        """
+        cst = timezone(timedelta(hours=8))
+        with tempfile.TemporaryDirectory() as td:
+            # 09-22 02:05 CST 组装（该次轮转产出的 §3）
+            t0 = datetime(2026, 9, 22, 2, 5, tzinfo=cst)
+            self._write(td, t0.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+            # 会话日口径：盘上摘要属于 09-22 → 只有 day="2026-09-22" 才算新鲜
+            # （00:00-02:00 的 day_key 归前一天，此处正是要覆盖那个窗口）
+            # 09-22 02:05 CST 组装（该次轮转产出的 §3）
+            self.assertTrue(digest_fresh_today(td, day="2026-09-22"), "会话日内应新鲜")
+            self.assertFalse(digest_fresh_today(td, day="2026-09-21"), "换了会话日应陈旧")
+            # 不给 day 时退回 CST 日历日
+            self.assertTrue(digest_fresh_today(td, now=t0))
+            self.assertFalse(digest_fresh_today(td, now=t0 + timedelta(days=1)))

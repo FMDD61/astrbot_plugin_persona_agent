@@ -1586,9 +1586,14 @@ class PersonaAgent(Star):
                         f"[selfcheck] §3 历史群聊摘要：{_n} 行"
                         + (f"，组装于 {_gen}" if _gen else "（memory_digest.json 不存在）")
                     )
-                    if _gen and _gen[:10] < time.strftime("%Y-%m-%d", time.gmtime()):
+                    # 🔴 2026-09-23 观察抓到误报：这里原先比的是 **UTC 日期**，而轮转在
+                    # 02:05 CST = **前一天的 18:05 UTC** → 每天 00:00-08:00 CST 之间都误报"§3 是旧的"。
+                    # 与 `digest_fresh_today` 同口径，一律 **显式 +8**。
+                    _cst = datetime.timezone(datetime.timedelta(hours=8))
+                    _today_cst = datetime.datetime.now(_cst).strftime("%Y-%m-%d")
+                    if _gen and _gen[:10] < _today_cst:
                         logger.warning(
-                            f"[selfcheck] ⚠️ §3 是**旧的**（组装于 {_gen}，不是今天）→ "
+                            f"[selfcheck] ⚠️ §3 是**旧的**（组装于 {_gen} UTC < 今天 {_today_cst} CST）→ "
                             f"检查 02:05 轮转的日记/组装那两步是否跑成"
                         )
                     if pm.get("memory_error"):
@@ -2803,7 +2808,13 @@ class PersonaAgent(Star):
         """
         try:
             from .services.summary import digest_fresh_today
-            return bool(digest_fresh_today(self.data_dir))
+            day = ""
+            if self.session_mgr is not None:
+                try:
+                    day = self.session_mgr.day_key(time.time())
+                except Exception:
+                    day = ""
+            return bool(digest_fresh_today(self.data_dir, day=day or None))
         except Exception as e:
             logger.debug(f"[persona_agent] digest 新鲜度判定失败（按陈旧处理）: {e}")
             return False
