@@ -450,6 +450,55 @@ class TestB055B056Wiring(unittest.TestCase):
         self.assertIn("_has_diary_for", body, "先查盘上有没有，避免重复生成")
 
 
+class TestC18NoGhostReply(unittest.TestCase):
+    """🔴 C18（审查两轮都点名）：**什么都没发出去时不许记账**。
+
+    旧实现的顺序是"无条件 register_reply + 往会话写占位" → 贴纸没选到、正文又为空时，
+    RP 与 Gate 会在共用会话里看到一条**从未发生的发言**（幽灵条目），还会刷新
+    `last_reply_ts`/推后 `cold_start`（污染参与量读数）。
+    测试不导入 main.py（见本文件开头的事故说明）→ 用 AST 钉住形状。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = (REPO / "main.py").read_text(encoding="utf-8")
+
+    def test_bookkeeping_is_guarded_by_actually_sent(self):
+        i = self.src.index("register reply + persist session")
+        guard = self.src.rfind("if not reply_text and not _sticker_sent", 0, i)
+        self.assertGreater(guard, 0, "记账前必须有「真的发出去了」的守卫")
+        seg = self.src[guard:i]
+        self.assertIn("return", seg, "守卫命中时应直接返回，不记账")
+        self.assertIn("_poked", seg, "戳人臂也要算「发出去了」（N-3）")
+
+    def test_sticker_sent_counter_exists(self):
+        self.assertIn("_sticker_sent += 1", self.src, "贴纸真的 yield 了才计数")
+        self.assertIn("_poked = bool(await self._send_proactive_poke(", self.src,
+                      "戳人用真实返回值，不用意图")
+
+
+class TestB057ArchivedDay(unittest.TestCase):
+    """🔴 B-057：日记的"日"必须等于**这次归档的那一天**，不许现算。
+
+    会话隔 ≥2 天才轮转时（day=09-15、09-22 才转），现算的 `day_key(now-86400)` = 09-21，
+    而归档是 09-15 → 日记写到错日子上，§3/周报按 day 取记录全乱。
+    """
+
+    def test_rotate_uses_last_rotated_day(self):
+        src = (REPO / "main.py").read_text(encoding="utf-8")
+        i = src.index("async def _rotate_followup")
+        j = src.index("async def _retry_diary_later", i)
+        body = src[i:j]
+        self.assertIn("last_rotated_day(group_id)", body,
+                      "归档日必须来自 session_mgr，不许现算")
+
+    def test_session_manager_exposes_it(self):
+        src = (REPO / "services" / "session_manager.py").read_text(encoding="utf-8")
+        self.assertIn("def last_rotated_day", src)
+        self.assertIn("self._last_rotated_day[group_id] = old_day", src,
+                      "归档时必须记录 old_day")
+
+
 class TestDiaryPathIsCurrent(unittest.TestCase):
     """🔴 P1（独立审查 2026-09-22）：`_has_diary_for` 必须走**现行路径**。
 

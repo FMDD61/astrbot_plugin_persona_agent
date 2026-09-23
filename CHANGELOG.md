@@ -11,6 +11,23 @@
 
 ## [Unreleased]
 
+### Fixed / Added (2026-09-23 · 代码侧收尾)
+- **B-057（审查第 3 轮残留）**：日记的"日"原先由写侧**现算** `day_key(now-86400)`，只在
+  "恰好陈旧 1 天"时才等于归档日；会话隔 ≥2 天才轮转（如 day=09-15、09-22 才转）→ 归档是
+  09-15 而日记写成 09-21（读侧按 day 取记录 → §3/周报全乱）。修法：`session_manager`
+  记 `last_rotated_day(group_id)`（**返回值签名不动**，两处调用方与既有测试不受影响），
+  `_rotate_followup` 取它当日记的日。两道闸变异自证有牙。
+- **replay 离线台补齐回调**（审查点名）：原先不传 `system_prompt` / `gate_system_prompt` /
+  `tool_syntax_block` / `relations_block` / `turn_block` → **C3（分时段 PHI）、C18（工具语法）、
+  C22（Gate 冻结头部）在离线重放里根本复现不了**，而它们正是下阶段提示词 A/B 要量的东西。
+  已按 main 同形实现（`_turn_block` 注释里写明"必须跟住 main"）。
+- **C18 的 AST 闸**（审查两轮点名"守卫无测试"）：`session_mgr.append` 必须被"真的发出去了"
+  的守卫支配；贴纸计数与 poke 真实返回值也一并钉住。变异（拆掉守卫）→ 用例红。
+- **`want`/`blocked` 的统计消费者**（C23 的"可分别统计"此前只到 trace，工具层不成立）：
+  `tools/trace_stats.py` 新增 Gate 两问分布（含"想说但被拦"过拦信号）与 emotion 分数分布
+  （含 `score<0.40` 悬崖占比）。
+
+
 ### Fixed (2026-09-23 · 部署后观察抓到的两条)
 - **自检误报「§3 是旧的」（时区口径）**：那句判据比的是 `generated_at` 的 **UTC 日期**与
   **今天的 UTC 日期**，而轮转在 02:05 CST = **前一天的 18:05 UTC** → 每天 00:00-08:00 CST

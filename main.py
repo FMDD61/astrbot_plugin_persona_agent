@@ -2767,7 +2767,11 @@ class PersonaAgent(Star):
             # 🔴 P2（独立审查 2026-09-22）：日记只在**这一刻**生成，错过就整天没有；
             # 而这一刻最可能出问题（进程刚重启、provider 刚注册）。
             # 所以没产出时要在**本进程内退避重试**，不能只指望"下次启动补写"（进程不重启就一直缺）。
-            _day = self.session_mgr.day_key(time.time() - 86400.0)
+            # 🔴 B-057（审查第 3 轮）：日必须等于**这次真正归档的那一天** ——
+            # 原先现算 `day_key(now-86400)`，只在"恰好陈旧 1 天"时才相等；
+            # 会话隔 ≥2 天才轮转时，归档是 09-15 而日记会被写成 09-21（读侧按 day 取 → 全乱）。
+            _day = (self.session_mgr.last_rotated_day(group_id)
+                    or self.session_mgr.day_key(time.time() - 86400.0))
             try:
                 # 上界 5 分钟：日记 LLM 卡死时不能拖住组装（有内容就装配）
                 await asyncio.wait_for(

@@ -520,6 +520,7 @@ class ReplayRuntime:
                 now_utc_fn=self.clock,
             )
 
+        self._last_emotion = None
         self.pipeline = PersonaPipeline(
             style=self.style,
             rag=self.rag if rag_on else None,
@@ -543,6 +544,16 @@ class ReplayRuntime:
             # 而 schema 的 hint 明写这个开关用于 A/B 与归因。
             kg_display=int(rag_cfg.get('display_enabled', 0)) == 1,
             now_utc_fn=self.clock,
+            # 🔴 2026-09-23（独立审查点名）：这几个回调**离线台原先不传** →
+            # C3（分时段 PHI）/ C18（工具语法教不教）/ C22（Gate 自己的冻结头部）
+            # 在离线重放里**根本复现不了**，而它们正是下阶段"提示词 A/B"要量的东西。
+            system_prompt=(self.style.system_prompt if self.style is not None else None),
+            gate_system_prompt=(
+                self.style.gate_system_prompt if self.style is not None else None),
+            tool_syntax_block=self._tool_syntax_block,
+            relations_block=(
+                self.style.relations_block if self.style is not None else None),
+            turn_block=self._turn_block,
         )
 
     def _cfg(self, key: str, default=None):
@@ -593,6 +604,47 @@ class ReplayRuntime:
             return block
         except Exception:
             return ""
+
+    def _local_hour(self) -> int:
+        """离线台的本地小时 —— 走**虚拟时钟**（与 main 同口径）。"""
+        try:
+            return int(time.strftime("%H", time.localtime(self.clock())))
+        except Exception:
+            return 0
+
+    def _tool_syntax_block(self) -> str:
+        """与 main._tool_syntax_block 同源的最简版（离线只关心"教没教"）。
+
+        缺了它 → "教了 `[emote:]` 才有多发表情"这类效果在离线复现不出来。
+        """
+        cfg = self._cfg("sticker") or {}
+        if int(cfg.get("teach", 0)) != 1:
+            return ""
+        return ("想在回复后配一张表情包，就在回复末尾写 `[emote:意图短语]`，"
+                "比如 `[emote:无奈地摇头]`、`[emote:害羞比心]`。")
+
+    def _turn_block(self, turn_lines: list, ctx: dict) -> str:
+        """与 main._build_turn_block **同形**（C3：一行 PHI + `【当下】时段，心情`）。
+
+        ⚠️ 这里必须跟住 main —— 它改了而这里没改，离线 A/B 就会量到一个**不存在的线上行为**
+        （本项目吃过的"离线一套线上一套"的亏）。
+        """
+        uin = str(ctx.get("sender_uin") or "")
+        alias = ctx.get("sender_alias") or (f"群友{uin}" if uin else "群友")
+        first = turn_lines[0] if turn_lines else f"{alias}："
+        head = "【现在要回应的】" + first
+        if ctx.get("is_at"):
+            head += "（@ 了你）"
+        lines = [head]
+        lines.extend(turn_lines[1:])
+        mood = str(getattr(self, "_last_emotion", None) and
+                   getattr(self._last_emotion, "current_mood", "") or "")
+        vol = (self.style.volatile_line(local_hour=self._local_hour(), mood=mood)
+               if self.style is not None else "")
+        if vol:
+            lines.append("【当下】" + vol.replace(chr(10), " "))
+        return chr(10).join(lines)
+
 
     @staticmethod
     def _postprocess(text: str) -> str:
@@ -674,6 +726,9 @@ class ReplayRuntime:
         )
 
     async def _llm_generate(self, user_text, contexts, emotion, temperature, sender_uin, umo):
+        # 与 main 的 `_turn_block_emotion` 同理：turn_block 拿不到 emotion，
+        # 由生成回调这一侧记下来（C3 的【当下】要用心情）。
+        self._last_emotion = emotion
         """RP 生成。与线上 main._generate_reply 同构（防漂移）。
 
         2026-09-13 缓存重排：system prompt 恒定（不再拼时间/心情），

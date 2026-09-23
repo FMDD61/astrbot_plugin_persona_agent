@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from tools.trace_stats import (  # noqa: E402
     compute_stats,
     load_jsonl_with_rotations,
+    _fmt,
 )
 
 
@@ -221,6 +222,37 @@ class TestGenerationAttemptsS28(unittest.TestCase):
         self.assertEqual(st["gen_attempted"], 1)
         self.assertEqual(st["gen_failed"], 0)
 
+
+
+    def test_want_and_blocked_are_counted_separately(self):
+        """C23（审查点名）：两问必须在统计层**分开**，否则判断不了「禁令拦过头」。"""
+        rows = [
+            {'ts': 'a', 'gate': {'reply': True, 'want': True, 'blocked': False}, 'final_text': '好'},
+            {'ts': 'b', 'gate': {'reply': False, 'want': True, 'blocked': 'topic'}, 'final_text': ''},
+            {'ts': 'c', 'gate': {'reply': False, 'want': False, 'blocked': False}, 'final_text': ''},
+            {'ts': 'd', 'gate': {'reply': False, 'want': True, 'blocked': 'unknown:键政'}, 'final_text': ''},
+        ]
+        st = compute_stats(rows)
+        self.assertEqual(st['want_true'], 3)
+        self.assertEqual(st['want_false'], 1)
+        self.assertEqual(st['blocked']['topic'], 1)
+        self.assertEqual(st['blocked']['unknown:键政'], 1)
+        self.assertEqual(st['blocked_but_wanted'], 2, '被拦且想说 = 过拦信号（两条）')
+        self.assertEqual(st['gate_pass'], 1)
+        out = _fmt(st)
+        self.assertIn('Gate 两问', out, '报告里必须能分别看到两问')
+        self.assertIn('想说但被拦', out)
+
+    def test_emotion_scores_are_collected(self):
+        """C24：分数分布要能直接看（含 0.40 悬崖占比）。"""
+        rows = [
+            {'ts': 'x', 'emotion': {'score': 1.0, 'willingness': 1.0, 'mood': '轻快'}},
+            {'ts': 'y', 'emotion': {'score': 0.2, 'willingness': 0.68, 'mood': '提不起劲'}},
+        ]
+        st = compute_stats(rows)
+        self.assertEqual(st['emotion_scores'], [1.0, 0.2])
+        out = _fmt(st)
+        self.assertIn('score<0.40', out, '报告里必须能看到悬崖占比')
 
 
 if __name__ == "__main__":

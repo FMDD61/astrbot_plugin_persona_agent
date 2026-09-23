@@ -109,6 +109,8 @@ def load_alias_map(data_dir: str | Path) -> dict[str, str]:
 def compute_stats(rows: list[dict], *, alias_map: dict | None = None) -> dict:
     """按上表口径算统计。**绝不抛**（观测工具不该拖垮分析）。"""
     st: dict = {"inbound": len(rows), "hard_pass": 0, "gate_pass": 0,
+               "want_true": 0, "want_false": 0, "blocked": {},
+               "blocked_but_wanted": 0, "emotion_scores": [],
                 "generated": 0, "gen_attempted": 0, "gen_failed": 0,
                 "parse_failed": 0, "triggers": {}}
     cached_sum = other_sum = 0
@@ -130,6 +132,20 @@ def compute_stats(rows: list[dict], *, alias_map: dict | None = None) -> dict:
             st["gate_pass"] += 1
         if isinstance(g, dict) and "parse failed" in str(g.get("reason") or ""):
             st["parse_failed"] += 1
+        # 🔴 C23（独立审查点名）：两问必须能**分别统计** ——
+        #   want=False 是"压根不想说"，blocked≠false 是"想说但被挡"。
+        #   混着看就永远判断不了"禁令是不是拦过头"。
+        if isinstance(g, dict) and "want" in g:
+            st["want_true" if g.get("want") else "want_false"] += 1
+            _blk = g.get("blocked", False)
+            if _blk is not False and _blk:
+                _key = str(_blk)
+                st["blocked"][_key] = st["blocked"].get(_key, 0) + 1
+                if g.get("want"):
+                    st["blocked_but_wanted"] += 1   # 被拦且确实想说 = 过拦信号
+        _emo = r.get("emotion") or {}
+        if isinstance(_emo, dict) and _emo.get("score") is not None:
+            st["emotion_scores"].append(float(_emo["score"]))
         text = str(r.get("final_text") or "")
         # 🔴 B-028：生成尝试 / 失败必须与"没走到生成"分开
         #   （旧口径只看 raw_generation → 空生成完全无痕，实测少算 3/86）
@@ -189,6 +205,30 @@ def _fmt(st: dict) -> str:
             f"  ├ 解析失败      {st['parse_failed']:>6}  ({st['parse_failed_rate']:.1%} of 放行)"
             + ("   ← Gate 未生效" if st["parse_failed"] else ""),
             f"  └ 真实拒绝      {st['gate_reject_real']:>6}",
+        ]
+    if st.get("want_true") or st.get("want_false"):
+        _w, _f = st["want_true"], st["want_false"]
+        L += [
+            "",
+            "=== Gate 两问（C23）—— 想说但被拦 != 压根不想说 ===",
+            "  有话想说 want=true   %6d" % _w,
+            "  不想说   want=false  %6d" % _f,
+            "  └ 想说但被拦（过拦信号）%6d" % st["blocked_but_wanted"],
+        ]
+        if st["blocked"]:
+            L.append("  被拦原因分布：")
+            for k, v in sorted(st["blocked"].items(), key=lambda x: -x[1]):
+                L.append("    %-18s %6d" % (k, v))
+    if st.get("emotion_scores"):
+        _s = sorted(st["emotion_scores"])
+        _low = sum(1 for x in _s if x < 0.40)
+        L += [
+            "",
+            "=== emotion（C24 代码计算）===",
+            "  n=%d min=%.3f p50=%.3f max=%.3f" % (
+                len(_s), _s[0], _s[len(_s) // 2], _s[-1]),
+            "  score<0.40 占比 %.1f%%（跨线时非 @ 的 RAG 通道数学上不可达，emotion_v2 7.2）"
+            % (100.0 * _low / len(_s)),
         ]
     if st["triggers"]:
         L += ["", "=== 硬闸 trigger 分布 ==="]

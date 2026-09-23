@@ -330,6 +330,8 @@ class SessionManager:
         self._persist_step = 50
         self._persist_interval = 300.0
         self._sessions: dict[str, Session] = {}
+        #: B-057：每组最近一次归档的"日"（日记写侧必须用它，不许自算）
+        self._last_rotated_day: dict[str, str] = {}
         self._last_save: dict[str, float] = {}
         self._saved_at_count: dict[str, int] = {}
         # B-002 观测：恢复期丢弃的空 content 条目（>0 说明数据曾损坏）
@@ -548,11 +550,27 @@ class SessionManager:
 
     # ---- daily rotation (v3: rotate at rotation_hour local, keep unlimited) ----
 
+    def last_rotated_day(self, group_id: str) -> str:
+        """最近一次真正发生归档的"日"（B-057）。没归档过 → 空串。
+
+        ⚠️ 只在 `rotate_if_day_changed()` 返回非 None 之后当次使用（它记的是上一次归档日）。
+        用途：让日记/摘要的 day 与归档文件名**严格一致**。
+        """
+        with self._lock:
+            return str(self._last_rotated_day.get(group_id) or "")
+
+
     def rotate_if_day_changed(self, group_id: str) -> Optional[list[dict]]:
         """If the session belongs to a previous day window, archive and clear it.
 
         Returns the archived messages (for diary generation) or None when no
         rotation happened. Persists the old day to session_<group>_<day>.json.
+
+        🔴 B-057（独立审查 2026-09-22）：归档的"日"要能被调用方取到 —— 日记写侧原先
+        自己现算 `day_key(now-86400)`，**只在"恰好陈旧 1 天"时**才等于归档日；会话隔了
+        ≥2 天（如 day=09-15、09-22 才轮转）就会把日记写到错的日子上，连带影响 §3/周报
+        （读侧按 day 取记录）。这里把归档日记在实例上（**返回值签名不动** —— 两处调用方
+        与既有测试都依赖它），由 `last_rotated_day(group_id)` 取用。
         """
         key = self.day_key()
         with self._lock:
@@ -605,6 +623,8 @@ class SessionManager:
                 os.replace(tmp, path)
             except OSError:
                 pass
+        # B-057：把"这次归档的是哪一天"留给调用方（日记写侧必须用它，不许现算）
+        self._last_rotated_day[group_id] = old_day
         return old_msgs
 
     def save_all(self) -> None:
