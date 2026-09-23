@@ -123,20 +123,14 @@ def gif_grid_system_prompt(frames: int, cols: int = GIF_GRID_COLS,
     )
 
 
-#: 默认（6 帧 / 3 列 × 2 行）那一版。离线工具（tools/build_sticker_index.py）与
-#: 定长几何的调用方可以直接用它；线上走 ``gif_grid_system_prompt(prep["gif_grid"])``。
-VISION_GIF_SYSTEM_PROMPT = gif_grid_system_prompt(GIF_GRID_FRAMES)
-
-# 提示词复述/自我规训特征（模型把 system 要求或思考过程写进"答案"）
-_LEAK_MARKERS = (
-    "如是表情包", "不超过80", "不猜测人物", "不要脑补", "需要谨慎", "不能猜",
-    "用户说", "本条要求", "分析请求", "草拟描述", "字数检查", "输出格式",
-)
-
-
-def _looks_like_leaked_prompt(text: str) -> bool:
-    t = text or ""
-    return any(m in t for m in _LEAK_MARKERS)
+# ⚠️ **已删除**（2026-09-23 批次三清理）：常量 `VISION_GIF_SYSTEM_PROMPT` 不存在了。
+# 它只是 `gif_grid_system_prompt(GIF_GRID_FRAMES)` 的一个预求值副本，**生产零引用**
+# （线上按本轮实际帧数现算：`gif_grid_system_prompt(info["frames"], cols, rows)`；
+# 离线入库工具也走同一个函数）—— 想拿"6 帧 / 3 列 × 2 行"那一版就现调
+# `gif_grid_system_prompt(GIF_GRID_FRAMES)`，别再把常量加回来。
+#
+# ⚠️ 同处删掉的还有一份**重复定义**的 `_LEAK_MARKERS/_looks_like_leaked_prompt`
+# （本文件曾定义两次，本处这份被文件末尾那份**覆盖**，从未生效；见那份上方的说明）。
 
 
 def parse_vision_json(resp: dict) -> tuple[str, list[str]]:
@@ -287,7 +281,11 @@ def extract_completion_text(resp: dict) -> str:
     return ""
 
 
-# 提示词复述/自我规训特征（模型把 system 要求或思考过程写进"答案"）
+# 提示词复述/自我规训特征（模型把 system 要求或思考过程写进"答案"）。
+# ⚠️ **本处是唯一真身**：文件上方曾有第二份同名定义（多一个 "输出格式" 标记），
+# 因为 Python 后定义覆盖前定义，那份**从未生效**、2026-09-23 已删。
+# ⚠️ 两处字面量本来就**不一致**（少了 "输出格式"）：删掉的那份从未参与过判定，
+# 所以本次删除**不改行为**。要不要把 "输出格式" 补进来是**行为变更**，由所有者定。
 _LEAK_MARKERS = (
     "如是表情包", "不超过80", "不猜测人物", "不要脑补", "需要谨慎", "不能猜",
     "用户说", "本条要求", "分析请求", "草拟描述", "字数检查",

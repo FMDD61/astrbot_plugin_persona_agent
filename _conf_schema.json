@@ -361,7 +361,7 @@
         "type": "float",
         "description": "单图像描述超时（秒），超时降级为无描述",
         "default": 30,
-        "hint": "S6 标定（n=192）：p50 4.0s / p90 5.5s / p95 6.3s / p99 8.7s / max 26.9s —— 15s 会砍掉约 1% 的调用。>15s 的离群点全部是被整图直送的大 GIF（要压尾延迟就调小 image_prep.GIF_INLINE_MAX_BYTES）。"
+        "hint": "S6 标定（n=192，**C27 之前**）：p50 4.0s / p90 5.5s / p95 6.3s / p99 8.7s / max 26.9s —— 15s 会砍掉约 1% 的调用；当时的 >15s 离群点**全部**是「整图直送」的大 GIF。C27（2026-09-21）起多帧 GIF 一律抽帧拼网格（载荷几十 KB）→ 该离群源已消失（C27 之后尚未重测标定）。⚠️ 压尾延迟**不再有**可调的体积闸门（旧 image_prep.GIF_INLINE_MAX_BYTES 已删），只能调本项超时。⚠️ 代码兜底默认 15s（main.py），本 schema 默认 30s —— 以线上配置为准。"
       },
       "cache_ttl_sec": {
         "type": "float",

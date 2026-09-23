@@ -25,14 +25,9 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 import astrbot.api.message_components as Comp
 
-from .services.text_style import (
-    RE_QUOTE_BLOCK,
-    RE_AT_MARKER,
-    RE_EMOJI,
-    RE_AT_USER,
-    RE_PAREN_META,
-    RE_REPLY_MARKER,
-)
+# 2026-09-23 清理：这里原有的六个正则 import（RE_QUOTE_BLOCK / RE_AT_MARKER / RE_EMOJI /
+# RE_AT_USER / RE_PAREN_META / RE_REPLY_MARKER）**全仓零裸用**（都以 `text_style.RE_*` 形式调用），
+# 已删。`RE_EMOJI` / `RE_AT_USER` 当初就是靠这行才"看起来有人用"，也是它们不能删的唯一原因。
 from .services import text_style
 from .services.llm_params import (
     reasoning_value, resolve_provider_id, extract_reasoning,
@@ -3273,25 +3268,12 @@ class PersonaAgent(Star):
                 pass
         return False
 
-    @staticmethod
-    def _strip_at_mentions(text: str) -> str:
-        return text_style.strip_at_mentions(text)
+    # 2026-09-23 清理：这里原有五个**零调用**的 @staticmethod 包装
+    # （_strip_at_mentions / _strip_meta_parens / _strip_emoji / _cap_koupi / _extract_quote）。
+    # 其中两个转调的 `text_style.strip_emoji` / `strip_at_mentions` 已在 C15 删除 →
+    # 它们一旦被调用就是 AttributeError（全仓零调用点，但别让它们复活）。
 
-    @staticmethod
-    def _strip_meta_parens(text: str) -> str:
-        return text_style.strip_meta_parens(text)
 
-    @staticmethod
-    def _strip_emoji(text: str) -> str:
-        return text_style.strip_emoji(text)
-
-    @staticmethod
-    def _cap_koupi(text: str) -> str:
-        return text_style.cap_koupi(text)
-
-    @staticmethod
-    def _extract_quote(text: str) -> tuple[str, Optional[int]]:
-        return text_style.extract_quote(text)
 
     @staticmethod
     def _postprocess(text: str) -> str:

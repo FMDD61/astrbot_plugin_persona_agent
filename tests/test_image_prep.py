@@ -23,7 +23,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from services.image_prep import (  # noqa: E402
-    frame_count, mime_of, prepare_bytes_for_vision, prepare_for_vision, sniff_mime,
+    mime_of, prepare_bytes_for_vision, prepare_for_vision, sniff_mime,
 )
 
 
@@ -102,17 +102,35 @@ class TestSniffAndMeta(unittest.TestCase):
         self.assertEqual(mime_of("a.unknown"), "image/png")
 
     @requires_pil
-    def test_frame_count(self):
+    def test_animation_detection_has_one_outlet(self):
+        """**"是不是动图"只有一个出口** = `prepare_for_vision` 的 `meta`。
+
+        `frame_count()` 已删（2026-09-23 批次三清理：全仓零生产引用，只有测试在调；
+        离线工具自带一份同名实现）—— 想数帧就读 `meta["gif_grid"]["of"]`。
+        这条用例把"三帧 GIF / 静图 / 打不开的文件"三种情形一次性钉在行为上，
+        免得有人为了测试再添一份口径（两份实现必然漂移）。
+        """
         import tempfile
         from pathlib import Path
         with tempfile.TemporaryDirectory() as td:
-            p = Path(td) / "a.gif"
-            p.write_bytes(_img_bytes("GIF", frames=3))
-            self.assertEqual(frame_count(p), 3)
-            p2 = Path(td) / "b.png"
-            p2.write_bytes(_img_bytes())
-            self.assertEqual(frame_count(p2), 1)
-            self.assertEqual(frame_count(Path(td) / "missing.gif"), 0)
+            anim = Path(td) / "a.gif"
+            anim.write_bytes(_img_bytes("GIF", frames=3))
+            meta = {}
+            prepare_for_vision(anim, meta=meta)
+            self.assertEqual(meta["gif_grid"]["of"], 3, "多帧 GIF：帧数从 meta 读")
+            self.assertEqual(meta["path"], "gif_grid")
+
+            still = Path(td) / "b.png"
+            still.write_bytes(_img_bytes())
+            meta2 = {}
+            prepare_for_vision(still, meta=meta2)
+            self.assertNotIn("gif_grid", meta2)
+            self.assertEqual(meta2["path"], "static", "静图不该进网格")
+
+            meta3 = {}
+            out, mime = prepare_for_vision(Path(td) / "missing.gif", meta=meta3)
+            self.assertEqual((out, mime), (b"", "image/png"))
+            self.assertIn("read_fail", meta3, "打不开要留痕（旧 frame_count 返回 0）")
 
 
 class TestDownscale(unittest.TestCase):
@@ -328,23 +346,26 @@ class TestGifGridC27(unittest.TestCase):
             self.assertEqual(im.size, (960, 640))
 
     @requires_pil
-    def test_gate_constant_no_longer_gates(self):
-        """旧闸门常量**已废**：改它不再改变任何行为（保留名字只为离线工具 import）。"""
+    def test_volume_gate_constant_is_deleted(self):
+        """🔴 **墓志铭**：体积闸门常量已删，行为里没有任何体积分支。
+
+        旧行为（B-049 的根因）：`len(data) <= GIF_INLINE_MAX_BYTES` 才整图直送，
+        否则降级成**首帧 JPEG** → 动作语义丢失。C27 废掉分流后这个常量只剩墓碑
+        （注释还声称"保留给 `tools/build_sticker_index.py` 的 import"，而那个 import
+        早已删掉、全仓零引用）→ 2026-09-23 批次三清理连名字一起删。
+
+        反向断言两件事：① 名字不许回来（回来了 = 又有人想按体积分流）；
+        ② 行为不看体积（`test_volume_gate_is_gone` 用 >1.5MB 的样例钉住那一半）。
+        """
         from services import image_prep as P
+        self.assertFalse(hasattr(P, "GIF_INLINE_MAX_BYTES"),
+                         "体积闸门常量回来了 —— C27/B-049 的账会重开")
         gif = _anim_gif_bytes(8, (400, 300))
-        base, base_mime = prepare_bytes_for_vision(gif)
-        # 旧名**保留**（tools/build_sticker_index.py 还在 import 它，那文件不在本次
-        # 改动范围内）；保留的只是名字，值已经没有任何作用 —— 下面三个探针钉住这点。
-        self.assertTrue(hasattr(P, "GIF_INLINE_MAX_BYTES"))
-        orig = P.GIF_INLINE_MAX_BYTES
-        try:
-            for probe in (1, 10, 10 ** 9):
-                P.GIF_INLINE_MAX_BYTES = probe
-                out, mime = prepare_bytes_for_vision(gif)
-                self.assertEqual((out, mime), (base, base_mime),
-                                 f"闸门={probe} 竟然改变了行为 —— 闸门没废干净")
-        finally:
-            P.GIF_INLINE_MAX_BYTES = orig
+        meta = {}
+        out, mime = prepare_bytes_for_vision(gif, meta=meta)
+        self.assertEqual(mime, "image/jpeg")
+        self.assertNotEqual(out, gif, "不得整图直送")
+        self.assertTrue(meta.get("gif_grid"), "多帧 GIF 一律走网格")
 
     @requires_pil
     def test_non_gif_unaffected(self):
@@ -422,12 +443,21 @@ class TestGifGridDegradeC27(unittest.TestCase):
 class TestGifPromptFrameCountC27(unittest.TestCase):
     """提示词必须报**这次实际**的帧数（12% 的真实 GIF 不足 6 帧，会留白）。"""
 
-    def test_default_matches_constant(self):
-        from services.vision import VISION_GIF_SYSTEM_PROMPT as D
+    def test_default_geometry_prompt_computed_on_demand(self):
+        """默认几何（6 帧 / 3 列 × 2 行）那一版**现算**，没有预求值常量。
+
+        ⚠️ 曾经有 `VISION_GIF_SYSTEM_PROMPT = gif_grid_system_prompt(6)`，生产零引用
+        （线上/离线都按本轮实际帧数现算），2026-09-23 已删 —— 别再加第二份口径：
+        短 GIF（实测占真实贴纸 12%）拿写死"共 6 帧"的提示词会去解释空白格。
+        """
+        from services import vision as V
         from services.vision import gif_grid_system_prompt as G
-        self.assertEqual(G(6, 3, 2), D)
+        D = G(6, 3, 2)
         self.assertIn("共 6 帧", D)
+        self.assertIn("3 列 × 2 行", D)
         self.assertNotIn("空白", D, "满格时不该提空白格")
+        self.assertFalse(hasattr(V, "VISION_GIF_SYSTEM_PROMPT"),
+                         "预求值常量回来了 —— 它就等于 gif_grid_system_prompt(6,3,2)")
 
     def test_short_gif_prompt_reports_real_count_and_blanks(self):
         from services.vision import gif_grid_system_prompt as G

@@ -16,9 +16,22 @@
 #                                                    # 排一次定时任务（跑完自动摘掉）
 #   deploy-persona-plugin --remove-cron
 #
-# 可覆盖的环境变量（自测台用它们注入桩）：
+# 拉取策略（2026-09-23 起）：**多源顺序降级**
+#   原因：台式机直连 github 间歇性报 `GnuTLS recv error (-110)`（TLS 被中断），
+#   同一时段镜像却稳。所以 origin 失败后依次试镜像，而不是一次失败就放弃。
+#   * 顺序：origin（github 直连）→ ghfast.top → gh-proxy.com → ghproxy.net
+#   * 每个源重试 2 次（TLS 抖动是间歇性的，重试比换源更划算）
+#   * 镜像按 `git fetch <url> +refs/heads/main:refs/remotes/origin/main` 写入**同名 ref**，
+#     因此后续 HEAD 比较与 `--ff-only` 快进语义与直连**完全一致**
+#   * 每个源的成败 / 耗时 / 失败原因全部写进日志，换源时打印一行 ↳ —— 降级必须可见
+#   ⚠️ 镜像只能代理**公开**仓库。本仓库 2026-09-23 实测为 public；若哪天改回 private，
+#      镜像会如实报 404，只剩 origin 一条路（脚本不会假装成功）。
+#
+# 可覆盖的环境变量（自测台/运维用它们注入桩或改源）：
 #   PLUGIN_DIR ASTROBOT_LOG ASTROBOT_START SCREEN_NAME BRANCH PYTHON STATE_FILE
 #   GIT_BIN SCREEN_BIN TIMEOUT_BIN CRONTAB_BIN
+#   FETCH_SOURCES（空格分隔的完整 URL，**接管**整个源列表，跳过镜像自动推导）
+#   FETCH_ATTEMPTS（每源重试次数，默认 2） FETCH_TIMEOUT（每次上限秒数，默认 60）
 set -uo pipefail
 
 PLUGIN_DIR="${PLUGIN_DIR:-/opt/AstrBot/data/plugins/astrbot_plugin_persona_agent}"
@@ -34,7 +47,18 @@ TIMEOUT_BIN="${TIMEOUT_BIN:-timeout}"
 CRONTAB_BIN="${CRONTAB_BIN:-crontab}"
 
 CRON_MARK="# deploy-persona-plugin"
-FETCH_TIMEOUT=120
+#: 每个源**单次**拉取的上限（秒）。镜像实测 1~3s，60s 足够；卡死就快速失败换源。
+FETCH_TIMEOUT="${FETCH_TIMEOUT:-60}"
+#: 每个源的重试次数（GnuTLS -110 这类中断是间歇性的，重试常常一次就好）
+FETCH_ATTEMPTS="${FETCH_ATTEMPTS:-2}"
+#: 显式接管源列表（空格分隔的完整 URL）。留空 = origin + 按 origin 推导的镜像。
+FETCH_SOURCES="${FETCH_SOURCES:-}"
+#: 镜像模板（%s = owner/repo）。按顺序降级；实测只有这三个通（见 scratch/DEPLOY_mirror_report.md）
+MIRROR_URLS=(
+  "https://ghfast.top/https://github.com/%s.git"
+  "https://gh-proxy.com/https://github.com/%s.git"
+  "https://ghproxy.net/https://github.com/%s.git"
+)
 TEST_TIMEOUT=600
 STOP_WAIT=60
 BOOT_WAIT=120
@@ -59,7 +83,7 @@ die()  { printf '%s ❌ %s\n' "$(ts)" "$*" | tee -a "$LOG_FILE" >&2;
          printf 'FAILED %s %s\n' "$(ts)" "$*" > "$STATE_FILE"; exit 1; }
 ok()   { printf 'OK %s %s\n' "$(ts)" "$*" > "$STATE_FILE"; }
 
-usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR>1 && /^set -/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; }
 
 # ---------------------------------------------------------------- 参数
 while [ $# -gt 0 ]; do
@@ -139,20 +163,110 @@ if [ "$MODE" != no-restart ]; then
     || warn "screen 会话 $SCREEN_NAME 当前不存在（重启时会新建）"
 fi
 
-# ---------------------------------------------------------------- 拉取
-log "fetch origin/$BRANCH …"
-if GIT_TERMINAL_PROMPT=0 "$TIMEOUT_BIN" "$FETCH_TIMEOUT" \
-     "$GIT_BIN" fetch --prune origin "$BRANCH" >>"$LOG_FILE" 2>&1; then
-  NEW_HEAD="$("$GIT_BIN" rev-parse "origin/$BRANCH")"
+# ---------------------------------------------------------------- 拉取（多源顺序降级）
+# 口径：origin 直连优先；失败则依次试镜像。每个源的成败 / 耗时 / 失败原因都进日志。
+# 镜像用 git fetch <url> +refs/heads/$BRANCH:refs/remotes/origin/$BRANCH 写入**同名 ref**，
+# 所以下面的 HEAD 比较与 --ff-only 快进语义跟直连一模一样，不需要任何分支特判。
+_now_us() {   # 微秒时间戳（EPOCHREALTIME 可能带小数点，只留数字）
+  if [ -n "${EPOCHREALTIME:-}" ]; then printf '%s' "${EPOCHREALTIME//[!0-9]/}"; return; fi
+  printf '%s000000' "$(date +%s)"
+}
+_elapsed_ms() { echo $(( ($(_now_us) - $1) / 1000 )); }
+_fmt_ms()     { printf '%d.%03ds' "$(( $1 / 1000 ))" "$(( $1 % 1000 ))"; }
+
+case "$FETCH_ATTEMPTS" in ''|*[!0-9]*) FETCH_ATTEMPTS=2 ;; esac
+[ "$FETCH_ATTEMPTS" -ge 1 ] || FETCH_ATTEMPTS=1
+
+ORIGIN_URL="$("$GIT_BIN" remote get-url origin 2>/dev/null || true)"
+SOURCES=()
+if [ -n "$FETCH_SOURCES" ]; then
+  # shellcheck disable=SC2206
+  SOURCES=($FETCH_SOURCES)
+  log "拉取源：FETCH_SOURCES 显式指定了 ${#SOURCES[@]} 个（跳过镜像自动推导）"
 else
+  [ -n "$ORIGIN_URL" ] || die "仓库没有 origin remote，也没给 FETCH_SOURCES —— 无处可拉"
+  SOURCES=("$ORIGIN_URL")
+  case "$ORIGIN_URL" in
+    https://github.com/*)
+      SLUG="${ORIGIN_URL#https://github.com/}"; SLUG="${SLUG%.git}"
+      for _tpl in "${MIRROR_URLS[@]}"; do SOURCES+=("$(printf "$_tpl" "$SLUG")"); done
+      ;;
+    *) log "origin 不是 github HTTPS 地址（$ORIGIN_URL）→ 只用 origin，不启用镜像" ;;
+  esac
+fi
+[ "${#SOURCES[@]}" -ge 1 ] || die "拉取源列表为空 —— 拒绝继续"
+
+log "拉取：共 ${#SOURCES[@]} 个源，每源最多试 ${FETCH_ATTEMPTS} 次、单次上限 ${FETCH_TIMEOUT}s"
+FETCH_ROWS=()
+NEW_HEAD=""; WIN_SRC=""; WIN_MS=0; WIN_ATTEMPT=0
+si=0
+for src in "${SOURCES[@]}"; do
+  si=$((si + 1))
+  if [ -n "$ORIGIN_URL" ] && [ "$src" = "$ORIGIN_URL" ]; then label="origin（$src）"; else label="$src"; fi
+  ai=1; reason=""
+  while [ "$ai" -le "$FETCH_ATTEMPTS" ]; do
+    log "→ 源 $si/${#SOURCES[@]} 第 $ai/$FETCH_ATTEMPTS 次：$label"
+    t0="$(_now_us)"
+    if [ -n "$ORIGIN_URL" ] && [ "$src" = "$ORIGIN_URL" ]; then
+      GIT_TERMINAL_PROMPT=0 "$TIMEOUT_BIN" "$FETCH_TIMEOUT" \
+        "$GIT_BIN" fetch --prune origin "$BRANCH" >>"$LOG_FILE" 2>&1
+    else
+      GIT_TERMINAL_PROMPT=0 "$TIMEOUT_BIN" "$FETCH_TIMEOUT" \
+        "$GIT_BIN" fetch --prune --no-tags "$src" \
+          "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" >>"$LOG_FILE" 2>&1
+    fi
+    rc=$?
+    ms="$(_elapsed_ms "$t0")"
+    if [ "$rc" = 0 ]; then
+      cand="$("$GIT_BIN" rev-parse --verify "refs/remotes/origin/$BRANCH" 2>/dev/null || true)"
+      case "$cand" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
+          NEW_HEAD="$cand"; WIN_SRC="$src"; WIN_MS="$ms"; WIN_ATTEMPT="$ai"
+          log "  ✔ 源 $si/${#SOURCES[@]} 成功（$(_fmt_ms "$ms")，第 $ai 次）：$label → origin/$BRANCH=${cand:0:8}"
+          FETCH_ROWS+=("✔ 源 $si/${#SOURCES[@]}  $label  →  ${cand:0:8}  $(_fmt_ms "$ms")  第 $ai 次成功")
+          break 2
+          ;;
+      esac
+      reason="命令返回 0，但 origin/$BRANCH 还不是合法 SHA"
+    elif [ "$rc" = 124 ]; then
+      reason="超时：${FETCH_TIMEOUT}s 内没完成（TLS 卡死的典型表现）"
+    else
+      reason="$(tail -n 40 "$LOG_FILE" 2>/dev/null | grep -a -v '^[[:space:]]*$' | tail -1 | tr -d '\000' | cut -c1-140)"
+      [ -n "$reason" ] || reason="退出码 $rc，且没有输出"
+    fi
+    warn "  ✘ 源 $si/${#SOURCES[@]} 第 $ai/$FETCH_ATTEMPTS 次失败（$(_fmt_ms "$ms")）：$reason"
+    ai=$((ai + 1))
+    [ "$ai" -le "$FETCH_ATTEMPTS" ] && sleep 3
+  done
+  FETCH_ROWS+=("✘ 源 $si/${#SOURCES[@]}  $label  →  失败 ×$FETCH_ATTEMPTS（$reason）")
+  [ "$si" -lt "${#SOURCES[@]}" ] && log "  ↳ 降级：换下一个源（$((si + 1))/${#SOURCES[@]}）"
+  true
+done
+
+# 汇总：无论成败都打印 —— 降级必须可见
+log "拉取小结（共 ${#SOURCES[@]} 个源）："
+for row in "${FETCH_ROWS[@]}"; do log "    $row"; done
+
+if [ -z "$NEW_HEAD" ]; then
   # 网络/凭据失败**不该让「激活盘上代码」一起废掉**：定时任务里带了 --force-restart 时，
   # 照旧跑测试并重启（用当前 HEAD）。否则凌晨那一跑会静默地什么都没做。
   if [ "$FORCE_RESTART" = 1 ]; then
-    warn "git fetch 失败（网络/凭据？）→ 因指定了 --force-restart，改用**盘上现有代码**继续"
+    warn "fetch 失败：${#SOURCES[@]} 个源全部不可用（网络/凭据？）→ 因指定了 --force-restart，改用**盘上现有代码**继续"
     NEW_HEAD="$OLD_HEAD"
   else
-    die "git fetch 失败（网络/凭据？）—— 未做任何改动"
+    die "fetch 失败：${#SOURCES[@]} 个源全部不可用（网络/凭据？）—— 未做任何改动"
   fi
+elif [ -n "$ORIGIN_URL" ] && [ "$WIN_SRC" != "$ORIGIN_URL" ]; then
+  warn "本次是**降级**拉取：origin 直连没成功，改用镜像 $WIN_SRC（$(_fmt_ms "$WIN_MS")，第 $WIN_ATTEMPT 次）"
+  warn "  refs 已按 origin/$BRANCH 写入，HEAD 比较与 --ff-only 快进语义与直连一致"
+fi
+
+# 陈旧镜像保护：拉到的提交若是本地 HEAD 的**祖先**，说明这个源比本地旧（缓存滞后）
+# → 按「已是最新」处理，绝不把代码退回去。
+if [ -n "$NEW_HEAD" ] && [ "$OLD_HEAD" != "$NEW_HEAD" ] \
+   && "$GIT_BIN" merge-base --is-ancestor "$NEW_HEAD" "$OLD_HEAD" 2>/dev/null; then
+  warn "拉到的 $NEW_HEAD 是本地 HEAD 的祖先（镜像缓存滞后？）→ 按『已是最新』处理，不回退"
+  NEW_HEAD="$OLD_HEAD"
 fi
 
 if [ "$OLD_HEAD" = "$NEW_HEAD" ]; then
@@ -233,7 +347,9 @@ while [ $i -lt "$BOOT_WAIT" ]; do
   fi
   sleep 2; i=$((i + 2))
 done
-NEW_LOG="$([ -f "$ASTROBOT_LOG" ] && tail -n 400 "$ASTROBOT_LOG" 2>/dev/null || true)"
+# ⚠️ tr -d '\000'：runtime.log 含 NUL 字节，直接 $(...) 捕获会报
+# 「警告：命令替换：忽略输入中的 null 字节」（2026-09-23 实测）。
+NEW_LOG="$([ -f "$ASTROBOT_LOG" ] && tail -n 400 "$ASTROBOT_LOG" 2>/dev/null | tr -d '\000' || true)"
 for pat in '\[persona\] mode=' '\[examples\] 示例块来源' '已组装' 'cron'; do
   line="$(printf '%s' "$NEW_LOG" | grep -m1 -- "$pat" || true)"
   [ -n "$line" ] && log "    ✔ $line" || log "    · 未见「$pat」（不一定异常，见部署文档的预期表）"

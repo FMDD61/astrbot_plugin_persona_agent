@@ -206,12 +206,15 @@ def cap_koupi(text: str) -> str:
     return "".join(parts)
 
 
-def strip_emoji(text: str) -> str:
-    return RE_EMOJI.sub("", text)
-
-
-def strip_at_mentions(text: str) -> str:
-    return RE_AT_USER.sub("", text)
+# ⚠️ **已删除**（2026-09-23 批次三清理）：`strip_emoji()` 与 `strip_at_mentions()`。
+# C15（2026-09-21）把它们从 `postprocess` 里摘掉之后，生产侧就再没有调用点，
+# 只剩测试在调 —— 于是**删函数、留墓志铭**：`tests/test_text_style.py` 用 AST 断言
+# `postprocess` 不再调用这两个名字、且它们在本模块里不存在。删掉的理由见
+# `postprocess` 的 docstring（它们让提示词 §7【句末的表情】/ §6「@ 他一句」自上线起
+# 不可能生效 → B-048）。
+# ⚠️ `RE_EMOJI` / `RE_AT_USER` 这两个**正则保留**：`main.py:28-35` 在 import 期就
+# `from .services.text_style import (RE_EMOJI, RE_AT_USER, ...)`（那边其实没用到它们）。
+# 删正则会把 main.py 直接打炸 —— 清理由 main.py 的所有者一并做。
 
 
 def strip_meta_parens(text: str) -> str:
@@ -250,20 +253,29 @@ def postprocess(text: str) -> str:
 
     ⚠️ 放开后要观察一段时间（这两步原本防的是 emoji 滥用与误 @ 人）：
     观测口径 = 出站文本里 emoji / @ 的**出现率**（trace 的 `final_text` 可直接统计）。
+
+    ⚠️ **观测口径的偏差（独立审查 N-22）**：本函数末尾会把文本截到 400 字 / 折到 8 行，
+    所以"出现率"读到的其实是**截断后**的文本 —— 第 401 位的 emoji/@ 会被一起丢掉
+    （实测 `postprocess("好" * 400 + "@某人")` 长度 400、`@某人` 没了）。
+    要量"模型本来写了多少 emoji/@ "，得看截断前的原始生成文本，不能只统计 `final_text`。
+
+    📌 2026-09-23 批次三清理：上面提到的两个函数 `strip_emoji()` / `strip_at_mentions()`
+    **已从本文件删除**（C15 之后只剩测试在用）。它们**不该回来** ——
+    `tests/test_text_style.py::TestStripStepsRemovedC15` 用 AST + `hasattr` 钉住了这一点。
     """
     if not text:
         return ""
     out = text.strip()
     for b in _AI_PHRASES:
         out = out.replace(b, "")
-    # C15：不再 strip_at_mentions（@ 是 §6 教的表达手段之一）
+    # C15：不再 strip_at_mentions（@ 是 §6 教的表达手段之一）；该函数已于 2026-09-23 删除
     out = strip_meta_parens(out)
     out = RE_REPLY_MARKER.sub("", out)
     out = RE_ASTRBOT_MARKER.sub("", out)
     out = RE_TOOL_INTENT_MARK.sub("", out)
     out = re.sub(r"(?<=[\u4e00-\u9fff]) +(?=[\u4e00-\u9fff])", "", out)
     out = cap_koupi(out)
-    # C15：不再 strip_emoji（§7【句末的表情】教的就是它）
+    # C15：不再 strip_emoji（§7【句末的表情】教的就是它）；该函数已于 2026-09-23 删除
     out = collapse_newlines(out)
     if len(out) > 400:
         out = out[:400].rstrip()

@@ -11,6 +11,23 @@
 
 ## [Unreleased]
 
+### Removed / Docs (2026-09-23 · 代码侧收尾清理)
+- **删死代码**（都先 grep 全仓确认零引用）：`image_prep.GIF_INLINE_MAX_BYTES`（C27 后的墓碑）、
+  `image_prep.frame_count()`、`vision.VISION_GIF_SYSTEM_PROMPT`、`text_style.strip_emoji()` /
+  `strip_at_mentions()`（C15 后只剩测试在用，测试改成**墓志铭**：反断言 + AST 断言
+  `postprocess` 调用图里没有它们）；`main.py` 里五个零调用 `@staticmethod` 包装 ——
+  ⚠️ 其中两个转调的正是被删的两个函数，**再被调用就是 AttributeError**（地雷已拆）。
+- **删掉一处重复定义**：`vision._LEAK_MARKERS` / `_looks_like_leaked_prompt` 被后一份定义覆盖，
+  前一份**从未生效**且多一个 `"输出格式"` 标记 → 删除后行为逐字节不变（有变异自证）。
+- **清未用 import**：`main.py` 六个正则（全仓只以 `text_style.RE_*` 形式使用）—— 它们正是那两个
+  正则"看起来有人用"的原因，删掉后正则本身也可清。
+- **文档同步**：`services.md` 删掉整段逐字重复的 Design decisions（74→52 行）并修正
+  EmotionProvider（C24 无 LLM）/ VisionService（C27 网格 + 版本戳）/ text_style（C15 不再删 emoji@）；
+  `params.md` 补 `emotion.enabled`、**重写 `[r:-N]` 教学**（实测 `[r:1]` 与 `[r:-1]` 同义，旧文档
+  「缺负号无效」与代码不符）、新增 C27/C15 两条；`history.md` 补批次一/二/三。
+- 测试：907 OK（系统 python 21 skip / `.venv` 0 额外 skip）；清理项四处变异自证有牙。
+
+
 ### Fixed / Added (2026-09-23 · 代码侧收尾)
 - **B-057（审查第 3 轮残留）**：日记的"日"原先由写侧**现算** `day_key(now-86400)`，只在
   "恰好陈旧 1 天"时才等于归档日；会话隔 ≥2 天才轮转（如 day=09-15、09-22 才转）→ 归档是

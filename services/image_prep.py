@@ -24,15 +24,26 @@
 很多 GIF 靠动态动作体现含义（实测：首帧把"疯狂摇头撞桌"描述成"张嘴"）；
 而整图直送很贵（1.9MB/109 帧 实测 52s 且空返回）。
 
-⚠️ **曾经的取舍错在哪（B-049）**：把"大动图"降级成**首帧 JPEG**（体积闸门
-`GIF_INLINE_MAX_BYTES = 1_500_000`）。用户实测群内 GIF **普遍 >3MB、
-大的 >10MB** → 那条"≤1.5MB 整图直送"的路**几乎从不触发**，绝大多数 GIF 都在走首帧，
-**动作语义全丢**，而且**不留任何痕迹**（不报错、不降级标记，只是描述变静帧）。
+⚠️ **曾经的取舍错在哪（B-049）**：体积闸门 `GIF_INLINE_MAX_BYTES = 1_500_000`
+把 GIF 劈成两半 —— ≤1.5MB 整图直送 / >1.5MB **首帧 JPEG**。问题出在后一半：
+**动作语义全丢，而且不留任何痕迹**（不报错、无降级标记，只是描述变静帧）。
+两个语料的分布**相反**：
+
+- 贴纸库实测（n=181）：**133 张（73%）≤1.5MB 走整图直送**，48 张多帧走首帧降级
+  （27%，= B-049 的受害面；另有 2 张单帧 GIF 不受影响，与 CHANGELOG「首帧降级
+  50 张 → 0 张」自洽）—— 来源 `scratch/impl_c27_report.md`；
+- 用户群里的大 GIF **普遍 >3MB、大的 >10MB**（用户口径，未逐张量）。
+
+⚠️ 本文件旧注释曾写"整图直送那条路几乎从不触发、绝大多数 GIF 都在走首帧" ——
+与 n=181 的实测**相反**（独立审查 N-17，`scratch/REVIEW_batch3_round1.md`）。
+**本次按实测改写，别再按印象写分布。**
 
 现在的做法：**全部多帧 GIF 一律"均匀抽 6 帧 → 每帧长边 320px → 3 列 × 2 行拼网格
 → JPEG q82"**（约 960×640、几十 KB）。动作语义来自**帧与帧的差异**，网格正好把
 差异并排摆出来 —— 一举解决"体积"与"动作丢失"两个问题。
-**体积闸门已废**（`GIF_INLINE_MAX_BYTES` 只剩一个不再被读的名字，见下）。
+**体积闸门已彻底删除**：常量 `GIF_INLINE_MAX_BYTES` 与"保留给
+`tools/build_sticker_index.py` import"的墓碑注释一起清掉（离线工具早已不 import
+它，全仓零引用）；"任何体积都走网格"由 `tests/test_image_prep.py` 的反向用例钉住。
 
 **③ 降级必须留痕。** 拼网格失败（无 PIL / 解码失败）时回退首帧，但**原因必须带出去** ——
 `meta["gif_grid_fail"]` → 线上落 `diag`/`stats`/日志（见 `services/vision.py`）。
@@ -59,12 +70,11 @@ GIF_GRID_ROWS = 2
 #: 网格 JPEG 质量（与静图同档：q82 在几十 KB 量级，实测够用）
 GIF_GRID_JPEG_QUALITY = 82
 
-# ⚠️ **已废**（C27 / B-049）：1.5MB 体积闸门不再参与任何分流，多帧 GIF **一律**拼网格。
-# 保留这个名字**只为** `tools/build_sticker_index.py` 的 `from services.image_prep import ...`
-# 不炸（那个文件不在本次改动范围内）。它的值**没有任何作用**，改它不会改变行为
-# —— `tests/test_image_prep.py::test_gate_constant_no_longer_gates` 钉住了这一点。
-# 待离线工具改用新路径后，这个名字应当删掉。
-GIF_INLINE_MAX_BYTES = 1_500_000
+# ⚠️ **已删除**（2026-09-23 批次三清理）：体积闸门常量 `GIF_INLINE_MAX_BYTES` 不存在了。
+# C27 废掉它的分流作用后它只是个墓碑（注释还写着"保留给离线工具 import"，而
+# `tools/build_sticker_index.py` 早已改 import `DESC_MAX_EDGE/mime_of/prepare_for_vision`，
+# 全仓零引用）。**不要把这个名字加回来**：多帧 GIF 一律拼网格，没有体积分支
+# —— `tests/test_image_prep.py::test_volume_gate_constant_is_deleted` 是墓志铭。
 
 _MIME_BY_EXT = {
     "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
@@ -92,14 +102,11 @@ def mime_of(path: str | os.PathLike) -> str:
     return _MIME_BY_EXT.get(ext, "image/png")
 
 
-def frame_count(path: str | os.PathLike) -> int:
-    """返回帧数（>1 即动图）。打不开返回 0。"""
-    try:
-        from PIL import Image  # type: ignore
-        with Image.open(path) as im:
-            return int(getattr(im, "n_frames", 1) or 1)
-    except Exception:
-        return 0
+# ⚠️ 原 `frame_count(path)` 已删（2026-09-23 批次三清理）：全仓零生产引用，只有
+# 测试在调（离线工具 `tools/build_sticker_index.py` 自带一份同名实现）。
+# "是不是动图"这个判断现在只有一个出口 = `prepare_for_vision(..., meta=)` 的
+# `meta["gif_grid"]` / `meta["path"]` —— 想数帧就读 `meta["gif_grid"]["of"]`，
+# 别再提供第二条口径（两份实现会漂移）。
 
 
 def to_jpeg(data: bytes, max_edge: int = DESC_MAX_EDGE,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # deploy-persona-plugin 的**离线自测台**：用真 git + 桩 screen/python3/crontab
-# 跑 7 个场景，验证「不该动的时候绝不动、该回滚的时候真回滚」。
+# 跑 16 个场景，验证「不该动的时候绝不动、该回滚的时候真回滚、降级时必须留痕」。
 #
 #   bash selftest.sh [待测脚本路径]      # 默认测同目录的 deploy_persona_plugin.sh
 #
@@ -51,9 +51,12 @@ cd "$WORK" && git clone -q "$WORK/remote.git" plugin
 # 远端前进一个提交（模拟"有新提交"）
 cd "$WORK/src" && echo v2 > version.txt && git commit -qam 'v2' && git push -q origin main
 
+#: 场景可临时追加环境变量（多源场景用 FETCH_SOURCES 注入源列表）；每次 run 后自动清空
+EXTRA_ENV=()
 run() {  # run <场景名> <期望退出码> [额外参数…]
   local name="$1" want="$2"; shift 2
   rm -f "$WORK/screen.log"
+  env "${EXTRA_ENV[@]}" \
   HOME="$WORK" PLUGIN_DIR="$WORK/plugin" ASTROBOT_LOG="$WORK/runtime.log" \
   ASTROBOT_START="$WORK/start.sh" SCREEN_NAME=astrbot \
   SCREEN_BIN="$WORK/bin/screen" PYTHON="$WORK/bin/pyt" CRONTAB_BIN="$WORK/bin/crontab" \
@@ -147,6 +150,59 @@ cd "$WORK/src" && echo v6 > version.txt && git commit -qam 'v6' && git push -q o
 run 'tracked-dirty-blocked' 1
 check '已跟踪改动 → 拒绝' "$(restarted)" no
 git -C "$WORK/plugin" checkout -q -- version.txt
+
+# 多源降级的公共夹具：造两个"坏源"（不存在路径），再加一个"好源"
+BAD1="$WORK/nonexistent-a.git"
+BAD2="$WORK/nonexistent-b.git"
+
+echo '── 13) 多源降级：源 1 失败 → 源 2 成功（且 ref 落点正确、能快进）'
+cd "$WORK/src" && echo v7 > version.txt && git commit -qam 'v7' && git push -q origin main
+# 把 origin 指向坏源，源 2 用好源 —— 这样才真的走到「镜像 URL + 显式 refspec」那条代码路径
+git -C "$WORK/plugin" remote set-url origin "$BAD1"
+EXTRA_ENV=(FETCH_SOURCES="$BAD1 $WORK/remote.git" FETCH_ATTEMPTS=1)
+run 'multisource-fallback' 0
+check '降级后已重启' "$(restarted)" yes
+check '降级后 HEAD 前进到 v7' "$(grep -c 'v7' "$WORK/plugin/version.txt")" 1
+check '降级：源 1 失败留痕' "$(grep -c '✘ 源 1/2' "$WORK/out.txt")" 1
+check '降级：源 2 成功留痕' "$(grep -c '✔ 源 2/2 成功' "$WORK/out.txt")" 1
+check '降级：打印了 ↳ 换源' "$(grep -c '↳ 降级：换下一个源' "$WORK/out.txt")" 1
+check '降级：有醒目告警' "$(grep -c '本次是\*\*降级\*\*拉取' "$WORK/out.txt")" 1
+check '降级：origin/main 落点正确' \
+      "$(git -C "$WORK/plugin" rev-parse origin/main)" "$(git -C "$WORK/remote.git" rev-parse main)"
+git -C "$WORK/plugin" remote set-url origin "$WORK/remote.git"
+
+echo '── 14) 多源全失败（无 --force-restart）→ 中止、不重启、每源都留痕'
+EXTRA_ENV=(FETCH_SOURCES="$BAD1 $BAD2" FETCH_ATTEMPTS=1)
+run 'multisource-allfail' 1
+check '全失败未重启' "$(restarted)" no
+check '全失败：小结里 2 个源各一行' "$(grep -c '失败 ×' "$WORK/out.txt")" 2
+check '全失败：2 次尝试都有告警' "$(grep -c '次失败' "$WORK/out.txt")" 2
+check '全失败：打印了拉取小结' "$(grep -c '拉取小结' "$WORK/out.txt")" 1
+check '全失败：原因可读' "$(grep -c '个源全部不可用' "$WORK/out.txt")" 1
+
+echo '── 15) 陈旧镜像（拉到的提交是本地 HEAD 的祖先）→ 按已是最新处理，绝不回退'
+git init -q --bare "$WORK/stale.git"
+ROOT_COMMIT="$(git -C "$WORK/src" rev-list --max-parents=0 HEAD)"
+git -C "$WORK/src" push -q "$WORK/stale.git" "$ROOT_COMMIT:refs/heads/main"
+HEAD_BEFORE_STALE="$(head_of)"
+EXTRA_ENV=(FETCH_SOURCES="$WORK/stale.git" FETCH_ATTEMPTS=1)
+run 'stale-mirror' 0
+check '陈旧源：未重启' "$(restarted)" no
+check '陈旧源：HEAD 没被回退' "$(head_of)" "$HEAD_BEFORE_STALE"
+check '陈旧源：明说按『已是最新』处理' "$(grep -c '镜像缓存滞后' "$WORK/out.txt")" 1
+git -C "$WORK/plugin" fetch -q origin main        # 夹具复原：origin/main 回到真远端
+
+echo '── 16) --check-only 也走多源降级（台式机验证用的就是这条路：只看不动）'
+cd "$WORK/src" && echo v8 > version.txt && git commit -qam 'v8' && git push -q origin main
+HEAD_BEFORE_CHECK="$(head_of)"
+EXTRA_ENV=(FETCH_SOURCES="$BAD1 $WORK/remote.git" FETCH_ATTEMPTS=1)
+run 'checkonly-multisource' 0 --check-only
+check 'check-only 未重启' "$(restarted)" no
+check 'check-only HEAD 未动' "$(head_of)" "$HEAD_BEFORE_CHECK"
+check 'check-only 列出源 1 失败' "$(grep -c '✘ 源 1/2' "$WORK/out.txt")" 1
+check 'check-only 列出源 2 成功' "$(grep -c '✔ 源 2/2 成功' "$WORK/out.txt")" 1
+check 'check-only 列出了新提交 v8' "$(grep -c 'v8' "$WORK/out.txt")" 1
+
 echo
 echo "==== 自测结果：$PASS 通过 / $FAIL 失败 ===="
 [ "$FAIL" = 0 ] || exit 1

@@ -7,10 +7,23 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from services.image_prep import (  # noqa: E402
+    GIF_GRID_COLS, GIF_GRID_FRAMES, GIF_GRID_ROWS,
+)
 from services.vision import (  # noqa: E402
-    VISION_GIF_SYSTEM_PROMPT, VISION_SYSTEM_PROMPT, VisionService, face_name,
+    VISION_SYSTEM_PROMPT, VisionService, face_name, gif_grid_system_prompt,
     sniff_mime, resolve_image_bytes,
 )
+
+
+def _grid_prompt_default() -> str:
+    """默认几何（6 帧 / 3 列 × 2 行）的网格提示词 —— **现算**，没有预求值常量。
+
+    ⚠️ 曾经有 `VISION_GIF_SYSTEM_PROMPT = gif_grid_system_prompt(GIF_GRID_FRAMES)`，
+    生产零引用（线上/离线都按本轮实际帧数现算），2026-09-23 批次三清理已删。
+    测试要那一版就现调函数 —— 别再定义一个同名模块常量（那是第二份口径）。
+    """
+    return gif_grid_system_prompt(GIF_GRID_FRAMES, GIF_GRID_COLS, GIF_GRID_ROWS)
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 JPG = b"\xff\xd8\xff\xe0" + b"\x00" * 16
@@ -329,11 +342,11 @@ class TestGifGridPromptC27(unittest.TestCase):
         return cap, post
 
     def test_prompts_are_distinct(self):
-        self.assertNotEqual(VISION_GIF_SYSTEM_PROMPT, VISION_SYSTEM_PROMPT)
+        self.assertNotEqual(_grid_prompt_default(), VISION_SYSTEM_PROMPT)
 
     def test_gif_prompt_says_frames_in_order(self):
         """网格版必须点明"动图 / 按顺序抽的帧"，否则模型当拼图描述。"""
-        P = VISION_GIF_SYSTEM_PROMPT
+        P = _grid_prompt_default()
         for kw in ("动图", "顺序", "帧", "网格"):
             self.assertIn(kw, P, f"GIF 网格提示词缺少 {kw!r}")
         # 输出契约与静图版一致（S6：约定 JSON schema 是可用率的主导因素）
@@ -343,6 +356,16 @@ class TestGifGridPromptC27(unittest.TestCase):
     def test_static_prompt_does_not_claim_to_be_a_grid(self):
         self.assertNotIn("网格", VISION_SYSTEM_PROMPT)
         self.assertNotIn("连续帧", VISION_SYSTEM_PROMPT)
+
+    def test_precomputed_gif_prompt_constant_is_deleted(self):
+        """🔴 墓志铭：`VISION_GIF_SYSTEM_PROMPT` 已删（生产零引用）。
+
+        线上按本轮实际帧数现算、离线工具走同一个函数，加一份预求值常量就是第二条
+        口径 —— 短 GIF（实测占真实贴纸 12%）拿到写死"共 6 帧"的提示词会去解释空白格。
+        """
+        from services import vision as V
+        self.assertFalse(hasattr(V, "VISION_GIF_SYSTEM_PROMPT"),
+                         "预求值常量回来了 —— 请改成 gif_grid_system_prompt(实际帧数)")
 
     @_requires_pil
     def test_animated_gif_uses_grid_prompt_and_jpeg_payload(self):
@@ -358,7 +381,7 @@ class TestGifGridPromptC27(unittest.TestCase):
 
         v, diag, out = asyncio.run(go())
         self.assertEqual(out, "ok")
-        self.assertEqual(cap[0]["messages"][0]["content"], VISION_GIF_SYSTEM_PROMPT)
+        self.assertEqual(cap[0]["messages"][0]["content"], _grid_prompt_default())
         url = cap[0]["messages"][1]["content"][1]["image_url"]["url"]
         self.assertTrue(url.startswith("data:image/jpeg;base64,"), url[:32])
         # 载荷确实是一张 960×640 的网格（不是原 GIF、也不是首帧）
@@ -387,7 +410,7 @@ class TestGifGridPromptC27(unittest.TestCase):
         self.assertEqual(out, "ok")
         sys_prompt = cap[0]["messages"][0]["content"]
         self.assertIn("共 2 帧", sys_prompt)
-        self.assertNotEqual(sys_prompt, VISION_GIF_SYSTEM_PROMPT)
+        self.assertNotEqual(sys_prompt, _grid_prompt_default())
         self.assertEqual(diag["grid"]["rows"], 1)
 
     def test_static_image_uses_static_prompt(self):
@@ -687,3 +710,25 @@ class TestCacheVersionStampC27(unittest.TestCase):
         svc.last_error = None
         new_key = "v%d:deadbeef" % V.VISION_PREP_VERSION
         self.assertNotIn(new_key, svc._cache, "带版本的键不该命中老条目")
+
+
+class TestDeadCodeStaysDead(unittest.TestCase):
+    """🔴 2026-09-23 批次三清理的墓志铭：**删掉的东西不许悄悄回来**。
+
+    行为断言在别处；这里只钉两件结构性的事：同一份定义不许有两份、删掉的入口不复活。
+    """
+
+    def test_leak_markers_defined_once(self):
+        """`_LEAK_MARKERS` / `_looks_like_leaked_prompt` 曾在本模块**定义两遍**。
+
+        后定义覆盖前定义，而两份字面量**并不相同**（前一份多一个 "输出格式"）→
+        读代码的人和解释器看到的不是一回事（教科书级的静默失效）。2026-09-23 删掉
+        从未生效的那一份（删前核实：第一份定义到文件末尾之间没有任何调用能看到它，
+        行为逐字节不变）。这条钉住"只许有一份"。
+        """
+        import inspect
+        from services import vision as V
+        src = inspect.getsource(V)
+        self.assertEqual(src.count("\n_LEAK_MARKERS = ("), 1,
+                         "_LEAK_MARKERS 又被定义了第二遍（后者覆盖前者 = 静默失效）")
+        self.assertEqual(src.count("\ndef _looks_like_leaked_prompt("), 1)

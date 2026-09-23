@@ -4,7 +4,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from services.text_style import (
     clean_message_text, extract_quote, postprocess, collapse_newlines,
-    cap_koupi, strip_emoji,
+    cap_koupi,
 )
 
 
@@ -91,9 +91,37 @@ class TestCapKoupi(unittest.TestCase):
         self.assertIn("c", out)
 
 
-class TestStripEmoji(unittest.TestCase):
-    def test_strip(self):
-        self.assertEqual(strip_emoji("a🤤b😭c"), "abc")
+class TestStripStepsRemovedC15(unittest.TestCase):
+    """🔴 C15 / B-048 的**墓志铭**：`strip_emoji()` / `strip_at_mentions()` 已删。
+
+    它们是 S0 的预防性收口，由 `postprocess` 调用 → 提示词 §7【句末的表情】与
+    §6「@ 他一句」两处教学**自上线起不可能生效**（实测 bot 输出 465 条：含 emoji 0 /
+    含 @ 0；风格源 2337 条：emoji 112 / @ 50）。C15 放开后这两步只剩测试在用，
+    2026-09-23 批次三清理**删掉函数**。
+
+    所以本类不再测"函数怎么剥 emoji"（函数没了），而是钉住**它们不该回来**：
+    名字不存在 + `postprocess` 的调用图里没有它们。行为侧的断言在
+    `TestPostprocess.test_emoji_and_at_survive_postprocess_c15`。
+    """
+
+    def test_functions_no_longer_exist(self):
+        from services import text_style
+        self.assertFalse(hasattr(text_style, "strip_emoji"),
+                         "strip_emoji 回来了 —— C15/B-048 的账会重开")
+        self.assertFalse(hasattr(text_style, "strip_at_mentions"),
+                         "strip_at_mentions 回来了 —— §6「@ 他一句」又会失效")
+
+    def test_postprocess_does_not_call_them(self):
+        """AST 看**调用图**，不看注释/docstring（那里故意留着历史说明）。"""
+        import ast
+        import inspect
+        import textwrap
+        from services import text_style
+        tree = ast.parse(textwrap.dedent(inspect.getsource(text_style.postprocess)))
+        called = {n.func.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        self.assertNotIn("strip_emoji", called)
+        self.assertNotIn("strip_at_mentions", called)
 
 
 if __name__ == "__main__":
